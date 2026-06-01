@@ -13,6 +13,7 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
         float4 forward;
         uint4 grid;
         float4 view;
+        uint4 config;
     };
 
     let cam: NeoStressCamera* = (NeoStressCamera*)camera;
@@ -160,9 +161,25 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
 
     let idx: u32 = y * width + x;
     let color: u32 = 0xff08090du;
+    let debug_view: u32 = cam->config.x;
 
     if (tile_window[3] != 0) {
+        if (debug_view == 3u) {
+            color = 0xff303030u;
+        }
         ((unsigned int*)pixels)[idx] = color;
+        return;
+    }
+
+    let range_delta: i32 = tile_window[1] - tile_window[0];
+    if (range_delta < 0) {
+        range_delta = -range_delta;
+    }
+    let range_len: u32 = as_u32(range_delta + 1);
+    if (debug_view == 1u) {
+        let heat: u32 = as_u32(fminf(255.0f, as_f32(range_len) * 255.0f / fmaxf(1.0f, as_f32(grid_z))));
+        let cool: u32 = 255u - heat;
+        ((unsigned int*)pixels)[idx] = cool | (heat << 16u) | 0xff000000u;
         return;
     }
 
@@ -184,11 +201,25 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
     let half_x: f32 = (as_f32(grid_x) - 1.0f) * 0.5f;
     let half_y: f32 = (as_f32(grid_y) - 1.0f) * 0.5f;
     let half_z: f32 = (as_f32(grid_z_pixel) - 1.0f) * 0.5f;
+    let hit: i32 = 0;
+    let visited_count: u32 = 0u;
 
     if (instance_count == 0u || fabsf(dir_z) <= 0.00001f) {
+        if (debug_view == 3u) {
+            color = 0xff0000ffu;
+        }
         ((unsigned int*)pixels)[idx] = color;
         return;
     }
+
+    let group_size: u32 = 32u;
+    let group_slots: u32 = ((instance_count + group_size - 1u) / group_size) * group_size;
+    let data_offset: u32 = *((unsigned int*)(instances + 20u));
+    let data_base: unsigned char* = ((unsigned char*)instances) + data_offset;
+    let pos_stream: u32 = 0u;
+    let rot_stream: u32 = group_slots * 12u;
+    let scale_stream: u32 = rot_stream + group_slots * 16u;
+    let color_stream: u32 = scale_stream + group_slots * 8u;
 
     let layer_i: i32 = tile_window[0];
     let end_i: i32 = tile_window[1];
@@ -198,6 +229,7 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
         if ((step_i > 0 && layer_i > end_i) || (step_i < 0 && layer_i < end_i)) {
             break;
         }
+        visited_count = visited_count + 1u;
 
         let layer: u32 = as_u32(layer_i);
         let layer_z: f32 = (as_f32(layer) - half_z) * spacing;
@@ -212,18 +244,25 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
             let iy: u32 = as_u32(iy_i);
             let instance_id: u32 = layer * grid_x * grid_y + iy * grid_x + ix;
             if (instance_id < instance_count) {
-                let pos: vec3f = neo_instance_position3f(instances, instance_id);
-                let rot: vec4f = neo_instance_rotation4f(instances, instance_id);
-                let scale: vec2f = neo_instance_scale2f(instances, instance_id);
-                let pos_x: f32 = pos.x;
-                let pos_y: f32 = pos.y;
-                let pos_z: f32 = pos.z;
-                let rx: f32 = rot.x;
-                let ry: f32 = rot.y;
-                let rz: f32 = rot.z;
-                let rw: f32 = rot.w;
-                let scale_x: f32 = scale.x;
-                let scale_y: f32 = scale.y;
+                let group: u32 = instance_id / group_size;
+                let lane: u32 = instance_id - group * group_size;
+                let group_lane_12: u32 = group * group_size * 12u + lane * 12u;
+                let group_lane_16: u32 = group * group_size * 16u + lane * 16u;
+                let group_lane_8: u32 = group * group_size * 8u + lane * 8u;
+                let group_lane_4: u32 = group * group_size * 4u + lane * 4u;
+                let pos_values: float* = (float*)(data_base + pos_stream + group_lane_12);
+                let rot_values: float* = (float*)(data_base + rot_stream + group_lane_16);
+                let scale_values: float* = (float*)(data_base + scale_stream + group_lane_8);
+                let color_ptr: unsigned int* = (unsigned int*)(data_base + color_stream + group_lane_4);
+                let pos_x: f32 = pos_values[0];
+                let pos_y: f32 = pos_values[1];
+                let pos_z: f32 = pos_values[2];
+                let rx: f32 = rot_values[0];
+                let ry: f32 = rot_values[1];
+                let rz: f32 = rot_values[2];
+                let rw: f32 = rot_values[3];
+                let scale_x: f32 = scale_values[0];
+                let scale_y: f32 = scale_values[1];
 
                 let nx_uv_x: f32 = ry;
                 let nx_uv_y: f32 = -rx;
@@ -256,11 +295,12 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
 
                         if (fabsf(local_x_hit) <= scale_x && fabsf(local_y_hit) <= scale_y && fabsf(local_z_hit) <= spacing * 0.08f) {
                             let shade: f32 = fmaxf(0.18f, fabsf(normal_x * -dir_x + normal_y * -dir_y + normal_z * -dir_z));
-                            let c: u32 = neo_instance_color4u8(instances, instance_id);
+                            let c: u32 = color_ptr[0];
                             let b: u32 = as_u32(as_f32(c & 255u) * shade) & 255u;
                             let g: u32 = as_u32(as_f32((c >> 8u) & 255u) * shade) & 255u;
                             let r: u32 = as_u32(as_f32((c >> 16u) & 255u) * shade) & 255u;
                             color = b | (g << 8u) | (r << 16u) | 0xff000000u;
+                            hit = 1;
                             break;
                         }
                     }
@@ -269,6 +309,19 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
         }
 
         layer_i = layer_i + step_i;
+    }
+
+    if (debug_view == 2u) {
+        let heat: u32 = as_u32(fminf(255.0f, as_f32(visited_count) * 255.0f / fmaxf(1.0f, as_f32(grid_z_pixel))));
+        let cool: u32 = 255u - heat;
+        color = cool | (heat << 8u) | (heat << 16u) | 0xff000000u;
+    }
+    if (debug_view == 3u) {
+        if (hit != 0) {
+            color = 0xff00ff00u;
+        } else {
+            color = 0xff0000ffu;
+        }
     }
 
     ((unsigned int*)pixels)[idx] = color;

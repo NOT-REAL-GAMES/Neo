@@ -4,7 +4,30 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
+    pub layouts: Vec<LayoutDecl>,
     pub kernels: Vec<Kernel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutDecl {
+    pub name: String,
+    pub kind: LayoutKind,
+    pub fields: Vec<LayoutField>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayoutKind {
+    AoS,
+    SoA,
+    AoSoA { group_size: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutField {
+    pub name: String,
+    pub ty: TypeName,
+    pub semantic: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +68,7 @@ pub enum TypeName {
     Vec2f,
     Vec3f,
     Vec4f,
+    U8x4Unorm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +178,7 @@ fn cuda_type_name(ty: &TypeName) -> &'static str {
         TypeName::Vec2f => "float2",
         TypeName::Vec3f => "float3",
         TypeName::Vec4f => "float4",
+        TypeName::U8x4Unorm => "unsigned int",
     }
 }
 
@@ -230,6 +255,7 @@ fn parse_type_name_text(text: &str) -> Option<TypeName> {
         "vec2f" => Some(TypeName::Vec2f),
         "vec3f" => Some(TypeName::Vec3f),
         "vec4f" => Some(TypeName::Vec4f),
+        "u8x4_unorm" => Some(TypeName::U8x4Unorm),
         _ => None,
     }
 }
@@ -307,7 +333,7 @@ impl<'a> Lexer<'a> {
                 });
                 continue;
             }
-            if "(){}[],:;*.+-/<>=%!&|".contains(ch) {
+            if "(){}[],:;*.+-/<>=%!&|@".contains(ch) {
                 self.bump();
                 tokens.push(Token {
                     kind: TokenKind::Symbol(ch),
@@ -365,11 +391,80 @@ impl<'a> Parser<'a> {
 
     fn parse_program(mut self) -> Result<Program, ParseError> {
         self.tokens = Lexer::new(self.source).lex()?;
+        let mut layouts = Vec::new();
         let mut kernels = Vec::new();
         while !self.is_eof() {
-            kernels.push(self.parse_kernel()?);
+            match self.peek_ident() {
+                Some("layout") => layouts.push(self.parse_layout()?),
+                Some("kernel") => kernels.push(self.parse_kernel()?),
+                _ => {
+                    let token = self.peek_token().cloned().ok_or_else(|| self.eof_error())?;
+                    return Err(ParseError {
+                        diagnostic: Diagnostic::new("expected `layout` or `kernel`", token.span),
+                    });
+                }
+            }
         }
-        Ok(Program { kernels })
+        Ok(Program { layouts, kernels })
+    }
+
+    fn parse_layout(&mut self) -> Result<LayoutDecl, ParseError> {
+        let start = self.expect_ident_text("layout")?.span.start;
+        let kind_token = self.peek_token().cloned().ok_or_else(|| self.eof_error())?;
+        let kind_name = self.expect_ident()?;
+        let kind = match kind_name.as_str() {
+            "aos" => LayoutKind::AoS,
+            "soa" => LayoutKind::SoA,
+            "aosoa" => {
+                self.expect_symbol('(')?;
+                let number_token = self.peek_token().cloned().ok_or_else(|| self.eof_error())?;
+                let group_size = self
+                    .expect_number()?
+                    .parse::<u32>()
+                    .map_err(|_| ParseError {
+                        diagnostic: Diagnostic::new(
+                            "expected integer AoSoA group size",
+                            number_token.span,
+                        ),
+                    })?;
+                self.expect_symbol(')')?;
+                LayoutKind::AoSoA { group_size }
+            }
+            _ => {
+                return Err(ParseError {
+                    diagnostic: Diagnostic::new(
+                        "expected layout kind `aos`, `soa`, or `aosoa`",
+                        kind_token.span,
+                    ),
+                });
+            }
+        };
+        let name = self.expect_ident()?;
+        self.expect_symbol('{')?;
+        let mut fields = Vec::new();
+        while !self.check_symbol('}') {
+            let field_name = self.expect_ident()?;
+            self.expect_symbol(':')?;
+            let ty = self.parse_type_name()?;
+            self.expect_symbol('@')?;
+            let semantic = self.expect_ident()?;
+            self.eat_symbol(',');
+            fields.push(LayoutField {
+                name: field_name,
+                ty,
+                semantic,
+            });
+        }
+        let close = self.expect_symbol('}')?;
+        Ok(LayoutDecl {
+            name,
+            kind,
+            fields,
+            span: Span {
+                start,
+                end: close.span.end,
+            },
+        })
     }
 
     fn parse_kernel(&mut self) -> Result<Kernel, ParseError> {
@@ -490,6 +585,20 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn expect_number(&mut self) -> Result<String, ParseError> {
+        let token = self.peek_token().ok_or_else(|| self.eof_error())?;
+        match &token.kind {
+            TokenKind::Number(value) => {
+                let value = value.clone();
+                self.idx += 1;
+                Ok(value)
+            }
+            _ => Err(ParseError {
+                diagnostic: Diagnostic::new("expected number", token.span),
+            }),
+        }
+    }
+
     fn expect_symbol(&mut self, expected: char) -> Result<Token, ParseError> {
         let token = self.peek_token().cloned().ok_or_else(|| self.eof_error())?;
         match token.kind {
@@ -562,12 +671,37 @@ mod tests {
     #[test]
     fn parses_kernel_declaration_with_address_space() {
         let program = parse("kernel fn image(global u8* pixels, u32 width) {}").unwrap();
+        assert!(program.layouts.is_empty());
         assert_eq!(program.kernels.len(), 1);
         let kernel = &program.kernels[0];
         assert_eq!(kernel.name, "image");
         assert_eq!(kernel.params[0].address_space, Some(AddressSpace::Global));
         assert_eq!(kernel.params[0].ty.base, TypeName::U8);
         assert_eq!(kernel.params[0].ty.pointer_depth, 1);
+    }
+
+    #[test]
+    fn parses_layout_declaration() {
+        let program = parse(
+            "layout aosoa(32) Instance {\n    position: vec3f @ Position,\n    color: u8x4_unorm @ Color0,\n}\nkernel fn image(global u8* pixels) {}",
+        )
+        .unwrap();
+        assert_eq!(program.layouts.len(), 1);
+        assert_eq!(program.layouts[0].name, "Instance");
+        assert_eq!(
+            program.layouts[0].kind,
+            LayoutKind::AoSoA { group_size: 32 }
+        );
+        assert_eq!(program.layouts[0].fields[0].ty, TypeName::Vec3f);
+        assert_eq!(program.layouts[0].fields[1].ty, TypeName::U8x4Unorm);
+        assert_eq!(program.kernels.len(), 1);
+    }
+
+    #[test]
+    fn reports_invalid_layout_syntax_with_span() {
+        let err = parse("layout chunky Instance {}").unwrap_err();
+        assert!(err.diagnostic.message.contains("expected layout kind"));
+        assert!(err.diagnostic.span.end > err.diagnostic.span.start);
     }
 
     #[test]

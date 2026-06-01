@@ -12,11 +12,11 @@ use std::{
 use anyhow::{Context as _, Result, anyhow, bail};
 use neo_lang::{AddressSpace, TypeName};
 use neo_runtime::{
-    Context as NeoContext, CudaFence, CudaGraph, DeviceBuffer, IndexFormat, InstanceAttribute,
-    InstanceBuffer, InstanceBufferDesc, InstanceFormat, InstanceLayout, InstanceSemantic, Kernel,
-    LaunchDims, MeshBuffer, MeshBufferDesc, NeoD3d12InteropDevice, PrimitiveTopology,
-    ReadablePinnedHostBuffer, SharedFrameRing, Stream as CudaStream, VertexAttribute, VertexFormat,
-    VertexLayout, VertexSemantic,
+    Context as NeoContext, CudaFence, CudaGraph, DataLayout, DeviceBuffer, IndexFormat,
+    InstanceAttribute, InstanceBuffer, InstanceBufferDesc, InstanceFormat, InstanceLayout,
+    InstanceSemantic, Kernel, LaunchDims, MeshBuffer, MeshBufferDesc, NeoD3d12InteropDevice,
+    PrimitiveTopology, ReadablePinnedHostBuffer, SharedFrameRing, Stream as CudaStream,
+    VertexAttribute, VertexFormat, VertexLayout, VertexSemantic,
 };
 use notify::{Event as NotifyEvent, RecursiveMode, Watcher as _};
 use winit::{
@@ -37,9 +37,9 @@ const UNFOCUSED_IDLE_FPS: f32 = 15.0;
 const CAMERA_MOVE_UNITS_PER_SEC: f32 = 4.0;
 const CAMERA_MAX_STEP_SECONDS: f32 = 1.0 / 30.0;
 const DEFAULT_INSTANCE_GRID: InstanceGrid = InstanceGrid {
-    x: 128,
-    y: 128,
-    z: 64,
+    x: 256,
+    y: 256,
+    z: 128,
 };
 
 pub fn main_entry() -> Result<()> {
@@ -57,7 +57,9 @@ fn run(options: LiveOptions) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", options.source_path.display()))?;
     let instance_source_path = if options.mode == RunMode::InstanceStress {
-        options.instance_stress_variant.source_path(&source_path)
+        options
+            .instance_stress_variant
+            .source_path(&source_path, options.instance_layout)
     } else {
         source_path.clone()
     };
@@ -137,6 +139,7 @@ fn run(options: LiveOptions) -> Result<()> {
             &neo,
             options.instance_grid,
             options.present_ring,
+            options.instance_layout,
         )?)
     } else {
         None
@@ -238,8 +241,14 @@ fn run(options: LiveOptions) -> Result<()> {
                         throughput_generation = reload.generation;
                     }
                     let now = Instant::now();
-                    let camera_params =
+                    let mut camera_params =
                         camera.params(size, start.elapsed().as_secs_f32(), options.instance_grid);
+                    camera_params.config = [
+                        options.instance_debug_view.code(),
+                        options.instance_layout.group_size(),
+                        0,
+                        0,
+                    ];
                     let visibility = instance_render_visibility(
                         options.render_policy,
                         window_visibility,
@@ -300,6 +309,10 @@ fn run(options: LiveOptions) -> Result<()> {
                                 reload_error: reload.last_error.as_deref(),
                                 kernel_cap: options.kernel_cap(),
                                 instance_variant: Some(options.instance_stress_variant),
+                                instance_layout: instance_assets
+                                    .as_ref()
+                                    .map(|assets| assets.instances.layout_label()),
+                                instance_debug_view: Some(options.instance_debug_view),
                                 render_policy: options.render_policy,
                                 visibility,
                             });
@@ -395,6 +408,8 @@ fn run(options: LiveOptions) -> Result<()> {
                                 reload_error: reload.last_error.as_deref(),
                                 kernel_cap: options.kernel_cap(),
                                 instance_variant: None,
+                                instance_layout: None,
+                                instance_debug_view: None,
                                 render_policy: options.render_policy,
                                 visibility: window_visibility.render_visibility(),
                             });
@@ -479,6 +494,8 @@ fn run(options: LiveOptions) -> Result<()> {
                                 reload_error: reload.last_error.as_deref(),
                                 kernel_cap: options.kernel_cap(),
                                 instance_variant: None,
+                                instance_layout: None,
+                                instance_debug_view: None,
                                 render_policy: options.render_policy,
                                 visibility: window_visibility.render_visibility(),
                             });
@@ -756,6 +773,8 @@ struct LiveOptions {
     present_ring: usize,
     instance_grid: InstanceGrid,
     instance_stress_variant: InstanceStressVariant,
+    instance_debug_view: InstanceDebugView,
+    instance_layout: StressInstanceLayout,
     render_policy: RenderPolicy,
     d3d_upload: D3dUploadMode,
     interop_fallback: InteropFallback,
@@ -780,6 +799,8 @@ impl LiveOptions {
             present_ring: 6,
             instance_grid: DEFAULT_INSTANCE_GRID,
             instance_stress_variant: InstanceStressVariant::Tiled,
+            instance_debug_view: InstanceDebugView::Off,
+            instance_layout: StressInstanceLayout::AoSoA32,
             render_policy: RenderPolicy::Auto,
             d3d_upload: D3dUploadMode::MappedCopy,
             interop_fallback: InteropFallback::NoInterop,
@@ -812,6 +833,12 @@ impl LiveOptions {
                     options.instance_stress_variant =
                         parse_next(&mut args, "--instance-stress-variant")?
                 }
+                "--instance-debug-view" => {
+                    options.instance_debug_view = parse_next(&mut args, "--instance-debug-view")?
+                }
+                "--instance-layout" => {
+                    options.instance_layout = parse_next(&mut args, "--instance-layout")?
+                }
                 "--render-policy" => {
                     options.render_policy = parse_next(&mut args, "--render-policy")?
                 }
@@ -822,7 +849,7 @@ impl LiveOptions {
                 "--hot-reload" => options.hot_reload = true,
                 "--no-hot-reload" => options.hot_reload = false,
                 "--help" | "-h" => bail!(
-                    "usage: neo-live-window [path.neo] [--title TEXT] [--width N] [--height N] [--frames N] [--seconds N] [--presenter d3d12-interop|d3d12|d3d11|gdi] [--mode live|kernel-throughput|mesh-demo|instance-stress] [--sample-every N] [--present-target-fps N] [--kernel-target-fps N] [--max-inflight N] [--present-ring N] [--instance-grid XxYxZ] [--instance-stress-variant baseline|fast|culled|tiled] [--render-policy auto|force-render|pause-when-empty] [--d3d-upload mapped-copy|update-subresource] [--interop-fallback no-interop|fail] [--hot-reload|--no-hot-reload]"
+                    "usage: neo-live-window [path.neo] [--title TEXT] [--width N] [--height N] [--frames N] [--seconds N] [--presenter d3d12-interop|d3d12|d3d11|gdi] [--mode live|kernel-throughput|mesh-demo|instance-stress] [--sample-every N] [--present-target-fps N] [--kernel-target-fps N] [--max-inflight N] [--present-ring N] [--instance-grid XxYxZ] [--instance-stress-variant baseline|fast|culled|tiled] [--instance-debug-view off|tile-range|iterations|hit-miss] [--instance-layout aosoa32|aosoa64] [--render-policy auto|force-render|pause-when-empty] [--d3d-upload mapped-copy|update-subresource] [--interop-fallback no-interop|fail] [--hot-reload|--no-hot-reload]"
                 ),
                 value if value.starts_with('-') => bail!("unknown option `{value}`"),
                 value => options.source_path = PathBuf::from(value),
@@ -1068,7 +1095,7 @@ enum InstanceStressVariant {
 }
 
 impl InstanceStressVariant {
-    fn source_path(self, requested: &Path) -> PathBuf {
+    fn source_path(self, requested: &Path, layout: StressInstanceLayout) -> PathBuf {
         if requested
             .file_name()
             .is_some_and(|name| name == "three_d_instances.neo")
@@ -1079,7 +1106,12 @@ impl InstanceStressVariant {
                 }
                 Self::Fast => return requested.with_file_name("three_d_instances_fast.neo"),
                 Self::Culled => {}
-                Self::Tiled => return requested.with_file_name("three_d_instances_tiled.neo"),
+                Self::Tiled => {
+                    return requested.with_file_name(match layout {
+                        StressInstanceLayout::AoSoA32 => "three_d_instances_tiled_aosoa32.neo",
+                        StressInstanceLayout::AoSoA64 => "three_d_instances_tiled_aosoa64.neo",
+                    });
+                }
             }
         }
         requested.to_path_buf()
@@ -1109,6 +1141,94 @@ impl std::fmt::Display for InstanceStressVariant {
             Self::Fast => f.write_str("fast"),
             Self::Culled => f.write_str("culled"),
             Self::Tiled => f.write_str("tiled"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstanceDebugView {
+    Off,
+    TileRange,
+    Iterations,
+    HitMiss,
+}
+
+impl InstanceDebugView {
+    fn code(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::TileRange => 1,
+            Self::Iterations => 2,
+            Self::HitMiss => 3,
+        }
+    }
+}
+
+impl std::str::FromStr for InstanceDebugView {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "off" => Ok(Self::Off),
+            "tile-range" => Ok(Self::TileRange),
+            "iterations" => Ok(Self::Iterations),
+            "hit-miss" => Ok(Self::HitMiss),
+            _ => bail!(
+                "unknown instance debug view `{value}`; expected off, tile-range, iterations, or hit-miss"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for InstanceDebugView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => f.write_str("off"),
+            Self::TileRange => f.write_str("tile-range"),
+            Self::Iterations => f.write_str("iterations"),
+            Self::HitMiss => f.write_str("hit-miss"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StressInstanceLayout {
+    AoSoA32,
+    AoSoA64,
+}
+
+impl StressInstanceLayout {
+    fn group_size(self) -> u32 {
+        match self {
+            Self::AoSoA32 => 32,
+            Self::AoSoA64 => 64,
+        }
+    }
+
+    fn data_layout(self) -> DataLayout {
+        DataLayout::AoSoA {
+            group_size: self.group_size(),
+        }
+    }
+}
+
+impl std::str::FromStr for StressInstanceLayout {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "aosoa32" => Ok(Self::AoSoA32),
+            "aosoa64" => Ok(Self::AoSoA64),
+            _ => bail!("unknown instance layout `{value}`; expected aosoa32 or aosoa64"),
+        }
+    }
+}
+
+impl std::fmt::Display for StressInstanceLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AoSoA32 => f.write_str("aosoa32"),
+            Self::AoSoA64 => f.write_str("aosoa64"),
         }
     }
 }
@@ -1706,6 +1826,7 @@ struct CameraParams {
     forward: [f32; 4],
     grid: [u32; 4],
     view: [f32; 4],
+    config: [u32; 4],
 }
 
 struct InstanceStressAssets {
@@ -1721,13 +1842,14 @@ fn create_instance_stress_assets(
     neo: &NeoContext,
     grid: InstanceGrid,
     present_ring: usize,
+    instance_layout: StressInstanceLayout,
 ) -> Result<InstanceStressAssets> {
     let mesh = create_demo_mesh(neo)?;
     let instance_count = grid
         .count()
         .ok_or_else(|| anyhow!("instance grid count overflow"))?;
     let instances = create_stress_instances(grid)?;
-    let instance_buffer = InstanceBuffer::upload_typed(
+    let instance_buffer = InstanceBuffer::upload_typed_with_layout(
         neo,
         InstanceBufferDesc {
             instance_count,
@@ -1758,6 +1880,7 @@ fn create_instance_stress_assets(
             },
         },
         &instances,
+        instance_layout.data_layout(),
     )
     .context("failed to upload instance stress InstanceBuffer")?;
     let camera_len = std::mem::size_of::<CameraParams>();
@@ -2104,6 +2227,7 @@ impl CameraController {
             forward: [forward[0], forward[1], forward[2], 0.0],
             grid: [grid.x, grid.y, grid.z, grid.count().unwrap_or(0)],
             view: [tan_x, tan_y, 0.085, 0.0],
+            config: [0, 32, 0, 0],
         }
     }
 
@@ -3244,6 +3368,8 @@ struct ThroughputLogContext<'a> {
     reload_error: Option<&'a str>,
     kernel_cap: Option<f32>,
     instance_variant: Option<InstanceStressVariant>,
+    instance_layout: Option<String>,
+    instance_debug_view: Option<InstanceDebugView>,
     render_policy: RenderPolicy,
     visibility: RenderVisibility,
 }
@@ -3351,12 +3477,21 @@ impl ThroughputCounter {
             .instance_variant
             .map(|variant| format!(" | instance_variant {variant}"))
             .unwrap_or_default();
+        let layout_marker = context
+            .instance_layout
+            .as_deref()
+            .map(|layout| format!(" | instance_layout {layout}"))
+            .unwrap_or_default();
+        let debug_marker = context
+            .instance_debug_view
+            .map(|view| format!(" | instance_debug {view}"))
+            .unwrap_or_default();
         let presenter = context.presenter;
         let render_policy = context.render_policy;
         let visibility = context.visibility;
         let frame = context.frame;
         println!(
-            "kernel_fps {kernel_fps:>9.1} | sample_fps {sample_fps:>6.1} | present_fps {present_fps:>6.1} | completed {:>10} | frame {frame:>8} | {}x{} | {mb_frame:>5.1} MB/frame | dtoh {dtoh_gbps:>5.1} GB/s {sample_us:>6.1} us | upload {upload_gbps:>5.1} GB/s map_copy {map_copy_us:>6.1} us | gpu_copy {draw_us:>6.1} us | swap {swap_us:>6.1} us | present {present_us:>6.1} us | launch {launch_us:>5.1} us/k | wait {wait_us:>5.1} us/k | presenter {presenter} | kernel_cap {kernel_cap} | render_policy {render_policy} | visibility {visibility} | kernel {reload_state}{interop_marker}{variant_marker}",
+            "kernel_fps {kernel_fps:>9.1} | sample_fps {sample_fps:>6.1} | present_fps {present_fps:>6.1} | completed {:>10} | frame {frame:>8} | {}x{} | {mb_frame:>5.1} MB/frame | dtoh {dtoh_gbps:>5.1} GB/s {sample_us:>6.1} us | upload {upload_gbps:>5.1} GB/s map_copy {map_copy_us:>6.1} us | gpu_copy {draw_us:>6.1} us | swap {swap_us:>6.1} us | present {present_us:>6.1} us | launch {launch_us:>5.1} us/k | wait {wait_us:>5.1} us/k | presenter {presenter} | kernel_cap {kernel_cap} | render_policy {render_policy} | visibility {visibility} | kernel {reload_state}{interop_marker}{variant_marker}{layout_marker}{debug_marker}",
             self.total_completed, context.size.width, context.size.height
         );
         self.completed_since_log = 0;
@@ -5212,6 +5347,14 @@ mod tests {
             "../../stress-quads/three_d_instances_tiled.neo"
         ))
         .unwrap();
+        validate_instance_kernel_abi(include_str!(
+            "../../stress-quads/three_d_instances_tiled_aosoa32.neo"
+        ))
+        .unwrap();
+        validate_instance_kernel_abi(include_str!(
+            "../../stress-quads/three_d_instances_tiled_aosoa64.neo"
+        ))
+        .unwrap();
         assert!(
             !include_str!("../../stress-quads/three_d_instances_tiled.neo")
                 .contains("instance_cull")
@@ -5341,9 +5484,13 @@ mod tests {
                 "--presenter",
                 "d3d12-interop",
                 "--instance-grid",
-                "128x128x64",
+                "256x256x128",
                 "--instance-stress-variant",
                 "baseline",
+                "--instance-debug-view",
+                "iterations",
+                "--instance-layout",
+                "aosoa64",
                 "--render-policy",
                 "pause-when-empty",
             ]
@@ -5354,12 +5501,54 @@ mod tests {
         assert_eq!(options.mode, RunMode::InstanceStress);
         assert_eq!(options.presenter, PresenterKind::D3d12Interop);
         assert_eq!(options.instance_grid, DEFAULT_INSTANCE_GRID);
-        assert_eq!(options.instance_grid.count(), Some(1_048_576));
+        assert_eq!(options.instance_grid.count(), Some(8_388_608));
         assert_eq!(
             options.instance_stress_variant,
             InstanceStressVariant::Baseline
         );
+        assert_eq!(options.instance_debug_view, InstanceDebugView::Iterations);
+        assert_eq!(options.instance_layout, StressInstanceLayout::AoSoA64);
         assert_eq!(options.render_policy, RenderPolicy::PauseWhenEmpty);
+    }
+
+    #[test]
+    fn instance_debug_view_accepts_expected_values() {
+        assert_eq!(
+            "off".parse::<InstanceDebugView>().unwrap(),
+            InstanceDebugView::Off
+        );
+        assert_eq!(
+            "tile-range".parse::<InstanceDebugView>().unwrap(),
+            InstanceDebugView::TileRange
+        );
+        assert_eq!(
+            "iterations".parse::<InstanceDebugView>().unwrap(),
+            InstanceDebugView::Iterations
+        );
+        assert_eq!(
+            "hit-miss".parse::<InstanceDebugView>().unwrap(),
+            InstanceDebugView::HitMiss
+        );
+        let err = "cost".parse::<InstanceDebugView>().unwrap_err().to_string();
+        assert!(err.contains("expected off, tile-range, iterations, or hit-miss"));
+    }
+
+    #[test]
+    fn instance_layout_accepts_aosoa32_and_aosoa64() {
+        assert_eq!(
+            "aosoa32".parse::<StressInstanceLayout>().unwrap(),
+            StressInstanceLayout::AoSoA32
+        );
+        assert_eq!(
+            "aosoa64".parse::<StressInstanceLayout>().unwrap(),
+            StressInstanceLayout::AoSoA64
+        );
+        assert_eq!(StressInstanceLayout::AoSoA64.group_size(), 64);
+        let err = "soa"
+            .parse::<StressInstanceLayout>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected aosoa32 or aosoa64"));
     }
 
     #[test]
@@ -5406,20 +5595,24 @@ mod tests {
     fn instance_stress_variant_resolves_stock_sources() {
         let requested = Path::new("D:/Neo/examples/stress-quads/three_d_instances.neo");
         assert_eq!(
-            InstanceStressVariant::Baseline.source_path(requested),
+            InstanceStressVariant::Baseline.source_path(requested, StressInstanceLayout::AoSoA32),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_baseline.neo")
         );
         assert_eq!(
-            InstanceStressVariant::Fast.source_path(requested),
+            InstanceStressVariant::Fast.source_path(requested, StressInstanceLayout::AoSoA32),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_fast.neo")
         );
         assert_eq!(
-            InstanceStressVariant::Culled.source_path(requested),
+            InstanceStressVariant::Culled.source_path(requested, StressInstanceLayout::AoSoA32),
             requested.to_path_buf()
         );
         assert_eq!(
-            InstanceStressVariant::Tiled.source_path(requested),
-            PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_tiled.neo")
+            InstanceStressVariant::Tiled.source_path(requested, StressInstanceLayout::AoSoA32),
+            PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_tiled_aosoa32.neo")
+        );
+        assert_eq!(
+            InstanceStressVariant::Tiled.source_path(requested, StressInstanceLayout::AoSoA64),
+            PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_tiled_aosoa64.neo")
         );
     }
 
@@ -5467,7 +5660,7 @@ mod tests {
         let mut camera = CameraController::new();
         let params = camera.params(PhysicalSize::new(1280, 720), 1.0, DEFAULT_INSTANCE_GRID);
         assert!(camera.auto);
-        assert_eq!(params.grid, [128, 128, 64, 1_048_576]);
+        assert_eq!(params.grid, [256, 256, 128, 8_388_608]);
         assert!(params.view[0] > params.view[1]);
     }
 
@@ -5522,7 +5715,7 @@ mod tests {
         let edge_visible = camera.params(size, 1.0, DEFAULT_INSTANCE_GRID);
         assert!(instance_lattice_visible(&edge_visible));
 
-        camera.yaw = std::f32::consts::FRAC_PI_2 + 2.4;
+        camera.yaw = std::f32::consts::FRAC_PI_2 + 3.1;
         let fully_empty = camera.params(size, 1.01, DEFAULT_INSTANCE_GRID);
         assert!(!instance_lattice_visible(&fully_empty));
     }

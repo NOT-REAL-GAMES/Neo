@@ -1,65 +1,175 @@
 # Neo
 
-Neo is a tiny v0 graphics-kernel language prototype for explicit, SIMD-oriented
-GPU work on NVIDIA hardware. The current backend lowers `.neo` kernels to CUDA C,
-compiles them with NVRTC through Rust, launches them with the CUDA driver API,
-and writes a compute-generated image.
+Neo is a Rust-based, NVIDIA-first graphics kernel language and runtime. It began
+as a tiny `.neo` to CUDA C prototype, and is now growing into an explicit,
+SIMD-oriented graphics stack: kernels, GPU-owned buffers, D3D12/CUDA interop
+presentation, mesh and instance resources, AoSoA layouts, and live stress demos.
+
+The design goal is still the same: no hidden global graphics state. Host code owns
+resources and launch dimensions; Neo kernels receive explicit pointers and
+metadata. The friendly app layer can make common workflows concise, but the
+low-level handles stay available.
+
+## Current Highlights
+
+- `.neo` kernels lower to CUDA C and compile at runtime with NVRTC.
+- `neo-runtime` provides CUDA context/module/kernel launch helpers, device
+  buffers, pinned buffers, CUDA fences/streams/graphs, image output, mesh buffers,
+  instance buffers, and D3D12/CUDA external-memory interop.
+- `neo-live-window` runs live kernels in a Win32 window with hot reload, FPS
+  logging, D3D12 interop presentation, fallback upload presenters, kernel caps,
+  presentation caps, idle/visibility throttling, and stress modes.
+- `MeshBuffer`, `InstanceBuffer`, `StructuredBuffer`, `DataLayout::AoS`,
+  `DataLayout::SoA`, and `DataLayout::AoSoA { group_size }` make layout explicit.
+- The current flagship stress path renders an 8,388,608 instance
+  `256x256x128` 3D quad field through D3D12/CUDA interop, with AoSoA32/AoSoA64
+  comparison and GPU-side debug heatmaps.
+- `neo-app` is the friendlier Rust layer: builder-style configuration on top of
+  the runtime, not a replacement for it.
+
+## Quick Commands
+
+Basic compiler/runtime checks:
 
 ```powershell
 cargo run -p neo-cli -- doctor
 cargo run -p neo-cli -- compile examples/gradient.neo --out target/gradient.cu
 cargo run -p neo-cli -- run examples/gradient.neo --out target/gradient.png
-cargo run -p neo-live-window -- examples/live-window/live.neo
-cargo run -p neo-live-window -- examples/live-window/live.neo --width 960 --height 540 --seconds 3
-cargo run -p neo-live-window --release -- examples/live-window/live.neo --width 960 --height 540 --seconds 3 --mode kernel-throughput --sample-every 256
-cargo run -p neo-live-window --release -- examples/live-window/live.neo --width 3440 --height 1440 --seconds 3 --mode kernel-throughput --present-target-fps 60
 ```
 
-The compiler is intentionally small in v0: kernel signatures are parsed as Neo,
-while kernel bodies use a modern C-like subset with targeted rewrites for `let`,
-Neo scalar/vector names, and builtins such as `thread_id()` and `block_id()`.
+Live plasma/image kernel:
 
-## v0 Language Shape
+```powershell
+cargo run -p neo-live-window --release -- examples/live-window/live.neo --presenter d3d12-interop
+```
+
+Kernel throughput with visible interop presentation:
+
+```powershell
+cargo run -p neo-live-window --release -- examples/live-window/live.neo --width 3440 --height 1440 --mode kernel-throughput --presenter d3d12-interop --kernel-target-fps 1000 --present-target-fps 1000 --no-hot-reload
+```
+
+Flagship 8M 3D quad stress launcher:
+
+```powershell
+cargo run -p neo-quad-stress-3d --release
+```
+
+Tweakable 8M stress command with debug views:
+
+```powershell
+cargo run -p neo-live-window --release -- examples/stress-quads/three_d_instances.neo --mode instance-stress --presenter d3d12-interop --kernel-target-fps 1000 --present-target-fps 1000 --max-inflight 8 --present-ring 8 --instance-grid 256x256x128 --instance-stress-variant tiled --instance-layout aosoa32 --instance-debug-view iterations --render-policy auto --no-hot-reload --interop-fallback fail
+```
+
+Debug views:
+
+- `--instance-debug-view off`: normal render.
+- `--instance-debug-view tile-range`: tile candidate layer-window heatmap.
+- `--instance-debug-view iterations`: per-pixel traversal-count heatmap.
+- `--instance-debug-view hit-miss`: hit/miss/early-background diagnostic colors.
+
+Layout comparison:
+
+- `--instance-layout aosoa32`: default NVIDIA warp-sized AoSoA grouping.
+- `--instance-layout aosoa64`: two-warp grouping for cache/neighbor experiments.
+
+## Language Shape
+
+Neo source files contain explicit kernel entrypoints:
 
 ```neo
-kernel fn image(global u8* pixels, u32 width, u32 height) {
+kernel fn image(global u8* pixels, u32 width, u32 height, f32 time, u32 frame) {
     let x: u32 = block_id().x * block_dim().x + thread_id().x;
+    let y: u32 = block_id().y * block_dim().y + thread_id().y;
 }
 ```
 
-Supported v0 concepts:
+Supported concepts include:
+
 - `kernel fn` entrypoints with explicit parameters.
 - Address-space markers: `global`, `shared`, `local`.
-- Scalar/vector names: `bool`, `i32`, `u8`, `u32`, `f32`, `vec2f`, `vec3f`, `vec4f`.
+- Scalar/vector names: `bool`, `i32`, `u8`, `u32`, `f32`, `vec2f`, `vec3f`,
+  `vec4f`, `u8x4_unorm`.
 - SIMD launch builtins: `thread_id()`, `block_id()`, `block_dim()`, `grid_dim()`.
-- Explicit host launch through `neo-runtime`; no hidden global graphics state.
+- Block synchronization via `block_barrier()`.
+- Declarative layout syntax such as `layout aosoa(32) Instance { ... }`.
 
-## Runtime Notes
+The parser/lowering layer is intentionally compact. Kernel bodies are a modern
+C-like subset with targeted Neo rewrites rather than a full CUDA clone. Runtime
+preludes provide mesh and instance helpers when compiling through `neo-runtime`.
 
-`neo doctor` reports CUDA driver and NVRTC discovery. On Windows, Neo checks
-`PATH`, `CUDA_PATH`, installed CUDA Toolkit folders, and a couple of NVIDIA app
-SDK locations before compiling. A full CUDA Toolkit install remains the cleanest
-setup, but v0 can use a compatible `nvrtc64_120_0.dll` already present on this
-machine.
+## Runtime And Presentation
 
-## Live Window
+The fast live path is Windows + NVIDIA + D3D12/CUDA interop. Neo owns linear BGRA
+frame buffers in shared GPU memory; CUDA writes them, D3D12 copies/presents them,
+and there is no CPU readback or upload in the interop path.
 
-`neo-live-window` opens a Win32 window, launches the Neo `image` kernel into a
-CUDA-owned device buffer every frame, downloads into a reused host buffer, and
-presents through a no-interop Win32 presenter. This path intentionally avoids
-CUDA/OpenGL, CUDA/D3D, Vulkan external memory, registered graphics buffers, and
-mapped graphics resources. The live kernel ABI is:
+Fallback no-interop presenters remain useful for comparison and debugging:
 
-```neo
-kernel fn image(global u8* pixels, u32 width, u32 height, f32 time, u32 frame)
+- `--presenter d3d12`: D3D12 flip-model upload path.
+- `--presenter d3d11`: D3D11 flip-model upload path.
+- `--presenter gdi`: simple CPU fallback.
+
+`--mode kernel-throughput` separates completed CUDA kernel FPS from sampled
+readbacks and visible presentation. `--kernel-target-fps` caps GPU work;
+`--present-target-fps` caps visible updates. `--render-policy auto` can pause or
+throttle when the window is minimized, occluded, or the structured stress scene
+is off-screen.
+
+## Resource Model
+
+Neo's modern buffer direction is explicit and runtime-owned:
+
+- `MeshBuffer` is the replacement for loose vertex/index buffers.
+- `InstanceBuffer` stores repeated instance data on the GPU.
+- `StructuredBuffer` and `DataLayout` make AoS/SoA/AoSoA choices visible.
+- AoSoA defaults to 32 lanes for NVIDIA-friendly warp access, with explicit
+  alternatives such as 64 lanes when benchmarking says it helps.
+
+The stress renderer uses one base quad mesh plus millions of GPU-resident
+instances. The specialized tiled kernels read known AoSoA streams directly for
+the hot path, while generic helper-based kernels remain available for
+compatibility and experiments.
+
+## Workspace Map
+
+- `crates/neo-lang`: lexer/parser, AST, diagnostics, and CUDA C lowering.
+- `crates/neo-runtime`: CUDA/NVRTC runtime, buffers, mesh/instance resources,
+  layout packing, D3D12 interop, and launch helpers.
+- `crates/neo-cli`: doctor/compile/run commands.
+- `crates/neo-app`: friendly Rust builder layer over the runtime/live stack.
+- `examples/live-window`: main live window, throughput, mesh, and instance stress
+  frontend.
+- `examples/stress-quads`: 2D and 3D stress kernels.
+- `examples/stress-quads-3d`: fixed flagship 8M quad stress launcher.
+- `examples/friendly-demo`: concise app-layer demo.
+
+## Setup Notes
+
+Neo currently targets Windows + NVIDIA first. A working NVIDIA driver is required,
+and NVRTC must be discoverable. `neo doctor` checks `PATH`, `CUDA_PATH`, installed
+CUDA Toolkit folders, and common NVIDIA SDK locations.
+
+Recommended verification before pushing changes:
+
+```powershell
+cargo fmt --all -- --check
+cargo clippy --workspace -- -D warnings
+cargo test --workspace
 ```
 
-The app watches the `.neo` file and hot reloads it. If compilation fails, it
-keeps rendering the last good kernel and prints the error to stderr. FPS is
-logged to the console once per second. The live presenter expects BGRA8 pixels
-so Win32 can consume the buffer without a CPU color swizzle.
+## Aspirations
 
-Use `--mode kernel-throughput` to measure completed Neo kernels separately from
-sampled readbacks and visible presents. This is the intended mode for the 10k
-kernel FPS target. Use `--present-target-fps N` when you want a specific visible
-preview cadence while leaving kernel throughput uncapped.
+Neo is heading toward a graphics language/runtime where high-level convenience
+does not erase low-level control:
+
+- friendly app construction without hiding ownership,
+- first-class layout and data-oriented GPU resources,
+- compute-first rendering experiments that can later meet raster/graphics API
+  interop cleanly,
+- specialization where performance matters,
+- diagnostics and heatmaps that make GPU work visible instead of mystical.
+
+The v0 contract is still preserved in [docs/v0.md](docs/v0.md), but the root
+README now tracks the living project: a fast, explicit, weirdly fun graphics
+language taking shape one measured stress test at a time.

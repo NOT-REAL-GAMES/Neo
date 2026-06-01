@@ -271,8 +271,8 @@ const MESH_INDEX_U32: u32 = 2;
 const MESH_TOPOLOGY_TRIANGLE_LIST: u32 = 1;
 
 const INSTANCE_MAGIC: u32 = 0x4948_454e;
-const INSTANCE_VERSION: u32 = 1;
-const INSTANCE_HEADER_BYTES: usize = 32;
+const INSTANCE_VERSION: u32 = 2;
+const INSTANCE_HEADER_BYTES: usize = 40;
 const INSTANCE_ATTRIBUTE_BYTES: usize = 16;
 
 const INSTANCE_SEMANTIC_POSITION: u32 = 1;
@@ -284,6 +284,102 @@ const INSTANCE_FORMAT_F32X2: u32 = 1;
 const INSTANCE_FORMAT_F32X3: u32 = 2;
 const INSTANCE_FORMAT_F32X4: u32 = 3;
 const INSTANCE_FORMAT_U8X4_UNORM: u32 = 4;
+
+pub const DEFAULT_AOSOA_GROUP_SIZE: u32 = 32;
+const DATA_LAYOUT_AOS: u32 = 0;
+const DATA_LAYOUT_SOA: u32 = 1;
+const DATA_LAYOUT_AOSOA: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataLayout {
+    AoS,
+    SoA,
+    AoSoA { group_size: u32 },
+}
+
+impl DataLayout {
+    pub fn aosoa32() -> Self {
+        Self::AoSoA {
+            group_size: DEFAULT_AOSOA_GROUP_SIZE,
+        }
+    }
+
+    pub fn aosoa64() -> Self {
+        Self::AoSoA { group_size: 64 }
+    }
+
+    fn code(self) -> u32 {
+        match self {
+            Self::AoS => DATA_LAYOUT_AOS,
+            Self::SoA => DATA_LAYOUT_SOA,
+            Self::AoSoA { .. } => DATA_LAYOUT_AOSOA,
+        }
+    }
+
+    fn group_size(self) -> u32 {
+        match self {
+            Self::AoS | Self::SoA => 1,
+            Self::AoSoA { group_size } => group_size,
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::AoS => "aos".to_string(),
+            Self::SoA => "soa".to_string(),
+            Self::AoSoA { group_size } => format!("aosoa{group_size}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferFormat {
+    F32x2,
+    F32x3,
+    F32x4,
+    U8x4Unorm,
+}
+
+impl BufferFormat {
+    fn code(self) -> u32 {
+        match self {
+            Self::F32x2 => INSTANCE_FORMAT_F32X2,
+            Self::F32x3 => INSTANCE_FORMAT_F32X3,
+            Self::F32x4 => INSTANCE_FORMAT_F32X4,
+            Self::U8x4Unorm => INSTANCE_FORMAT_U8X4_UNORM,
+        }
+    }
+
+    fn byte_len(self) -> u32 {
+        match self {
+            Self::F32x2 => 8,
+            Self::F32x3 => 12,
+            Self::F32x4 => 16,
+            Self::U8x4Unorm => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferField {
+    pub semantic: u32,
+    pub format: BufferFormat,
+    pub offset: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredBufferDesc {
+    pub element_count: u32,
+    pub source_stride: u32,
+    pub layout: DataLayout,
+    pub fields: Vec<BufferField>,
+}
+
+pub struct StructuredBuffer {
+    buffer: DeviceBuffer<u8>,
+    desc: StructuredBufferDesc,
+    byte_len: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VertexSemantic {
@@ -380,6 +476,64 @@ pub struct InstanceBuffer {
     buffer: DeviceBuffer<u8>,
     desc: InstanceBufferDesc,
     byte_len: usize,
+    data_layout: DataLayout,
+}
+
+impl StructuredBuffer {
+    pub fn upload_aos(
+        ctx: &Context,
+        mut desc: StructuredBufferDesc,
+        source_bytes: &[u8],
+    ) -> Result<Self, RuntimeError> {
+        desc.layout = DataLayout::AoS;
+        Self::upload(ctx, desc, source_bytes)
+    }
+
+    pub fn upload_soa(
+        ctx: &Context,
+        mut desc: StructuredBufferDesc,
+        source_bytes: &[u8],
+    ) -> Result<Self, RuntimeError> {
+        desc.layout = DataLayout::SoA;
+        Self::upload(ctx, desc, source_bytes)
+    }
+
+    pub fn upload_aosoa(
+        ctx: &Context,
+        mut desc: StructuredBufferDesc,
+        source_bytes: &[u8],
+        group_size: u32,
+    ) -> Result<Self, RuntimeError> {
+        desc.layout = DataLayout::AoSoA { group_size };
+        Self::upload(ctx, desc, source_bytes)
+    }
+
+    fn upload(
+        ctx: &Context,
+        desc: StructuredBufferDesc,
+        source_bytes: &[u8],
+    ) -> Result<Self, RuntimeError> {
+        let blob = pack_structured_buffer(&desc, source_bytes)?;
+        let byte_len = blob.len();
+        let buffer = DeviceBuffer::upload(ctx, &blob)?;
+        Ok(Self {
+            buffer,
+            desc,
+            byte_len,
+        })
+    }
+
+    pub fn desc(&self) -> &StructuredBufferDesc {
+        &self.desc
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
 }
 
 impl InstanceBuffer {
@@ -388,13 +542,23 @@ impl InstanceBuffer {
         desc: InstanceBufferDesc,
         instance_bytes: &[u8],
     ) -> Result<Self, RuntimeError> {
-        let blob = pack_instance_buffer(&desc, instance_bytes)?;
+        Self::upload_with_layout(ctx, desc, instance_bytes, DataLayout::AoS)
+    }
+
+    pub fn upload_with_layout(
+        ctx: &Context,
+        desc: InstanceBufferDesc,
+        instance_bytes: &[u8],
+        data_layout: DataLayout,
+    ) -> Result<Self, RuntimeError> {
+        let blob = pack_instance_buffer_with_layout(&desc, instance_bytes, data_layout)?;
         let byte_len = blob.len();
         let buffer = DeviceBuffer::upload(ctx, &blob)?;
         Ok(Self {
             buffer,
             desc,
             byte_len,
+            data_layout,
         })
     }
 
@@ -409,8 +573,28 @@ impl InstanceBuffer {
         Self::upload(ctx, desc, slice_as_bytes(instances))
     }
 
+    pub fn upload_typed_with_layout<I>(
+        ctx: &Context,
+        desc: InstanceBufferDesc,
+        instances: &[I],
+        data_layout: DataLayout,
+    ) -> Result<Self, RuntimeError>
+    where
+        I: Copy,
+    {
+        Self::upload_with_layout(ctx, desc, slice_as_bytes(instances), data_layout)
+    }
+
     pub fn desc(&self) -> &InstanceBufferDesc {
         &self.desc
+    }
+
+    pub fn data_layout(&self) -> DataLayout {
+        self.data_layout
+    }
+
+    pub fn layout_label(&self) -> String {
+        self.data_layout.label()
     }
 
     pub fn byte_len(&self) -> usize {
@@ -586,42 +770,234 @@ fn validate_mesh_buffer(
     Ok(())
 }
 
+#[cfg(test)]
 fn pack_instance_buffer(
     desc: &InstanceBufferDesc,
     instance_bytes: &[u8],
 ) -> Result<Vec<u8>, RuntimeError> {
+    pack_instance_buffer_with_layout(desc, instance_bytes, DataLayout::AoS)
+}
+
+fn pack_instance_buffer_with_layout(
+    desc: &InstanceBufferDesc,
+    instance_bytes: &[u8],
+    data_layout: DataLayout,
+) -> Result<Vec<u8>, RuntimeError> {
     validate_instance_buffer(desc, instance_bytes)?;
-    let attr_count = desc.instance_layout.attributes.len();
+    let structured = StructuredBufferDesc {
+        element_count: desc.instance_count,
+        source_stride: desc.instance_layout.stride,
+        layout: data_layout,
+        fields: desc
+            .instance_layout
+            .attributes
+            .iter()
+            .map(|attr| BufferField {
+                semantic: attr.semantic.code(),
+                format: attr.format.into(),
+                offset: attr.offset,
+            })
+            .collect(),
+    };
+    pack_structured_buffer(&structured, instance_bytes)
+}
+
+fn pack_structured_buffer(
+    desc: &StructuredBufferDesc,
+    source_bytes: &[u8],
+) -> Result<Vec<u8>, RuntimeError> {
+    validate_structured_buffer(desc, source_bytes)?;
+    let attr_count = desc.fields.len();
     let attr_bytes_offset = INSTANCE_HEADER_BYTES;
-    let instance_bytes_offset = align_usize(
+    let data_bytes_offset = align_usize(
         attr_bytes_offset + attr_count * INSTANCE_ATTRIBUTE_BYTES,
         16,
     );
-    let total_bytes = instance_bytes_offset + instance_bytes.len();
+    let stream_offsets = structured_stream_offsets(desc)?;
+    let data_len = structured_data_len(desc, &stream_offsets)?;
+    let total_bytes = data_bytes_offset
+        .checked_add(data_len)
+        .ok_or(RuntimeError::HostBufferTooLarge)?;
     let mut blob = vec![0u8; total_bytes];
     let header = [
         INSTANCE_MAGIC,
         INSTANCE_VERSION,
         INSTANCE_HEADER_BYTES as u32,
-        desc.instance_count,
-        desc.instance_layout.stride,
-        instance_bytes_offset as u32,
+        desc.element_count,
+        desc.source_stride,
+        data_bytes_offset as u32,
         attr_count as u32,
         attr_bytes_offset as u32,
+        desc.layout.code(),
+        desc.layout.group_size(),
     ];
     for (idx, value) in header.into_iter().enumerate() {
         write_u32_le(&mut blob, idx * 4, value);
     }
-    for (idx, attr) in desc.instance_layout.attributes.iter().enumerate() {
+    for (idx, field) in desc.fields.iter().enumerate() {
         let offset = attr_bytes_offset + idx * INSTANCE_ATTRIBUTE_BYTES;
-        write_u32_le(&mut blob, offset, attr.semantic.code());
-        write_u32_le(&mut blob, offset + 4, attr.format.code());
-        write_u32_le(&mut blob, offset + 8, attr.offset);
-        write_u32_le(&mut blob, offset + 12, 0);
+        let device_offset = match desc.layout {
+            DataLayout::AoS => field.offset,
+            DataLayout::SoA | DataLayout::AoSoA { .. } => stream_offsets[idx] as u32,
+        };
+        write_u32_le(&mut blob, offset, field.semantic);
+        write_u32_le(&mut blob, offset + 4, field.format.code());
+        write_u32_le(&mut blob, offset + 8, device_offset);
+        write_u32_le(&mut blob, offset + 12, field.offset);
     }
-    blob[instance_bytes_offset..instance_bytes_offset + instance_bytes.len()]
-        .copy_from_slice(instance_bytes);
+    match desc.layout {
+        DataLayout::AoS => blob[data_bytes_offset..data_bytes_offset + source_bytes.len()]
+            .copy_from_slice(source_bytes),
+        DataLayout::SoA | DataLayout::AoSoA { .. } => {
+            copy_structured_streams(
+                desc,
+                source_bytes,
+                &stream_offsets,
+                &mut blob[data_bytes_offset..],
+            )?;
+        }
+    }
     Ok(blob)
+}
+
+fn validate_structured_buffer(
+    desc: &StructuredBufferDesc,
+    source_bytes: &[u8],
+) -> Result<(), RuntimeError> {
+    if desc.source_stride == 0 {
+        return Err(RuntimeError::Instance(
+            "structured source stride must be greater than zero".to_string(),
+        ));
+    }
+    if desc.layout.group_size() == 0 {
+        return Err(RuntimeError::Instance(
+            "AoSoA group size must be greater than zero".to_string(),
+        ));
+    }
+    let expected_bytes = usize::try_from(desc.element_count)
+        .ok()
+        .and_then(|count| count.checked_mul(desc.source_stride as usize))
+        .ok_or(RuntimeError::HostBufferTooLarge)?;
+    if source_bytes.len() != expected_bytes {
+        return Err(RuntimeError::Instance(format!(
+            "expected {expected_bytes} structured source bytes, got {}",
+            source_bytes.len()
+        )));
+    }
+    let mut seen = Vec::new();
+    for field in &desc.fields {
+        if seen.contains(&field.semantic) {
+            return Err(RuntimeError::Instance(format!(
+                "duplicate buffer semantic {}",
+                field.semantic
+            )));
+        }
+        seen.push(field.semantic);
+        let end = field
+            .offset
+            .checked_add(field.format.byte_len())
+            .ok_or(RuntimeError::HostBufferTooLarge)?;
+        if end > desc.source_stride {
+            return Err(RuntimeError::Instance(format!(
+                "buffer field semantic {} extends past stride {}",
+                field.semantic, desc.source_stride
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn structured_stream_offsets(desc: &StructuredBufferDesc) -> Result<Vec<usize>, RuntimeError> {
+    let mut offsets = Vec::with_capacity(desc.fields.len());
+    let mut cursor = 0usize;
+    for field in &desc.fields {
+        cursor = align_usize(cursor, 4);
+        offsets.push(cursor);
+        cursor = cursor
+            .checked_add(structured_stream_byte_len(desc, field.format)?)
+            .ok_or(RuntimeError::HostBufferTooLarge)?;
+    }
+    Ok(offsets)
+}
+
+fn structured_data_len(
+    desc: &StructuredBufferDesc,
+    stream_offsets: &[usize],
+) -> Result<usize, RuntimeError> {
+    match desc.layout {
+        DataLayout::AoS => usize::try_from(desc.element_count)
+            .ok()
+            .and_then(|count| count.checked_mul(desc.source_stride as usize))
+            .ok_or(RuntimeError::HostBufferTooLarge),
+        DataLayout::SoA | DataLayout::AoSoA { .. } => {
+            let Some((last_index, last_field)) = desc.fields.iter().enumerate().next_back() else {
+                return Ok(0);
+            };
+            stream_offsets[last_index]
+                .checked_add(structured_stream_byte_len(desc, last_field.format)?)
+                .ok_or(RuntimeError::HostBufferTooLarge)
+        }
+    }
+}
+
+fn structured_stream_byte_len(
+    desc: &StructuredBufferDesc,
+    format: BufferFormat,
+) -> Result<usize, RuntimeError> {
+    let element_size = format.byte_len() as usize;
+    match desc.layout {
+        DataLayout::AoS => usize::try_from(desc.element_count)
+            .ok()
+            .and_then(|count| count.checked_mul(desc.source_stride as usize))
+            .ok_or(RuntimeError::HostBufferTooLarge),
+        DataLayout::SoA => usize::try_from(desc.element_count)
+            .ok()
+            .and_then(|count| count.checked_mul(element_size))
+            .ok_or(RuntimeError::HostBufferTooLarge),
+        DataLayout::AoSoA { group_size } => {
+            let groups = desc.element_count.div_ceil(group_size);
+            usize::try_from(groups)
+                .ok()
+                .and_then(|groups| groups.checked_mul(group_size as usize))
+                .and_then(|slots| slots.checked_mul(element_size))
+                .ok_or(RuntimeError::HostBufferTooLarge)
+        }
+    }
+}
+
+fn copy_structured_streams(
+    desc: &StructuredBufferDesc,
+    source_bytes: &[u8],
+    stream_offsets: &[usize],
+    dst: &mut [u8],
+) -> Result<(), RuntimeError> {
+    for element in 0..desc.element_count as usize {
+        for (field_index, field) in desc.fields.iter().enumerate() {
+            let element_size = field.format.byte_len() as usize;
+            let src_offset = element
+                .checked_mul(desc.source_stride as usize)
+                .and_then(|offset| offset.checked_add(field.offset as usize))
+                .ok_or(RuntimeError::HostBufferTooLarge)?;
+            let dst_offset = match desc.layout {
+                DataLayout::SoA => stream_offsets[field_index]
+                    .checked_add(element * element_size)
+                    .ok_or(RuntimeError::HostBufferTooLarge)?,
+                DataLayout::AoSoA { group_size } => {
+                    let group_size = group_size as usize;
+                    let group = element / group_size;
+                    let lane = element % group_size;
+                    stream_offsets[field_index]
+                        .checked_add(group * group_size * element_size)
+                        .and_then(|offset| offset.checked_add(lane * element_size))
+                        .ok_or(RuntimeError::HostBufferTooLarge)?
+                }
+                DataLayout::AoS => unreachable!("AoS does not use stream copy"),
+            };
+            dst[dst_offset..dst_offset + element_size]
+                .copy_from_slice(&source_bytes[src_offset..src_offset + element_size]);
+        }
+    }
+    Ok(())
 }
 
 fn validate_instance_buffer(
@@ -724,21 +1100,23 @@ impl InstanceSemantic {
 }
 
 impl InstanceFormat {
-    fn code(self) -> u32 {
-        match self {
-            Self::F32x2 => INSTANCE_FORMAT_F32X2,
-            Self::F32x3 => INSTANCE_FORMAT_F32X3,
-            Self::F32x4 => INSTANCE_FORMAT_F32X4,
-            Self::U8x4Unorm => INSTANCE_FORMAT_U8X4_UNORM,
-        }
-    }
-
     fn byte_len(self) -> u32 {
         match self {
             Self::F32x2 => 8,
             Self::F32x3 => 12,
             Self::F32x4 => 16,
             Self::U8x4Unorm => 4,
+        }
+    }
+}
+
+impl From<InstanceFormat> for BufferFormat {
+    fn from(value: InstanceFormat) -> Self {
+        match value {
+            InstanceFormat::F32x2 => Self::F32x2,
+            InstanceFormat::F32x3 => Self::F32x3,
+            InstanceFormat::F32x4 => Self::F32x4,
+            InstanceFormat::U8x4Unorm => Self::U8x4Unorm,
         }
     }
 }
@@ -882,6 +1260,8 @@ struct NeoInstanceHeader {{
     unsigned int instance_bytes_offset;
     unsigned int attr_count;
     unsigned int attr_bytes_offset;
+    unsigned int layout_kind;
+    unsigned int group_size;
 }};
 
 struct NeoInstanceAttribute {{
@@ -912,8 +1292,22 @@ __device__ __forceinline__ unsigned int neo_instance_bytes_offset(const unsigned
     return neo_instance_header(instances)->instance_bytes_offset;
 }}
 
+__device__ __forceinline__ unsigned int neo_instance_layout_kind(const unsigned char* instances) {{
+    const NeoInstanceHeader* header = neo_instance_header(instances);
+    return header->version >= 2u ? header->layout_kind : {DATA_LAYOUT_AOS}u;
+}}
+
+__device__ __forceinline__ unsigned int neo_instance_group_size(const unsigned char* instances) {{
+    const NeoInstanceHeader* header = neo_instance_header(instances);
+    unsigned int group_size = header->version >= 2u ? header->group_size : 1u;
+    return group_size == 0u ? 1u : group_size;
+}}
+
 __device__ __forceinline__ const unsigned char* neo_instance_payload(const unsigned char* instances, unsigned int instance_id) {{
     const NeoInstanceHeader* header = neo_instance_header(instances);
+    if (neo_instance_layout_kind(instances) != {DATA_LAYOUT_AOS}u) {{
+        return 0;
+    }}
     return instances + header->instance_bytes_offset + instance_id * header->instance_stride;
 }}
 
@@ -928,17 +1322,54 @@ __device__ __forceinline__ const NeoInstanceAttribute* neo_instance_find_attr(co
     return 0;
 }}
 
+__device__ __forceinline__ unsigned int neo_instance_format_size(unsigned int format);
+
 __device__ __forceinline__ const unsigned char* neo_instance_attr_bytes(const unsigned char* instances, const NeoInstanceAttribute* attr, unsigned int instance_id) {{
     const NeoInstanceHeader* header = neo_instance_header(instances);
+    unsigned int layout_kind = neo_instance_layout_kind(instances);
+    if (layout_kind == {DATA_LAYOUT_SOA}u) {{
+        unsigned int element_size = neo_instance_format_size(attr->format);
+        return instances + header->instance_bytes_offset + attr->offset + instance_id * element_size;
+    }}
+    if (layout_kind == {DATA_LAYOUT_AOSOA}u) {{
+        unsigned int group_size = neo_instance_group_size(instances);
+        unsigned int element_size = neo_instance_format_size(attr->format);
+        unsigned int group = instance_id / group_size;
+        unsigned int lane = instance_id - group * group_size;
+        return instances + header->instance_bytes_offset + attr->offset + group * group_size * element_size + lane * element_size;
+    }}
     return instances + header->instance_bytes_offset + instance_id * header->instance_stride + attr->offset;
 }}
 
-__device__ __forceinline__ float3 neo_instance_position3f(const unsigned char* instances, unsigned int instance_id) {{
+__device__ __forceinline__ unsigned int neo_instance_format_size(unsigned int format) {{
+    if (format == {INSTANCE_FORMAT_F32X2}u) return 8u;
+    if (format == {INSTANCE_FORMAT_F32X3}u) return 12u;
+    if (format == {INSTANCE_FORMAT_F32X4}u) return 16u;
+    if (format == {INSTANCE_FORMAT_U8X4_UNORM}u) return 4u;
+    return 0u;
+}}
+
+__device__ __forceinline__ const NeoInstanceAttribute* neo_instance_position_attr(const unsigned char* instances) {{
+    return neo_instance_find_attr(instances, {INSTANCE_SEMANTIC_POSITION}u);
+}}
+
+__device__ __forceinline__ const NeoInstanceAttribute* neo_instance_rotation_attr(const unsigned char* instances) {{
+    return neo_instance_find_attr(instances, {INSTANCE_SEMANTIC_ROTATION}u);
+}}
+
+__device__ __forceinline__ const NeoInstanceAttribute* neo_instance_scale_attr(const unsigned char* instances) {{
+    return neo_instance_find_attr(instances, {INSTANCE_SEMANTIC_SCALE}u);
+}}
+
+__device__ __forceinline__ const NeoInstanceAttribute* neo_instance_color_attr(const unsigned char* instances) {{
+    return neo_instance_find_attr(instances, {INSTANCE_SEMANTIC_COLOR0}u);
+}}
+
+__device__ __forceinline__ float3 neo_instance_position3f_attr(const unsigned char* instances, const NeoInstanceAttribute* attr, unsigned int instance_id) {{
     const NeoInstanceHeader* header = neo_instance_header(instances);
     if (instance_id >= header->instance_count) {{
         return make_float3(0.0f, 0.0f, 0.0f);
     }}
-    const NeoInstanceAttribute* attr = neo_instance_find_attr(instances, {INSTANCE_SEMANTIC_POSITION}u);
     if (attr == 0) {{
         return make_float3(0.0f, 0.0f, 0.0f);
     }}
@@ -952,12 +1383,15 @@ __device__ __forceinline__ float3 neo_instance_position3f(const unsigned char* i
     return make_float3(0.0f, 0.0f, 0.0f);
 }}
 
-__device__ __forceinline__ float4 neo_instance_rotation4f(const unsigned char* instances, unsigned int instance_id) {{
+__device__ __forceinline__ float3 neo_instance_position3f(const unsigned char* instances, unsigned int instance_id) {{
+    return neo_instance_position3f_attr(instances, neo_instance_position_attr(instances), instance_id);
+}}
+
+__device__ __forceinline__ float4 neo_instance_rotation4f_attr(const unsigned char* instances, const NeoInstanceAttribute* attr, unsigned int instance_id) {{
     const NeoInstanceHeader* header = neo_instance_header(instances);
     if (instance_id >= header->instance_count) {{
         return make_float4(0.0f, 0.0f, 0.0f, 1.0f);
     }}
-    const NeoInstanceAttribute* attr = neo_instance_find_attr(instances, {INSTANCE_SEMANTIC_ROTATION}u);
     if (attr == 0 || attr->format != {INSTANCE_FORMAT_F32X4}u) {{
         return make_float4(0.0f, 0.0f, 0.0f, 1.0f);
     }}
@@ -965,12 +1399,15 @@ __device__ __forceinline__ float4 neo_instance_rotation4f(const unsigned char* i
     return make_float4(values[0], values[1], values[2], values[3]);
 }}
 
-__device__ __forceinline__ float2 neo_instance_scale2f(const unsigned char* instances, unsigned int instance_id) {{
+__device__ __forceinline__ float4 neo_instance_rotation4f(const unsigned char* instances, unsigned int instance_id) {{
+    return neo_instance_rotation4f_attr(instances, neo_instance_rotation_attr(instances), instance_id);
+}}
+
+__device__ __forceinline__ float2 neo_instance_scale2f_attr(const unsigned char* instances, const NeoInstanceAttribute* attr, unsigned int instance_id) {{
     const NeoInstanceHeader* header = neo_instance_header(instances);
     if (instance_id >= header->instance_count) {{
         return make_float2(1.0f, 1.0f);
     }}
-    const NeoInstanceAttribute* attr = neo_instance_find_attr(instances, {INSTANCE_SEMANTIC_SCALE}u);
     if (attr == 0) {{
         return make_float2(1.0f, 1.0f);
     }}
@@ -981,16 +1418,23 @@ __device__ __forceinline__ float2 neo_instance_scale2f(const unsigned char* inst
     return make_float2(1.0f, 1.0f);
 }}
 
-__device__ __forceinline__ unsigned int neo_instance_color4u8(const unsigned char* instances, unsigned int instance_id) {{
+__device__ __forceinline__ float2 neo_instance_scale2f(const unsigned char* instances, unsigned int instance_id) {{
+    return neo_instance_scale2f_attr(instances, neo_instance_scale_attr(instances), instance_id);
+}}
+
+__device__ __forceinline__ unsigned int neo_instance_color4u8_attr(const unsigned char* instances, const NeoInstanceAttribute* attr, unsigned int instance_id) {{
     const NeoInstanceHeader* header = neo_instance_header(instances);
     if (instance_id >= header->instance_count) {{
         return 0xffffffffu;
     }}
-    const NeoInstanceAttribute* attr = neo_instance_find_attr(instances, {INSTANCE_SEMANTIC_COLOR0}u);
     if (attr == 0 || attr->format != {INSTANCE_FORMAT_U8X4_UNORM}u) {{
         return 0xffffffffu;
     }}
     return *((const unsigned int*)neo_instance_attr_bytes(instances, attr, instance_id));
+}}
+
+__device__ __forceinline__ unsigned int neo_instance_color4u8(const unsigned char* instances, unsigned int instance_id) {{
+    return neo_instance_color4u8_attr(instances, neo_instance_color_attr(instances), instance_id);
 }}
 "#
     )
@@ -2265,10 +2709,57 @@ mod tests {
         assert_eq!(read_u32_le(&blob, 8), INSTANCE_HEADER_BYTES as u32);
         assert_eq!(read_u32_le(&blob, 12), 3);
         assert_eq!(read_u32_le(&blob, 16), 40);
-        assert_eq!(read_u32_le(&blob, 20), 96);
+        assert_eq!(read_u32_le(&blob, 20), 112);
         assert_eq!(read_u32_le(&blob, 24), 4);
         assert_eq!(read_u32_le(&blob, 28), INSTANCE_HEADER_BYTES as u32);
-        assert_eq!(blob.len(), 216);
+        assert_eq!(read_u32_le(&blob, 32), DATA_LAYOUT_AOS);
+        assert_eq!(read_u32_le(&blob, 36), 1);
+        assert_eq!(blob.len(), 232);
+    }
+
+    #[test]
+    fn structured_buffer_packs_soa_and_aosoa_offsets() {
+        let desc = StructuredBufferDesc {
+            element_count: 3,
+            source_stride: 16,
+            layout: DataLayout::SoA,
+            fields: vec![
+                BufferField {
+                    semantic: INSTANCE_SEMANTIC_POSITION,
+                    format: BufferFormat::F32x3,
+                    offset: 0,
+                },
+                BufferField {
+                    semantic: INSTANCE_SEMANTIC_COLOR0,
+                    format: BufferFormat::U8x4Unorm,
+                    offset: 12,
+                },
+            ],
+        };
+        let mut source = vec![0u8; 3 * 16];
+        source[0..4].copy_from_slice(&1.0f32.to_le_bytes());
+        source[16..20].copy_from_slice(&2.0f32.to_le_bytes());
+        source[32..36].copy_from_slice(&3.0f32.to_le_bytes());
+        let soa = pack_structured_buffer(&desc, &source).unwrap();
+        assert_eq!(read_u32_le(&soa, 32), DATA_LAYOUT_SOA);
+        assert_eq!(read_u32_le(&soa, 40 + 8), 0);
+        assert_eq!(read_u32_le(&soa, 56 + 8), 36);
+        assert_eq!(f32::from_le_bytes(soa[80..84].try_into().unwrap()), 1.0);
+        assert_eq!(f32::from_le_bytes(soa[92..96].try_into().unwrap()), 2.0);
+        assert_eq!(f32::from_le_bytes(soa[104..108].try_into().unwrap()), 3.0);
+
+        let mut aosoa_desc = desc;
+        aosoa_desc.layout = DataLayout::AoSoA { group_size: 32 };
+        let aosoa = pack_structured_buffer(&aosoa_desc, &source).unwrap();
+        assert_eq!(read_u32_le(&aosoa, 32), DATA_LAYOUT_AOSOA);
+        assert_eq!(read_u32_le(&aosoa, 36), 32);
+        assert_eq!(read_u32_le(&aosoa, 56 + 8), 384);
+
+        aosoa_desc.layout = DataLayout::aosoa64();
+        let aosoa64 = pack_structured_buffer(&aosoa_desc, &source).unwrap();
+        assert_eq!(read_u32_le(&aosoa64, 32), DATA_LAYOUT_AOSOA);
+        assert_eq!(read_u32_le(&aosoa64, 36), 64);
+        assert_eq!(read_u32_le(&aosoa64, 56 + 8), 768);
     }
 
     #[test]

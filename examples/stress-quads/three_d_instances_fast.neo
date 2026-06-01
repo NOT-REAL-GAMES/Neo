@@ -104,18 +104,18 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
             let iy: u32 = as_u32(iy_i);
             let instance_id: u32 = layer * grid_x * grid_y + iy * grid_x + ix;
             if (instance_id < instance_count) {
-                let payload: unsigned char* = (unsigned char*)neo_instance_payload(instances, instance_id);
-                let values: float* = (float*)payload;
-                let pos_x: f32 = values[0];
-                let pos_y: f32 = values[1];
-                let pos_z: f32 = values[2];
-                let rx: f32 = values[3];
-                let ry: f32 = values[4];
-                let rz: f32 = values[5];
-                let rw: f32 = values[6];
-                let scale_x: f32 = values[7];
-                let scale_y: f32 = values[8];
-                let color_ptr: unsigned int* = (unsigned int*)(payload + 36u);
+                let pos: vec3f = neo_instance_position3f(instances, instance_id);
+                let rot: vec4f = neo_instance_rotation4f(instances, instance_id);
+                let scale: vec2f = neo_instance_scale2f(instances, instance_id);
+                let pos_x: f32 = pos.x;
+                let pos_y: f32 = pos.y;
+                let pos_z: f32 = pos.z;
+                let rx: f32 = rot.x;
+                let ry: f32 = rot.y;
+                let rz: f32 = rot.z;
+                let rw: f32 = rot.w;
+                let scale_x: f32 = scale.x;
+                let scale_y: f32 = scale.y;
 
                 let nx_uv_x: f32 = ry;
                 let nx_uv_y: f32 = -rx;
@@ -148,7 +148,7 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
 
                         if (fabsf(local_x) <= scale_x && fabsf(local_y) <= scale_y && fabsf(local_z) <= spacing * 0.08f) {
                             let shade: f32 = fmaxf(0.18f, fabsf(normal_x * -dir_x + normal_y * -dir_y + normal_z * -dir_z));
-                            let c: u32 = color_ptr[0];
+                            let c: u32 = neo_instance_color4u8(instances, instance_id);
                             let b: u32 = as_u32(as_f32(c & 255u) * shade) & 255u;
                             let g: u32 = as_u32(as_f32((c >> 8u) & 255u) * shade) & 255u;
                             let r: u32 = as_u32(as_f32((c >> 16u) & 255u) * shade) & 255u;
