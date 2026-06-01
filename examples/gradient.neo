@@ -1,0 +1,17 @@
+kernel fn image(global u8* pixels, u32 width, u32 height) {
+    let x: u32 = block_id().x * block_dim().x + thread_id().x;
+    let y: u32 = block_id().y * block_dim().y + thread_id().y;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    let fx: f32 = as_f32(x) / as_f32(width - 1u);
+    let fy: f32 = as_f32(y) / as_f32(height - 1u);
+    let idx: u32 = (y * width + x) * 4u;
+
+    pixels[idx + 0u] = as_u8(255.0f * fx);
+    pixels[idx + 1u] = as_u8(255.0f * fy);
+    pixels[idx + 2u] = as_u8(255.0f * (0.25f + 0.75f * (1.0f - fx) * fy));
+    pixels[idx + 3u] = 255u;
+}

@@ -1,0 +1,27 @@
+[workspace]
+members = [
+    "crates/neo-cli",
+    "crates/neo-lang",
+    "crates/neo-runtime",
+    "examples/live-window",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+clap = { version = "4.5.39", features = ["derive"] }
+cudarc = { version = "0.19.7", default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-12000"] }
+image = { version = "0.25.6", default-features = false, features = ["png"] }
+neo-lang = { path = "crates/neo-lang" }
+neo-runtime = { path = "crates/neo-runtime" }
+notify = "9.0.0-rc.4"
+raw-window-handle = "0.6.2"
+thiserror = "2.0.12"
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D_Fxc", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }
+winit = "0.30.0"
