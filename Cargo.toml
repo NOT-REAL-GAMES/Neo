@@ -1,9 +1,13 @@
 [workspace]
 members = [
+    "crates/neo-app",
     "crates/neo-cli",
     "crates/neo-lang",
     "crates/neo-runtime",
+    "examples/friendly-demo",
     "examples/live-window",
+    "examples/stress-quads",
+    "examples/stress-quads-3d",
 ]
 resolver = "2"
 
@@ -18,10 +22,12 @@ clap = { version = "4.5.39", features = ["derive"] }
 cudarc = { version = "0.19.7", default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-12000"] }
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 neo-lang = { path = "crates/neo-lang" }
+neo-app = { path = "crates/neo-app" }
+neo-live-window = { path = "examples/live-window" }
 neo-runtime = { path = "crates/neo-runtime" }
 notify = "9.0.0-rc.4"
 raw-window-handle = "0.6.2"
 thiserror = "2.0.12"
-windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D_Fxc", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Security", "Win32_System_Threading"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }
 winit = "0.30.0"

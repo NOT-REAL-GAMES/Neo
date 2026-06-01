@@ -7,10 +7,22 @@ kernel fn image(global u8* pixels, u32 width, u32 height, f32 time, u32 frame) {
     }
 
     let idx: u32 = y * width + x;
-    let tick: u32 = as_u32(time * 240.0f);
-    let b: u32 = (x + tick) & 255u;
-    let g: u32 = (y * 2u + tick) & 255u;
-    let r: u32 = (x + y + tick * 2u) & 255u;
+    let fx: f32 = (as_f32(x) + 0.5f) / as_f32(width);
+    let fy: f32 = (as_f32(y) + 0.5f) / as_f32(height);
+    let aspect: f32 = as_f32(width) / as_f32(height);
+    let px: f32 = (fx * 2.0f - 1.0f) * aspect;
+    let py: f32 = fy * 2.0f - 1.0f;
+    let t: f32 = time * 1.37f;
+
+    let wave0: f32 = sinf(px * 18.0f + t);
+    let wave1: f32 = cosf(py * 15.0f - t * 1.31f);
+    let wave2: f32 = sinf((px + py) * 12.0f + t * 0.73f);
+    let wave3: f32 = cosf((px * px + py * py) * 9.0f - t * 1.91f);
+    let v: f32 = wave0 * 0.35f + wave1 * 0.27f + wave2 * 0.21f + wave3 * 0.17f;
+
+    let r: u32 = as_u32((sinf(v * 3.10f + t * 0.90f) + 1.0f) * 127.5f) & 255u;
+    let g: u32 = as_u32((sinf(v * 4.70f - t * 1.20f + px) + 1.0f) * 127.5f) & 255u;
+    let b: u32 = as_u32((cosf(v * 5.30f + t * 1.60f + py) + 1.0f) * 127.5f) & 255u;
     let bgra: u32 = b | (g << 8u) | (r << 16u) | 0xff000000u;
 
     ((unsigned int*)pixels)[idx] = bgra;

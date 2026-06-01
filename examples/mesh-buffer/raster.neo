@@ -1,0 +1,56 @@
+kernel fn raster(global u8* pixels, u32 width, u32 height, global u8* mesh, f32 time, u32 frame) {
+    let x: u32 = block_id().x * block_dim().x + thread_id().x;
+    let y: u32 = block_id().y * block_dim().y + thread_id().y;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    let idx: u32 = y * width + x;
+    let fx: f32 = (as_f32(x) + 0.5f) / as_f32(width);
+    let fy: f32 = (as_f32(y) + 0.5f) / as_f32(height);
+    let aspect: f32 = as_f32(width) / as_f32(height);
+    let px: f32 = (fx * 2.0f - 1.0f) * aspect;
+    let py: f32 = 1.0f - fy * 2.0f;
+    let c: f32 = cosf(time * 0.9f);
+    let s: f32 = sinf(time * 0.9f);
+    let tri_count: u32 = neo_mesh_triangle_count(mesh);
+    let grid_b: u32 = as_u32((fx + time * 0.04f) * 64.0f) & 31u;
+    let grid_g: u32 = as_u32((fy + time * 0.03f) * 64.0f) & 31u;
+    let background: u32 = 0xff101018u | (grid_b << 16u) | (grid_g << 8u);
+    let color: u32 = background;
+
+    for (unsigned int tri = 0u; tri < tri_count; ++tri) {
+        let i0: u32 = neo_mesh_index(mesh, tri * 3u + 0u);
+        let i1: u32 = neo_mesh_index(mesh, tri * 3u + 1u);
+        let i2: u32 = neo_mesh_index(mesh, tri * 3u + 2u);
+        let p0: vec3f = neo_mesh_position3f(mesh, i0);
+        let p1: vec3f = neo_mesh_position3f(mesh, i1);
+        let p2: vec3f = neo_mesh_position3f(mesh, i2);
+
+        let sx0: f32 = p0.x * c - p0.y * s;
+        let sy0: f32 = p0.x * s + p0.y * c;
+        let sx1: f32 = p1.x * c - p1.y * s;
+        let sy1: f32 = p1.x * s + p1.y * c;
+        let sx2: f32 = p2.x * c - p2.y * s;
+        let sy2: f32 = p2.x * s + p2.y * c;
+
+        let denom: f32 = (sy1 - sy2) * (sx0 - sx2) + (sx2 - sx1) * (sy0 - sy2);
+        if (denom != 0.0f) {
+            let w0: f32 = ((sy1 - sy2) * (px - sx2) + (sx2 - sx1) * (py - sy2)) / denom;
+            let w1: f32 = ((sy2 - sy0) * (px - sx2) + (sx0 - sx2) * (py - sy2)) / denom;
+            let w2: f32 = 1.0f - w0 - w1;
+            if (w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f) {
+                let c0: u32 = neo_mesh_color4u8(mesh, i0);
+                let c1: u32 = neo_mesh_color4u8(mesh, i1);
+                let c2: u32 = neo_mesh_color4u8(mesh, i2);
+                let b: u32 = as_u32(as_f32(c0 & 255u) * w0 + as_f32(c1 & 255u) * w1 + as_f32(c2 & 255u) * w2) & 255u;
+                let g: u32 = as_u32(as_f32((c0 >> 8u) & 255u) * w0 + as_f32((c1 >> 8u) & 255u) * w1 + as_f32((c2 >> 8u) & 255u) * w2) & 255u;
+                let r: u32 = as_u32(as_f32((c0 >> 16u) & 255u) * w0 + as_f32((c1 >> 16u) & 255u) * w1 + as_f32((c2 >> 16u) & 255u) * w2) & 255u;
+                color = b | (g << 8u) | (r << 16u) | 0xff000000u;
+            }
+        }
+    }
+
+    ((unsigned int*)pixels)[idx] = color;
+}

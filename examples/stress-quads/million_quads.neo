@@ -1,0 +1,38 @@
+kernel fn image(global u8* pixels, u32 width, u32 height, f32 time, u32 frame) {
+    let x: u32 = block_id().x * block_dim().x + thread_id().x;
+    let y: u32 = block_id().y * block_dim().y + thread_id().y;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    let quads_per_axis: u32 = 1024u;
+    let idx: u32 = y * width + x;
+    let fx: f32 = (as_f32(x) + 0.5f) / as_f32(width);
+    let fy: f32 = (as_f32(y) + 0.5f) / as_f32(height);
+    let cell_x: f32 = fx * as_f32(quads_per_axis);
+    let cell_y: f32 = fy * as_f32(quads_per_axis);
+    let quad_x: u32 = as_u32(cell_x);
+    let quad_y: u32 = as_u32(cell_y);
+    let local_x: f32 = cell_x - as_f32(quad_x);
+    let local_y: f32 = cell_y - as_f32(quad_y);
+    let quad_id: u32 = quad_y * quads_per_axis + quad_x;
+
+    let wave: f32 = sinf(cell_x * 0.017f + cell_y * 0.011f + time * 3.0f);
+    let margin: f32 = 0.10f + (wave + 1.0f) * 0.025f;
+    let inside_x: bool = local_x > margin && local_x < (1.0f - margin);
+    let inside_y: bool = local_y > margin && local_y < (1.0f - margin);
+
+    let hash: u32 = quad_id * 747796405u + frame * 2891336453u + 0x9e3779b9u;
+    let r: u32 = ((hash >> 16u) & 255u);
+    let g: u32 = ((hash >> 8u) & 255u);
+    let b: u32 = (hash & 255u);
+    let edge: u32 = 0xff111018u;
+    let quad_color: u32 = b | (g << 8u) | (r << 16u) | 0xff000000u;
+
+    if (inside_x && inside_y) {
+        ((unsigned int*)pixels)[idx] = quad_color;
+    } else {
+        ((unsigned int*)pixels)[idx] = edge;
+    }
+}

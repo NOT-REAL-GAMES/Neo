@@ -9,3 +9,4 @@ cudarc.workspace = true
 image.workspace = true
 neo-lang.workspace = true
 thiserror.workspace = true
+windows.workspace = true

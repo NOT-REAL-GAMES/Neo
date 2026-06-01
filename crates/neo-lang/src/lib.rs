@@ -168,6 +168,7 @@ fn rewrite_body(body: &str) -> String {
         .replace("block_id()", "blockIdx")
         .replace("block_dim()", "blockDim")
         .replace("grid_dim()", "gridDim")
+        .replace("block_barrier()", "__syncthreads()")
         .replace("vec2f(", "make_float2(")
         .replace("vec3f(", "make_float3(")
         .replace("vec4f(", "make_float4(")
@@ -177,6 +178,9 @@ fn rewrite_line(line: &str) -> String {
     let indent_len = line.len() - line.trim_start().len();
     let (indent, rest) = line.split_at(indent_len);
     let trimmed = rest.trim_start();
+    if let Some(shared) = trimmed.strip_prefix("shared ") {
+        return rewrite_shared_line(indent, shared);
+    }
     if !trimmed.starts_with("let ") {
         return line.to_string();
     }
@@ -201,6 +205,19 @@ fn rewrite_line(line: &str) -> String {
     };
 
     format!("{indent}{cuda_ty} {name} = {expr}")
+}
+
+fn rewrite_shared_line(indent: &str, shared: &str) -> String {
+    let shared = shared.trim_start();
+    let Some(split) = shared.find(char::is_whitespace) else {
+        return format!("{indent}shared {shared}");
+    };
+    let (ty, rest) = shared.split_at(split);
+    let cuda_ty = match parse_type_name_text(ty) {
+        Some(ty) => cuda_type_name(&ty),
+        None => ty,
+    };
+    format!("{indent}__shared__ {cuda_ty} {}", rest.trim_start())
 }
 
 fn parse_type_name_text(text: &str) -> Option<TypeName> {
@@ -578,5 +595,15 @@ mod tests {
         )
         .unwrap();
         assert!(cuda.contains("float4 color = make_float4"));
+    }
+
+    #[test]
+    fn lowers_shared_locals_and_block_barrier() {
+        let cuda = lower_to_cuda(
+            "kernel fn tile(global u8* pixels) {\n    shared i32 tile_window[4];\n    tile_window[0] = 1;\n    block_barrier();\n}",
+        )
+        .unwrap();
+        assert!(cuda.contains("__shared__ int tile_window[4];"));
+        assert!(cuda.contains("__syncthreads();"));
     }
 }
