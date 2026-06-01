@@ -1,0 +1,11 @@
+[package]
+name = "neo-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+neo-lang.workspace = true
+neo-runtime.workspace = true

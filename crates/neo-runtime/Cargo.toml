@@ -1,0 +1,11 @@
+[package]
+name = "neo-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cudarc.workspace = true
+image.workspace = true
+neo-lang.workspace = true
+thiserror.workspace = true
