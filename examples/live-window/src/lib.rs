@@ -39,6 +39,10 @@ const DEFAULT_HEIGHT: u32 = 540;
 const BLOCK: (u32, u32) = (16, 16);
 const INSTANCE_CULL_TILE: u32 = 8;
 const TILE_CULL_RECORD_BYTES: usize = 16;
+const INSTANCE_MACROCELL_SIZE: u32 = 8;
+const VISIBILITY_HEADER_U32S: usize = 8;
+const VISIBILITY_RECORD_U32S: usize = 6;
+const VISIBILITY_MAGIC: u32 = 0x4e45_4f4d;
 const EMPTY_IDLE_FPS: f32 = 15.0;
 const UNFOCUSED_IDLE_FPS: f32 = 15.0;
 const CAMERA_MOVE_UNITS_PER_SEC: f32 = 4.0;
@@ -1677,7 +1681,7 @@ impl LiveOptions {
                 "--hot-reload" => options.hot_reload = true,
                 "--no-hot-reload" => options.hot_reload = false,
                 "--help" | "-h" => bail!(
-                    "usage: neo-live-window [path.neo] [--title TEXT] [--width N] [--height N] [--frames N] [--seconds N] [--presenter d3d12-interop|d3d12|d3d11|gdi] [--mode live|kernel-throughput|mesh-demo|instance-stress|draw-stress|raster-stress] [--sample-every N] [--present-target-fps N] [--kernel-target-fps N] [--max-inflight N] [--present-ring N] [--instance-grid XxYxZ] [--instance-stress-variant baseline|fast|culled|tiled] [--instance-debug-view off|tile-range|iterations|hit-miss] [--instance-layout aosoa32|aosoa64] [--draw-policy draw-all|compute-culled] [--draw-depth auto|on|off] [--cull-order atomic-compact|stable-dense] [--visibility frustum|projected-size] [--min-projected-pixels N] [--render-policy auto|force-render|pause-when-empty] [--d3d-upload mapped-copy|update-subresource] [--interop-fallback no-interop|fail] [--hot-reload|--no-hot-reload]"
+                    "usage: neo-live-window [path.neo] [--title TEXT] [--width N] [--height N] [--frames N] [--seconds N] [--presenter d3d12-interop|d3d12|d3d11|gdi] [--mode live|kernel-throughput|mesh-demo|instance-stress|draw-stress|raster-stress] [--sample-every N] [--present-target-fps N] [--kernel-target-fps N] [--max-inflight N] [--present-ring N] [--instance-grid XxYxZ] [--instance-stress-variant baseline|fast|culled|tiled|macrocell] [--instance-debug-view off|tile-range|iterations|hit-miss] [--instance-layout aosoa32|aosoa64] [--draw-policy draw-all|compute-culled] [--draw-depth auto|on|off] [--cull-order atomic-compact|stable-dense] [--visibility frustum|projected-size] [--min-projected-pixels N] [--render-policy auto|force-render|pause-when-empty] [--d3d-upload mapped-copy|update-subresource] [--interop-fallback no-interop|fail] [--hot-reload|--no-hot-reload]"
                 ),
                 value if value.starts_with('-') => bail!("unknown option `{value}`"),
                 value => options.source_path = PathBuf::from(value),
@@ -1939,6 +1943,7 @@ enum InstanceStressVariant {
     Fast,
     Culled,
     Tiled,
+    Macrocell,
 }
 
 impl InstanceStressVariant {
@@ -1959,6 +1964,9 @@ impl InstanceStressVariant {
                         StressInstanceLayout::AoSoA64 => "three_d_instances_tiled_aosoa64.neo",
                     });
                 }
+                Self::Macrocell => {
+                    return requested.with_file_name("three_d_instances_macrocell_aosoa32.neo");
+                }
             }
         }
         requested.to_path_buf()
@@ -1974,8 +1982,9 @@ impl std::str::FromStr for InstanceStressVariant {
             "fast" => Ok(Self::Fast),
             "culled" => Ok(Self::Culled),
             "tiled" => Ok(Self::Tiled),
+            "macrocell" => Ok(Self::Macrocell),
             _ => bail!(
-                "unknown instance stress variant `{value}`; expected baseline, fast, culled, or tiled"
+                "unknown instance stress variant `{value}`; expected baseline, fast, culled, tiled, or macrocell"
             ),
         }
     }
@@ -1988,6 +1997,7 @@ impl std::fmt::Display for InstanceStressVariant {
             Self::Fast => f.write_str("fast"),
             Self::Culled => f.write_str("culled"),
             Self::Tiled => f.write_str("tiled"),
+            Self::Macrocell => f.write_str("macrocell"),
         }
     }
 }
@@ -2351,6 +2361,7 @@ struct InstanceKernel {
     raster: Kernel,
     cull: Option<Kernel>,
     tiled: bool,
+    macrocell: bool,
 }
 
 impl InstanceKernel {
@@ -2364,11 +2375,13 @@ impl InstanceKernel {
                 validate_instance_kernel_abi(&source)?;
             }
             InstanceStressVariant::Culled => validate_culled_instance_kernel_abi(&source)?,
+            InstanceStressVariant::Macrocell => validate_macrocell_instance_kernel_abi(&source)?,
         }
         let entrypoints = match variant {
             InstanceStressVariant::Baseline
             | InstanceStressVariant::Fast
-            | InstanceStressVariant::Tiled => {
+            | InstanceStressVariant::Tiled
+            | InstanceStressVariant::Macrocell => {
                 vec!["instance_raster"]
             }
             InstanceStressVariant::Culled => vec!["instance_cull", "instance_raster"],
@@ -2381,7 +2394,11 @@ impl InstanceKernel {
             } else {
                 None
             },
-            tiled: variant == InstanceStressVariant::Tiled,
+            tiled: matches!(
+                variant,
+                InstanceStressVariant::Tiled | InstanceStressVariant::Macrocell
+            ),
+            macrocell: variant == InstanceStressVariant::Macrocell,
         })
     }
 }
@@ -2834,6 +2851,27 @@ fn validate_culled_instance_kernel_abi(source: &str) -> Result<()> {
     )
 }
 
+fn validate_macrocell_instance_kernel_abi(source: &str) -> Result<()> {
+    let program = neo_lang::parse(source)?;
+    validate_kernel_signature(
+        &program,
+        "instance_raster",
+        &[
+            ("pixels", Some(AddressSpace::Global), TypeName::U8, 1usize),
+            ("width", None, TypeName::U32, 0),
+            ("height", None, TypeName::U32, 0),
+            ("mesh", Some(AddressSpace::Global), TypeName::U8, 1),
+            ("instances", Some(AddressSpace::Global), TypeName::U8, 1),
+            ("visibility", Some(AddressSpace::Global), TypeName::U8, 1),
+            ("camera", Some(AddressSpace::Global), TypeName::U8, 1),
+            ("time", None, TypeName::F32, 0),
+            ("frame", None, TypeName::U32, 0),
+        ],
+        "macrocell instance stress kernel",
+        "global u8* pixels, u32 width, u32 height, global u8* mesh, global u8* instances, global u8* visibility, global u8* camera, f32 time, u32 frame",
+    )
+}
+
 fn validate_kernel_signature(
     program: &neo_lang::Program,
     name: &str,
@@ -3125,6 +3163,7 @@ struct CameraParams {
 struct InstanceStressAssets {
     mesh: MeshBuffer,
     instances: InstanceBuffer,
+    visibility: DeviceBuffer<u8>,
     raster_instances: Option<SharedInstanceStream>,
     camera_buffers: Vec<DeviceBuffer<u8>>,
     tile_cull_width: u32,
@@ -3173,6 +3212,8 @@ fn create_instance_stress_assets(
         },
     };
     let data_layout = instance_layout.data_layout();
+    let visibility = DeviceBuffer::upload(neo, &create_visibility_grid_bytes(grid)?)
+        .context("failed to upload macrocell visibility grid")?;
     let instance_buffer = InstanceBuffer::upload_typed_with_layout(
         neo,
         instance_desc.clone(),
@@ -3202,6 +3243,7 @@ fn create_instance_stress_assets(
     Ok(InstanceStressAssets {
         mesh,
         instances: instance_buffer,
+        visibility,
         raster_instances,
         camera_buffers,
         tile_cull_width: 0,
@@ -3233,6 +3275,64 @@ fn tile_cull_byte_len(size: PhysicalSize<u32>) -> Result<usize> {
                 size.height
             )
         })
+}
+
+fn macrocell_grid_size(grid: InstanceGrid) -> Result<(u32, u32, u32)> {
+    grid.validate()?;
+    Ok((
+        grid.x.div_ceil(INSTANCE_MACROCELL_SIZE),
+        grid.y.div_ceil(INSTANCE_MACROCELL_SIZE),
+        grid.z.div_ceil(INSTANCE_MACROCELL_SIZE),
+    ))
+}
+
+fn visibility_grid_u32_len(grid: InstanceGrid) -> Result<usize> {
+    let (mx, my, mz) = macrocell_grid_size(grid)?;
+    mx.checked_mul(my)
+        .and_then(|xy| xy.checked_mul(mz))
+        .and_then(|count| count.checked_mul(VISIBILITY_RECORD_U32S as u32))
+        .and_then(|records| records.checked_add(VISIBILITY_HEADER_U32S as u32))
+        .map(|values| values as usize)
+        .ok_or_else(|| anyhow!("macrocell visibility grid size overflow"))
+}
+
+fn create_visibility_grid_bytes(grid: InstanceGrid) -> Result<Vec<u8>> {
+    let (mx, my, mz) = macrocell_grid_size(grid)?;
+    let mut values = vec![0u32; visibility_grid_u32_len(grid)?];
+    values[0] = VISIBILITY_MAGIC;
+    values[1] = INSTANCE_MACROCELL_SIZE;
+    values[2] = mx;
+    values[3] = my;
+    values[4] = mz;
+    values[5] = mx
+        .checked_mul(my)
+        .and_then(|xy| xy.checked_mul(mz))
+        .ok_or_else(|| anyhow!("macrocell count overflow"))?;
+    values[6] = 0;
+    values[7] = 0;
+
+    let mut record_index = VISIBILITY_HEADER_U32S;
+    for z in 0..mz {
+        for y in 0..my {
+            for x in 0..mx {
+                let min_x = x * INSTANCE_MACROCELL_SIZE;
+                let min_y = y * INSTANCE_MACROCELL_SIZE;
+                let min_z = z * INSTANCE_MACROCELL_SIZE;
+                let max_x = (min_x + INSTANCE_MACROCELL_SIZE - 1).min(grid.x - 1);
+                let max_y = (min_y + INSTANCE_MACROCELL_SIZE - 1).min(grid.y - 1);
+                let max_z = (min_z + INSTANCE_MACROCELL_SIZE - 1).min(grid.z - 1);
+                values[record_index..record_index + VISIBILITY_RECORD_U32S]
+                    .copy_from_slice(&[min_x, max_x, min_y, max_y, min_z, max_z]);
+                record_index += VISIBILITY_RECORD_U32S;
+            }
+        }
+    }
+
+    let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<u32>());
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(bytes)
 }
 
 fn ensure_tile_cull_buffers(
@@ -4624,15 +4724,26 @@ fn run_instance_stress_batch(input: InstanceStressBatch<'_>) -> Result<Throughpu
         let stream_kernel = input.kernel.raster.on_stream(stream);
         {
             let mut launch = stream_kernel.launcher();
-            launch
-                .arg_device_ptr(&pixel_arg)
-                .arg(&kernel_width)
-                .arg(&input.size.height)
-                .arg_mesh(&input.assets.mesh)
-                .arg_instances(&input.assets.instances)
-                .arg_buffer(&input.assets.camera_buffers[index]);
-            if input.kernel.cull.is_some() {
-                launch.arg_buffer(&input.assets.tile_cull_buffers[index]);
+            if input.kernel.macrocell {
+                launch
+                    .arg_device_ptr(&pixel_arg)
+                    .arg(&kernel_width)
+                    .arg(&input.size.height)
+                    .arg_mesh(&input.assets.mesh)
+                    .arg_instances(&input.assets.instances)
+                    .arg_buffer(&input.assets.visibility)
+                    .arg_buffer(&input.assets.camera_buffers[index]);
+            } else {
+                launch
+                    .arg_device_ptr(&pixel_arg)
+                    .arg(&kernel_width)
+                    .arg(&input.size.height)
+                    .arg_mesh(&input.assets.mesh)
+                    .arg_instances(&input.assets.instances)
+                    .arg_buffer(&input.assets.camera_buffers[index]);
+                if input.kernel.cull.is_some() {
+                    launch.arg_buffer(&input.assets.tile_cull_buffers[index]);
+                }
             }
             launch.arg(&time).arg(&frame);
             unsafe {
@@ -8142,6 +8253,17 @@ mod tests {
     }
 
     #[test]
+    fn macrocell_instance_kernel_abi_accepts_visibility_pointer() {
+        let source = "kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* mesh, global u8* instances, global u8* visibility, global u8* camera, f32 time, u32 frame) {}";
+        validate_macrocell_instance_kernel_abi(source).unwrap();
+        let missing_visibility = "kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* mesh, global u8* instances, global u8* camera, f32 time, u32 frame) {}";
+        let err = validate_macrocell_instance_kernel_abi(missing_visibility)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must have 9 params"));
+    }
+
+    #[test]
     fn instance_stress_kernel_keeps_expected_abi() {
         validate_culled_instance_kernel_abi(include_str!(
             "../../stress-quads/three_d_instances.neo"
@@ -8165,6 +8287,10 @@ mod tests {
         .unwrap();
         validate_instance_kernel_abi(include_str!(
             "../../stress-quads/three_d_instances_tiled_aosoa64.neo"
+        ))
+        .unwrap();
+        validate_macrocell_instance_kernel_abi(include_str!(
+            "../../stress-quads/three_d_instances_macrocell_aosoa32.neo"
         ))
         .unwrap();
         assert!(
@@ -9340,7 +9466,7 @@ fragment fn quad_fs() {
     }
 
     #[test]
-    fn instance_stress_variant_accepts_baseline_fast_culled_and_tiled() {
+    fn instance_stress_variant_accepts_baseline_fast_culled_tiled_and_macrocell() {
         assert_eq!(
             "baseline".parse::<InstanceStressVariant>().unwrap(),
             InstanceStressVariant::Baseline
@@ -9357,11 +9483,16 @@ fragment fn quad_fs() {
             "tiled".parse::<InstanceStressVariant>().unwrap(),
             InstanceStressVariant::Tiled
         );
+        assert_eq!(
+            "macrocell".parse::<InstanceStressVariant>().unwrap(),
+            InstanceStressVariant::Macrocell
+        );
+        assert_eq!(InstanceStressVariant::Macrocell.to_string(), "macrocell");
         let err = "turbo"
             .parse::<InstanceStressVariant>()
             .unwrap_err()
             .to_string();
-        assert!(err.contains("expected baseline, fast, culled, or tiled"));
+        assert!(err.contains("expected baseline, fast, culled, tiled, or macrocell"));
     }
 
     #[test]
@@ -9387,6 +9518,80 @@ fragment fn quad_fs() {
             InstanceStressVariant::Tiled.source_path(requested, StressInstanceLayout::AoSoA64),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_tiled_aosoa64.neo")
         );
+        assert_eq!(
+            InstanceStressVariant::Macrocell.source_path(requested, StressInstanceLayout::AoSoA32),
+            PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_macrocell_aosoa32.neo")
+        );
+        assert_eq!(
+            InstanceStressVariant::Macrocell.source_path(requested, StressInstanceLayout::AoSoA64),
+            PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_macrocell_aosoa32.neo")
+        );
+    }
+
+    fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn macrocell_visibility_grid_packs_stable_records() {
+        let grid = InstanceGrid::new(256, 256, 128);
+        assert_eq!(macrocell_grid_size(grid).unwrap(), (32, 32, 16));
+        assert_eq!(
+            visibility_grid_u32_len(grid).unwrap(),
+            VISIBILITY_HEADER_U32S + 32 * 32 * 16 * VISIBILITY_RECORD_U32S
+        );
+        let bytes = create_visibility_grid_bytes(grid).unwrap();
+        assert_eq!(read_u32_le(&bytes, 0), VISIBILITY_MAGIC);
+        assert_eq!(read_u32_le(&bytes, 4), INSTANCE_MACROCELL_SIZE);
+        assert_eq!(read_u32_le(&bytes, 8), 32);
+        assert_eq!(read_u32_le(&bytes, 12), 32);
+        assert_eq!(read_u32_le(&bytes, 16), 16);
+        assert_eq!(read_u32_le(&bytes, 20), 32 * 32 * 16);
+        let first = VISIBILITY_HEADER_U32S * 4;
+        assert_eq!(
+            [
+                read_u32_le(&bytes, first),
+                read_u32_le(&bytes, first + 4),
+                read_u32_le(&bytes, first + 8),
+                read_u32_le(&bytes, first + 12),
+                read_u32_le(&bytes, first + 16),
+                read_u32_le(&bytes, first + 20),
+            ],
+            [0, 7, 0, 7, 0, 7]
+        );
+        let last = bytes.len() - VISIBILITY_RECORD_U32S * 4;
+        assert_eq!(
+            [
+                read_u32_le(&bytes, last),
+                read_u32_le(&bytes, last + 4),
+                read_u32_le(&bytes, last + 8),
+                read_u32_le(&bytes, last + 12),
+                read_u32_le(&bytes, last + 16),
+                read_u32_le(&bytes, last + 20),
+            ],
+            [248, 255, 248, 255, 120, 127]
+        );
+    }
+
+    #[test]
+    fn macrocell_visibility_grid_rounds_up_and_rejects_invalid_sizes() {
+        let grid = InstanceGrid::new(17, 9, 1);
+        assert_eq!(macrocell_grid_size(grid).unwrap(), (3, 2, 1));
+        let bytes = create_visibility_grid_bytes(grid).unwrap();
+        let last = bytes.len() - VISIBILITY_RECORD_U32S * 4;
+        assert_eq!(
+            [
+                read_u32_le(&bytes, last),
+                read_u32_le(&bytes, last + 4),
+                read_u32_le(&bytes, last + 8),
+                read_u32_le(&bytes, last + 12),
+                read_u32_le(&bytes, last + 16),
+                read_u32_le(&bytes, last + 20),
+            ],
+            [16, 16, 8, 8, 0, 0]
+        );
+        assert!(macrocell_grid_size(InstanceGrid::new(0, 1, 1)).is_err());
+        assert!(visibility_grid_u32_len(InstanceGrid::new(u32::MAX, u32::MAX, u32::MAX)).is_err());
     }
 
     #[test]
