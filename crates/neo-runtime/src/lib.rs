@@ -1,5 +1,7 @@
 use std::{
-    collections::BTreeSet,
+    any::Any,
+    fmt,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -10,7 +12,7 @@ use cudarc::{
         DriverError, LaunchArgs, LaunchConfig, PinnedHostSlice, PushKernelArg, ValidAsZeroBits,
         sys,
     },
-    nvrtc::compile_ptx,
+    nvrtc::{Ptx, compile_ptx, result as nvrtc_result},
 };
 use thiserror::Error;
 
@@ -44,6 +46,9 @@ pub enum RuntimeError {
     #[cfg(windows)]
     #[error("D3D12 interop error: {0}")]
     D3d12Interop(String),
+    #[cfg(windows)]
+    #[error("raster error: {0}")]
+    Raster(String),
     #[cfg(windows)]
     #[error("Windows graphics error: {0}")]
     Windows(#[from] windows::core::Error),
@@ -191,11 +196,9 @@ impl Module {
     ) -> Result<Self, RuntimeError> {
         let program = neo_lang::parse(source)?;
         for entrypoint in entrypoints {
-            if !program
-                .kernels
-                .iter()
-                .any(|kernel| kernel.name == *entrypoint)
-            {
+            if !program.kernels.iter().any(|kernel| {
+                kernel.kind == neo_lang::EntryPointKind::Kernel && kernel.name == *entrypoint
+            }) {
                 return Err(RuntimeError::MissingEntrypoint((*entrypoint).to_string()));
             }
         }
@@ -209,8 +212,8 @@ impl Module {
             return Err(RuntimeError::Nvrtc(diagnostics.nvrtc_help()));
         }
         configure_nvrtc_search_path(&diagnostics);
-        let ptx = compile_ptx(&cuda_source).map_err(|err| RuntimeError::Nvrtc(err.to_string()))?;
-        let inner = ctx.inner.load_module(ptx)?;
+        let ptx = compile_cuda_image_checked(ctx, &cuda_source, &diagnostics)?;
+        let inner = load_cuda_module_checked(ctx, ptx)?;
         Ok(Self {
             inner,
             stream: ctx.stream.clone(),
@@ -224,8 +227,8 @@ impl Module {
             return Err(RuntimeError::Nvrtc(diagnostics.nvrtc_help()));
         }
         configure_nvrtc_search_path(&diagnostics);
-        let ptx = compile_ptx(&cuda_source).map_err(|err| RuntimeError::Nvrtc(err.to_string()))?;
-        let inner = ctx.inner.load_module(ptx)?;
+        let ptx = compile_cuda_image_checked(ctx, &cuda_source, &diagnostics)?;
+        let inner = load_cuda_module_checked(ctx, ptx)?;
         Ok(Self {
             inner,
             stream: ctx.stream.clone(),
@@ -585,6 +588,17 @@ impl InstanceBuffer {
         Self::upload_with_layout(ctx, desc, slice_as_bytes(instances), data_layout)
     }
 
+    pub fn pack_typed_with_layout<I>(
+        desc: &InstanceBufferDesc,
+        instances: &[I],
+        data_layout: DataLayout,
+    ) -> Result<Vec<u8>, RuntimeError>
+    where
+        I: Copy,
+    {
+        pack_instance_buffer_with_layout(desc, slice_as_bytes(instances), data_layout)
+    }
+
     pub fn desc(&self) -> &InstanceBufferDesc {
         &self.desc
     }
@@ -599,6 +613,10 @@ impl InstanceBuffer {
 
     pub fn byte_len(&self) -> usize {
         self.byte_len
+    }
+
+    pub fn device_ptr_arg(&self) -> CudaDevicePtrArg {
+        self.buffer.device_ptr_arg()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1444,32 +1462,203 @@ pub fn nvrtc_available() -> bool {
     RuntimeDiagnostics::collect().nvrtc_loadable
 }
 
+fn compile_cuda_image_checked(
+    ctx: &Context,
+    cuda_source: &str,
+    diagnostics: &RuntimeDiagnostics,
+) -> Result<Ptx, RuntimeError> {
+    match compile_cubin_for_context_checked(ctx, cuda_source, diagnostics) {
+        Ok(cubin) => return Ok(Ptx::from_binary(cubin)),
+        Err(err) => {
+            let _ = err;
+        }
+    }
+    compile_ptx_checked(cuda_source, diagnostics)
+}
+
+fn compile_ptx_checked(
+    cuda_source: &str,
+    diagnostics: &RuntimeDiagnostics,
+) -> Result<Ptx, RuntimeError> {
+    let panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = catch_unwind(AssertUnwindSafe(|| compile_ptx(cuda_source)));
+    std::panic::set_hook(panic_hook);
+    result
+        .map_err(|payload| RuntimeError::Nvrtc(nvrtc_panic_help(payload, diagnostics)))?
+        .map_err(|err| RuntimeError::Nvrtc(err.to_string()))
+}
+
+fn compile_cubin_for_context_checked(
+    ctx: &Context,
+    cuda_source: &str,
+    diagnostics: &RuntimeDiagnostics,
+) -> Result<Vec<u8>, RuntimeError> {
+    let (major, minor) = ctx.inner.compute_capability()?;
+    let arch = format!("sm_{major}{minor}");
+    compile_cubin_checked(cuda_source, &arch, diagnostics)
+}
+
+fn compile_cubin_checked(
+    cuda_source: &str,
+    arch: &str,
+    diagnostics: &RuntimeDiagnostics,
+) -> Result<Vec<u8>, RuntimeError> {
+    let panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = catch_unwind(AssertUnwindSafe(|| compile_cubin(cuda_source, arch)));
+    std::panic::set_hook(panic_hook);
+    result.map_err(|payload| RuntimeError::Nvrtc(nvrtc_panic_help(payload, diagnostics)))?
+}
+
+fn compile_cubin(cuda_source: &str, arch: &str) -> Result<Vec<u8>, RuntimeError> {
+    use std::ffi::{CStr, CString};
+
+    let src =
+        CString::new(cuda_source.as_bytes()).expect("CUDA source cannot contain null terminators");
+    let program = nvrtc_result::create_program(src.as_c_str(), None)
+        .map_err(|err| RuntimeError::Nvrtc(err.to_string()))?;
+    let options = vec![format!("--gpu-architecture={arch}")];
+    let compile_result = unsafe { nvrtc_result::compile_program(program, &options) };
+    if let Err(err) = compile_result {
+        let log = unsafe { nvrtc_result::get_program_log(program) }
+            .ok()
+            .map(|raw| {
+                unsafe { CStr::from_ptr(raw.as_ptr()) }
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .unwrap_or_default();
+        unsafe {
+            let _ = nvrtc_result::destroy_program(program);
+        }
+        return Err(RuntimeError::Nvrtc(format!(
+            "native CUBIN compile failed for {arch}: {err}\n{log}"
+        )));
+    }
+    let cubin = unsafe { nvrtc_get_cubin(program) };
+    unsafe {
+        let _ = nvrtc_result::destroy_program(program);
+    }
+    cubin
+}
+
+unsafe fn nvrtc_get_cubin(
+    program: cudarc::nvrtc::sys::nvrtcProgram,
+) -> Result<Vec<u8>, RuntimeError> {
+    let mut size = 0usize;
+    unsafe { cudarc::nvrtc::sys::nvrtcGetCUBINSize(program, &mut size).result() }
+        .map_err(|err| RuntimeError::Nvrtc(err.to_string()))?;
+    let mut cubin = vec![0u8; size];
+    unsafe { cudarc::nvrtc::sys::nvrtcGetCUBIN(program, cubin.as_mut_ptr().cast()).result() }
+        .map_err(|err| RuntimeError::Nvrtc(err.to_string()))?;
+    Ok(cubin)
+}
+
+fn load_cuda_module_checked(
+    ctx: &Context,
+    image: Ptx,
+) -> Result<Arc<cudarc::driver::CudaModule>, RuntimeError> {
+    ctx.inner
+        .load_module(image)
+        .map_err(|err| unsupported_ptx_error(err).unwrap_or(RuntimeError::Driver(err)))
+}
+
+fn unsupported_ptx_error(err: DriverError) -> Option<RuntimeError> {
+    (err.0 == sys::CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION).then(|| {
+        RuntimeError::Nvrtc(
+            "CUDA driver rejected the compiled PTX because it was produced by a newer CUDA Toolkit than this driver supports. Update the NVIDIA driver, install a CUDA Toolkit matching the driver's reported CUDA version, or use Neo's native CUBIN path for the current GPU.".to_string(),
+        )
+    })
+}
+
+fn nvrtc_panic_help(payload: Box<dyn Any + Send>, diagnostics: &RuntimeDiagnostics) -> String {
+    let panic_message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+        .unwrap_or("cudarc panicked while loading NVRTC");
+    format!("{panic_message}\n\n{}", diagnostics.nvrtc_loader_help())
+}
+
 #[cfg(windows)]
 fn nvrtc_candidates() -> Vec<PathBuf> {
     let names = [
         "nvrtc.dll",
         "nvrtc64.dll",
+        "nvrtc64_13.dll",
+        "nvrtc64_130.dll",
+        "nvrtc64_130_0.dll",
         "nvrtc64_12.dll",
         "nvrtc64_120.dll",
         "nvrtc64_120_0.dll",
         "nvrtc64_11.dll",
         "nvrtc64_112_0.dll",
     ];
-    let mut dirs = BTreeSet::new();
-    if let Some(path) = std::env::var_os("PATH") {
-        dirs.extend(std::env::split_paths(&path));
+    let mut dirs = Vec::new();
+    let mut versioned_roots = std::env::vars_os()
+        .filter_map(|(key, root)| {
+            key.to_string_lossy()
+                .starts_with("CUDA_PATH_V")
+                .then(|| PathBuf::from(root))
+        })
+        .collect::<Vec<_>>();
+    versioned_roots.sort_by(|left, right| right.cmp(left));
+    for root in versioned_roots {
+        push_cuda_root_bin_dirs(&mut dirs, root);
     }
     for key in ["CUDA_PATH", "CUDA_HOME"] {
         if let Some(root) = std::env::var_os(key) {
-            dirs.insert(PathBuf::from(root).join("bin"));
+            push_cuda_root_bin_dirs(&mut dirs, PathBuf::from(root));
         }
     }
-    dirs.extend(cuda_toolkit_bin_dirs());
-    dirs.extend(nvidia_app_nvrtc_dirs());
+    let mut toolkit_dirs = cuda_toolkit_bin_dirs();
+    toolkit_dirs.sort_by(|left, right| right.cmp(left));
+    for dir in toolkit_dirs {
+        push_unique_path(&mut dirs, dir);
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            push_unique_path(&mut dirs, dir);
+        }
+    }
+    for dir in nvidia_app_nvrtc_dirs() {
+        push_unique_path(&mut dirs, dir);
+    }
 
     dirs.into_iter()
         .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
         .collect()
+}
+
+#[cfg(windows)]
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+#[cfg(windows)]
+fn push_cuda_root_bin_dirs(paths: &mut Vec<PathBuf>, root: PathBuf) {
+    let bin = root.join("bin");
+    push_unique_path(paths, bin.join("x64"));
+    push_unique_path(paths, bin);
+}
+
+#[cfg(windows)]
+fn compatible_nvrtc_candidate(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "nvrtc.dll" | "nvrtc64.dll" | "nvrtc64_13.dll" | "nvrtc64_130.dll" | "nvrtc64_130_0.dll"
+    )
+}
+
+#[cfg(not(windows))]
+fn compatible_nvrtc_candidate(_path: &Path) -> bool {
+    true
 }
 
 #[cfg(not(windows))]
@@ -1500,6 +1689,7 @@ pub struct RuntimeDiagnostics {
     pub cuda_driver_error: Option<String>,
     pub nvrtc_candidates: Vec<PathBuf>,
     pub nvrtc_found: Vec<PathBuf>,
+    pub nvrtc_compatible: Vec<PathBuf>,
     pub nvrtc_loadable: bool,
 }
 
@@ -1518,36 +1708,95 @@ impl RuntimeDiagnostics {
             .filter(|candidate| candidate.exists())
             .cloned()
             .collect::<Vec<_>>();
-        let nvrtc_loadable = !nvrtc_found.is_empty();
+        let nvrtc_compatible = nvrtc_found
+            .iter()
+            .filter(|candidate| compatible_nvrtc_candidate(candidate))
+            .cloned()
+            .collect::<Vec<_>>();
+        let nvrtc_loadable = !nvrtc_compatible.is_empty();
         Self {
             cuda_driver_available,
             cuda_driver_error,
             nvrtc_candidates,
             nvrtc_found,
+            nvrtc_compatible,
             nvrtc_loadable,
         }
     }
 
     pub fn nvrtc_help(&self) -> String {
-        if let Some(found) = self.nvrtc_found.first() {
+        if !self.nvrtc_compatible.is_empty() {
             return format!(
-                "NVRTC was found at {}, but the dynamic loader could not use it. Add its directory to PATH before starting Neo.",
-                found.display()
+                "NVRTC was found, but the dynamic loader could not use it.\n\n{}",
+                self.nvrtc_loader_help()
             );
         }
-        "NVRTC shared library was not found. Install the NVIDIA CUDA Toolkit or add the directory containing nvrtc64_120_0.dll/nvrtc64_12.dll to PATH.".to_string()
+        if !self.nvrtc_found.is_empty() {
+            return format!(
+                "NVRTC was found, but not a CUDA 13-compatible NVRTC for this Neo build.\n\n{}",
+                self.nvrtc_loader_help()
+            );
+        }
+        "NVRTC shared library was not found. Install the NVIDIA CUDA Toolkit or add the directory containing nvrtc64_130_0.dll/nvrtc64_13.dll, nvrtc64_120_0.dll/nvrtc64_12.dll, or the matching NVRTC DLL to PATH.".to_string()
+    }
+
+    pub fn nvrtc_loader_help(&self) -> String {
+        if let Some(found) = self.nvrtc_compatible.first() {
+            return format!(
+                "Neo found NVRTC at {} and tried to register {} with the process DLL loader. If this still fails, launch Neo from a shell where that CUDA bin directory is on PATH, or set CUDA_PATH/CUDA_PATH_V13_0 to the CUDA Toolkit root before starting Neo.",
+                found.display(),
+                found.parent().unwrap_or_else(|| Path::new("")).display()
+            );
+        }
+        if let Some(found) = self.nvrtc_found.first() {
+            let checked = self
+                .nvrtc_candidates
+                .iter()
+                .filter(|candidate| compatible_nvrtc_candidate(candidate))
+                .take(16)
+                .map(|candidate| format!("  - {}", candidate.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let checked = if checked.is_empty() {
+                "  - no CUDA 13-compatible candidate names were generated".to_string()
+            } else {
+                checked
+            };
+            return format!(
+                "Neo found NVRTC at {}, but this build expects CUDA 13-compatible NVRTC names such as nvrtc64_130_0.dll, nvrtc64_13.dll, or nvrtc.dll from the CUDA Toolkit.\nSet CUDA_PATH_V13_0 or CUDA_PATH to your CUDA 13 Toolkit root before starting Neo.\nChecked CUDA 13-compatible candidates:\n{}",
+                found.display(),
+                checked
+            );
+        }
+        let checked = self
+            .nvrtc_candidates
+            .iter()
+            .filter(|candidate| compatible_nvrtc_candidate(candidate))
+            .take(16)
+            .map(|candidate| format!("  - {}", candidate.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if checked.is_empty() {
+            "Neo did not generate any CUDA 13-compatible NVRTC candidate paths. Set CUDA_PATH_V13_0 or CUDA_PATH to your CUDA 13 Toolkit root before starting Neo.".to_string()
+        } else {
+            format!(
+                "Neo could not find a CUDA 13-compatible NVRTC DLL. Set CUDA_PATH_V13_0 or CUDA_PATH to your CUDA 13 Toolkit root before starting Neo.\nChecked CUDA 13-compatible candidates:\n{checked}"
+            )
+        }
     }
 }
 
 #[cfg(windows)]
 fn configure_nvrtc_search_path(diagnostics: &RuntimeDiagnostics) {
     let Some(dir) = diagnostics
-        .nvrtc_found
+        .nvrtc_compatible
         .first()
         .and_then(|path| path.parent())
     else {
         return;
     };
+
+    register_windows_dll_directory(dir);
 
     let Some(current_path) = std::env::var_os("PATH") else {
         // SAFETY: Neo is single-threaded at the point this is called by the CLI/runtime setup.
@@ -1571,6 +1820,22 @@ fn configure_nvrtc_search_path(diagnostics: &RuntimeDiagnostics) {
     }
 }
 
+#[cfg(windows)]
+fn register_windows_dll_directory(dir: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+    use windows::core::PCWSTR;
+
+    let wide = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        let _ = SetDllDirectoryW(PCWSTR(wide.as_ptr()));
+    }
+}
+
 #[cfg(not(windows))]
 fn configure_nvrtc_search_path(_diagnostics: &RuntimeDiagnostics) {}
 
@@ -1582,7 +1847,11 @@ fn cuda_toolkit_bin_dirs() -> Vec<PathBuf> {
     };
     entries
         .filter_map(Result::ok)
-        .map(|entry| entry.path().join("bin"))
+        .flat_map(|entry| {
+            let mut dirs = Vec::new();
+            push_cuda_root_bin_dirs(&mut dirs, entry.path());
+            dirs
+        })
         .filter(|path| path.is_dir())
         .collect()
 }
@@ -1860,6 +2129,13 @@ where
         self.inner.len()
     }
 
+    pub fn device_ptr_arg(&self) -> CudaDevicePtrArg {
+        use cudarc::driver::DevicePtr as _;
+
+        let (ptr, _record_read) = self.inner.device_ptr(self.inner.stream());
+        CudaDevicePtrArg::new(ptr)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
@@ -2057,6 +2333,1466 @@ impl NeoD3d12InteropDevice {
         slots: usize,
     ) -> Result<SharedFrameRing, RuntimeError> {
         SharedFrameRing::new(&self.device, width, height, slots)
+    }
+
+    pub fn create_shared_gpu_buffer(&self, byte_len: u64) -> Result<SharedGpuBuffer, RuntimeError> {
+        SharedGpuBuffer::new(&self.device, byte_len)
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+pub struct DrawDevice {
+    interop: Arc<NeoD3d12InteropDevice>,
+}
+
+#[cfg(windows)]
+pub type RasterDevice = DrawDevice;
+
+#[cfg(windows)]
+impl DrawDevice {
+    pub fn new(ctx: &Context) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            interop: Arc::new(NeoD3d12InteropDevice::new(ctx)?),
+        })
+    }
+
+    pub fn from_interop(interop: NeoD3d12InteropDevice) -> Self {
+        Self {
+            interop: Arc::new(interop),
+        }
+    }
+
+    pub fn interop(&self) -> &NeoD3d12InteropDevice {
+        &self.interop
+    }
+
+    pub fn create_shared_gpu_buffer(&self, byte_len: u64) -> Result<SharedGpuBuffer, RuntimeError> {
+        self.interop.create_shared_gpu_buffer(byte_len)
+    }
+}
+
+#[cfg(windows)]
+pub struct DrawPipeline {
+    label: String,
+}
+
+#[cfg(windows)]
+pub type RasterPipeline = DrawPipeline;
+
+#[cfg(windows)]
+impl DrawPipeline {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub struct GeometryStream<'a> {
+    mesh: &'a MeshBuffer,
+}
+
+#[cfg(windows)]
+impl<'a> GeometryStream<'a> {
+    pub fn from_mesh(mesh: &'a MeshBuffer) -> Self {
+        Self { mesh }
+    }
+
+    pub fn mesh(&self) -> &'a MeshBuffer {
+        self.mesh
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub struct InstanceStream<'a> {
+    instances: &'a InstanceBuffer,
+}
+
+#[cfg(windows)]
+impl<'a> InstanceStream<'a> {
+    pub fn from_instances(instances: &'a InstanceBuffer) -> Self {
+        Self { instances }
+    }
+
+    pub fn instances(&self) -> &'a InstanceBuffer {
+        self.instances
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MaterialKernelAbi {
+    pub kind: MaterialKernelKind,
+    pub vertex_entrypoint: String,
+    pub fragment_entrypoint: String,
+    pub kernel_entrypoint: String,
+    pub vertex_requirements: Vec<MaterialVertexRequirement>,
+    pub fragment_requirements: Vec<MaterialFragmentRequirement>,
+    pub bindings: Vec<MaterialBinding>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MaterialKernelKind {
+    DrawExecution,
+    HardwareRaster,
+    CudaTiled,
+}
+
+#[cfg(windows)]
+impl MaterialKernelKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DrawExecution => "draw-execution",
+            Self::HardwareRaster => "hardware-raster",
+            Self::CudaTiled => "cuda-tiled",
+        }
+    }
+
+    pub fn backend(self) -> DrawBackend {
+        match self {
+            Self::DrawExecution | Self::HardwareRaster => DrawBackend::HardwareRaster,
+            Self::CudaTiled => DrawBackend::CudaTiled,
+        }
+    }
+
+    pub fn is_draw_execution(self) -> bool {
+        matches!(self, Self::DrawExecution | Self::HardwareRaster)
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Display for MaterialKernelKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[cfg(windows)]
+impl MaterialKernelAbi {
+    pub fn kind_label(&self) -> &'static str {
+        self.kind.label()
+    }
+
+    pub fn simple_color(
+        vertex_entrypoint: impl Into<String>,
+        fragment_entrypoint: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: MaterialKernelKind::DrawExecution,
+            vertex_entrypoint: vertex_entrypoint.into(),
+            fragment_entrypoint: fragment_entrypoint.into(),
+            kernel_entrypoint: String::new(),
+            vertex_requirements: vec![
+                MaterialVertexRequirement::ClipPositionOutput,
+                MaterialVertexRequirement::VertexColorOutput,
+            ],
+            fragment_requirements: vec![MaterialFragmentRequirement::InterpolatedColorInput],
+            bindings: vec![MaterialBinding::draw_params(0, 0)],
+        }
+    }
+
+    pub fn compute_culled_instance_color(
+        vertex_entrypoint: impl Into<String>,
+        fragment_entrypoint: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: MaterialKernelKind::DrawExecution,
+            vertex_entrypoint: vertex_entrypoint.into(),
+            fragment_entrypoint: fragment_entrypoint.into(),
+            kernel_entrypoint: String::new(),
+            vertex_requirements: vec![
+                MaterialVertexRequirement::VisibleInstanceStream,
+                MaterialVertexRequirement::InstancePosition,
+                MaterialVertexRequirement::GeometryPosition,
+                MaterialVertexRequirement::ClipPositionOutput,
+                MaterialVertexRequirement::VertexColorOutput,
+            ],
+            fragment_requirements: vec![MaterialFragmentRequirement::InterpolatedColorInput],
+            bindings: vec![
+                MaterialBinding::draw_params(0, 0),
+                MaterialBinding::visible_instance_stream(1, 0),
+                MaterialBinding::instance_stream(2, 1),
+                MaterialBinding::geometry_stream(3, 2),
+            ],
+        }
+    }
+
+    pub fn direct_instance_color(
+        vertex_entrypoint: impl Into<String>,
+        fragment_entrypoint: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: MaterialKernelKind::DrawExecution,
+            vertex_entrypoint: vertex_entrypoint.into(),
+            fragment_entrypoint: fragment_entrypoint.into(),
+            kernel_entrypoint: String::new(),
+            vertex_requirements: vec![
+                MaterialVertexRequirement::DirectInstanceId,
+                MaterialVertexRequirement::InstancePosition,
+                MaterialVertexRequirement::GeometryPosition,
+                MaterialVertexRequirement::ClipPositionOutput,
+                MaterialVertexRequirement::VertexColorOutput,
+            ],
+            fragment_requirements: vec![MaterialFragmentRequirement::InterpolatedColorInput],
+            bindings: vec![
+                MaterialBinding::draw_params(0, 0),
+                MaterialBinding::instance_stream(1, 1),
+                MaterialBinding::geometry_stream(2, 2),
+            ],
+        }
+    }
+
+    pub fn cuda_tiled_instance_color(kernel_entrypoint: impl Into<String>) -> Self {
+        Self {
+            kind: MaterialKernelKind::CudaTiled,
+            vertex_entrypoint: String::new(),
+            fragment_entrypoint: String::new(),
+            kernel_entrypoint: kernel_entrypoint.into(),
+            vertex_requirements: Vec::new(),
+            fragment_requirements: Vec::new(),
+            bindings: vec![
+                MaterialBinding::draw_params(0, 0),
+                MaterialBinding::instance_stream(1, 1),
+                MaterialBinding::geometry_stream(2, 2),
+            ],
+        }
+    }
+
+    pub fn is_draw_execution(&self) -> bool {
+        self.kind.is_draw_execution()
+    }
+
+    pub fn is_hardware_raster(&self) -> bool {
+        self.is_draw_execution()
+    }
+
+    pub fn is_cuda_tiled(&self) -> bool {
+        self.kind == MaterialKernelKind::CudaTiled
+    }
+
+    pub fn backend(&self) -> DrawBackend {
+        self.kind.backend()
+    }
+
+    pub fn vertex_entrypoint(&self) -> Option<&str> {
+        self.is_draw_execution()
+            .then_some(self.vertex_entrypoint.as_str())
+    }
+
+    pub fn fragment_entrypoint(&self) -> Option<&str> {
+        self.is_draw_execution()
+            .then_some(self.fragment_entrypoint.as_str())
+    }
+
+    pub fn kernel_entrypoint(&self) -> Option<&str> {
+        self.is_cuda_tiled()
+            .then_some(self.kernel_entrypoint.as_str())
+    }
+
+    pub fn requires_instance_stream(&self) -> bool {
+        if self.is_cuda_tiled() {
+            return true;
+        }
+        self.vertex_requirements.iter().any(|requirement| {
+            matches!(
+                requirement,
+                MaterialVertexRequirement::VisibleInstanceStream
+                    | MaterialVertexRequirement::DirectInstanceId
+                    | MaterialVertexRequirement::InstancePosition
+            )
+        })
+    }
+
+    pub fn requires_compute_culling(&self) -> bool {
+        if self.is_cuda_tiled() {
+            return false;
+        }
+        self.vertex_requirements
+            .contains(&MaterialVertexRequirement::VisibleInstanceStream)
+    }
+
+    pub fn binding(&self, kind: MaterialBindingKind) -> Option<&MaterialBinding> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.kind.matches(kind))
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MaterialBinding {
+    pub kind: MaterialBindingKind,
+    pub root_parameter_index: u32,
+    pub shader_register: u32,
+    pub register_space: u32,
+}
+
+#[cfg(windows)]
+impl MaterialBinding {
+    pub fn draw_params(root_parameter_index: u32, shader_register: u32) -> Self {
+        Self {
+            kind: MaterialBindingKind::DrawParams,
+            root_parameter_index,
+            shader_register,
+            register_space: 0,
+        }
+    }
+
+    pub fn raster_params(root_parameter_index: u32, shader_register: u32) -> Self {
+        Self {
+            kind: MaterialBindingKind::RasterParams,
+            root_parameter_index,
+            shader_register,
+            register_space: 0,
+        }
+    }
+
+    pub fn visible_instance_stream(root_parameter_index: u32, shader_register: u32) -> Self {
+        Self {
+            kind: MaterialBindingKind::VisibleInstanceStream,
+            root_parameter_index,
+            shader_register,
+            register_space: 0,
+        }
+    }
+
+    pub fn instance_stream(root_parameter_index: u32, shader_register: u32) -> Self {
+        Self {
+            kind: MaterialBindingKind::InstanceStream,
+            root_parameter_index,
+            shader_register,
+            register_space: 0,
+        }
+    }
+
+    pub fn geometry_stream(root_parameter_index: u32, shader_register: u32) -> Self {
+        Self {
+            kind: MaterialBindingKind::GeometryStream,
+            root_parameter_index,
+            shader_register,
+            register_space: 0,
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MaterialBindingKind {
+    DrawParams,
+    RasterParams,
+    VisibleInstanceStream,
+    InstanceStream,
+    GeometryStream,
+}
+
+#[cfg(windows)]
+impl MaterialBindingKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DrawParams => "draw params",
+            Self::RasterParams => "raster params",
+            Self::VisibleInstanceStream => "visible InstanceStream",
+            Self::InstanceStream => "InstanceStream",
+            Self::GeometryStream => "GeometryStream",
+        }
+    }
+
+    pub fn matches(self, requested: Self) -> bool {
+        self == requested
+            || matches!(
+                (self, requested),
+                (Self::DrawParams, Self::RasterParams) | (Self::RasterParams, Self::DrawParams)
+            )
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MaterialVertexRequirement {
+    VisibleInstanceStream,
+    DirectInstanceId,
+    InstancePosition,
+    GeometryPosition,
+    ClipPositionOutput,
+    VertexColorOutput,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MaterialFragmentRequirement {
+    InterpolatedColorInput,
+}
+
+#[cfg(windows)]
+pub struct MaterialKernel {
+    label: String,
+    vertex_entrypoint: String,
+    fragment_entrypoint: String,
+    abi: MaterialKernelAbi,
+}
+
+#[cfg(windows)]
+impl MaterialKernel {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self::from_stages(label, "quad_vs", "quad_fs")
+    }
+
+    pub fn from_stages(
+        label: impl Into<String>,
+        vertex_entrypoint: impl Into<String>,
+        fragment_entrypoint: impl Into<String>,
+    ) -> Self {
+        let vertex_entrypoint = vertex_entrypoint.into();
+        let fragment_entrypoint = fragment_entrypoint.into();
+        Self {
+            label: label.into(),
+            abi: MaterialKernelAbi::simple_color(
+                vertex_entrypoint.clone(),
+                fragment_entrypoint.clone(),
+            ),
+            vertex_entrypoint,
+            fragment_entrypoint,
+        }
+    }
+
+    pub fn from_cuda_tiled(label: impl Into<String>, kernel_entrypoint: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            abi: MaterialKernelAbi::cuda_tiled_instance_color(kernel_entrypoint),
+            vertex_entrypoint: String::new(),
+            fragment_entrypoint: String::new(),
+        }
+    }
+
+    pub fn with_abi(mut self, abi: MaterialKernelAbi) -> Self {
+        self.vertex_entrypoint = abi.vertex_entrypoint.clone();
+        self.fragment_entrypoint = abi.fragment_entrypoint.clone();
+        self.abi = abi;
+        self
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn kind_label(&self) -> &'static str {
+        self.abi.kind_label()
+    }
+
+    pub fn vertex_entrypoint(&self) -> &str {
+        &self.vertex_entrypoint
+    }
+
+    pub fn fragment_entrypoint(&self) -> &str {
+        &self.fragment_entrypoint
+    }
+
+    pub fn kernel_entrypoint(&self) -> Option<&str> {
+        self.abi.kernel_entrypoint()
+    }
+
+    pub fn abi(&self) -> &MaterialKernelAbi {
+        &self.abi
+    }
+
+    pub fn backend(&self) -> DrawBackend {
+        self.abi.backend()
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrawPolicy {
+    DrawAll,
+    ComputeCulled,
+    CudaTiled,
+}
+
+#[cfg(windows)]
+impl DrawPolicy {
+    pub fn backend(self) -> DrawBackend {
+        match self {
+            Self::DrawAll | Self::ComputeCulled => DrawBackend::HardwareRaster,
+            Self::CudaTiled => DrawBackend::CudaTiled,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DrawAll => "draw-all",
+            Self::ComputeCulled => "compute-culled",
+            Self::CudaTiled => "cuda-tiled",
+        }
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Display for DrawPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrawBackend {
+    HardwareRaster,
+    CudaTiled,
+}
+
+#[cfg(windows)]
+impl DrawBackend {
+    pub fn primary_neo() -> Self {
+        Self::CudaTiled
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::HardwareRaster => "hardware-raster",
+            Self::CudaTiled => "cuda-tiled",
+        }
+    }
+
+    pub fn is_primary_neo(self) -> bool {
+        self == Self::primary_neo()
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Display for DrawBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CullOrder {
+    AtomicCompact,
+    StableDense,
+}
+
+#[cfg(windows)]
+pub type RasterCullOrder = CullOrder;
+
+#[cfg(windows)]
+impl CullOrder {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AtomicCompact => "atomic-compact",
+            Self::StableDense => "stable-dense",
+        }
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Display for CullOrder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisibilityMode {
+    Frustum,
+    ProjectedSize,
+}
+
+#[cfg(windows)]
+pub type RasterVisibilityMode = VisibilityMode;
+
+#[cfg(windows)]
+impl VisibilityMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Frustum => "frustum",
+            Self::ProjectedSize => "projected-size",
+        }
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Display for VisibilityMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrawDepthMode {
+    Auto,
+    On,
+    Off,
+}
+
+#[cfg(windows)]
+impl DrawDepthMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn uses_depth(self, policy: DrawPolicy) -> bool {
+        match self {
+            Self::Auto => policy != DrawPolicy::DrawAll,
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Display for DrawDepthMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[cfg(windows)]
+pub const DEFAULT_RASTER_MIN_PROJECTED_MILLIPIXELS: u32 = 850;
+
+#[cfg(windows)]
+pub const DEFAULT_MIN_PROJECTED_MILLIPIXELS: u32 = DEFAULT_RASTER_MIN_PROJECTED_MILLIPIXELS;
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrawPolicyConfig {
+    pub policy: DrawPolicy,
+    pub depth: DrawDepthMode,
+    pub cull_order: CullOrder,
+    pub visibility: VisibilityMode,
+    pub min_projected_millipixels: u32,
+}
+
+#[cfg(windows)]
+impl DrawPolicyConfig {
+    pub fn draw_all() -> Self {
+        Self {
+            policy: DrawPolicy::DrawAll,
+            depth: DrawDepthMode::Auto,
+            cull_order: CullOrder::StableDense,
+            visibility: VisibilityMode::Frustum,
+            min_projected_millipixels: DEFAULT_RASTER_MIN_PROJECTED_MILLIPIXELS,
+        }
+    }
+
+    pub fn compute_culled(cull_order: CullOrder) -> Self {
+        Self {
+            policy: DrawPolicy::ComputeCulled,
+            depth: DrawDepthMode::Auto,
+            cull_order,
+            visibility: VisibilityMode::Frustum,
+            min_projected_millipixels: DEFAULT_RASTER_MIN_PROJECTED_MILLIPIXELS,
+        }
+    }
+
+    pub fn compute_culled_with_visibility(
+        cull_order: CullOrder,
+        visibility: VisibilityMode,
+    ) -> Self {
+        Self {
+            policy: DrawPolicy::ComputeCulled,
+            depth: DrawDepthMode::Auto,
+            cull_order,
+            visibility,
+            min_projected_millipixels: DEFAULT_RASTER_MIN_PROJECTED_MILLIPIXELS,
+        }
+    }
+
+    pub fn cuda_tiled() -> Self {
+        Self {
+            policy: DrawPolicy::CudaTiled,
+            depth: DrawDepthMode::Auto,
+            cull_order: CullOrder::StableDense,
+            visibility: VisibilityMode::ProjectedSize,
+            min_projected_millipixels: DEFAULT_RASTER_MIN_PROJECTED_MILLIPIXELS,
+        }
+    }
+
+    pub fn with_min_projected_millipixels(mut self, min_projected_millipixels: u32) -> Self {
+        self.min_projected_millipixels = min_projected_millipixels;
+        self
+    }
+
+    pub fn with_depth(mut self, depth: DrawDepthMode) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    pub fn backend(self) -> DrawBackend {
+        self.policy.backend()
+    }
+
+    pub fn policy_label(self) -> &'static str {
+        self.policy.label()
+    }
+
+    pub fn backend_label(self) -> &'static str {
+        self.backend().label()
+    }
+
+    pub fn cull_order_label(self) -> &'static str {
+        self.cull_order.label()
+    }
+
+    pub fn depth_label(self) -> &'static str {
+        self.depth.label()
+    }
+
+    pub fn uses_depth(self) -> bool {
+        self.depth.uses_depth(self.policy)
+    }
+
+    pub fn visibility_label(self) -> &'static str {
+        self.visibility.label()
+    }
+
+    pub fn min_projected_pixels(self) -> f32 {
+        self.min_projected_millipixels as f32 / 1000.0
+    }
+}
+
+#[cfg(windows)]
+impl From<DrawPolicy> for DrawPolicyConfig {
+    fn from(policy: DrawPolicy) -> Self {
+        match policy {
+            DrawPolicy::DrawAll => Self::draw_all(),
+            DrawPolicy::ComputeCulled => Self::compute_culled(CullOrder::AtomicCompact),
+            DrawPolicy::CudaTiled => Self::cuda_tiled(),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[cfg(windows)]
+impl Target {
+    pub fn new(width: u32, height: u32) -> Result<Self, RuntimeError> {
+        if width == 0 || height == 0 {
+            return Err(RuntimeError::Raster(
+                "target width and height must be greater than zero".to_string(),
+            ));
+        }
+        Ok(Self { width, height })
+    }
+}
+
+#[cfg(windows)]
+pub type RasterTarget = Target;
+
+#[cfg(windows)]
+pub type RenderTarget = Target;
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrawPass {
+    pub target: Target,
+}
+
+#[cfg(windows)]
+pub type RasterPass = DrawPass;
+
+#[cfg(windows)]
+pub trait DrawRecipe<'a> {
+    fn backend(&self) -> DrawBackend;
+    fn geometry(&self) -> GeometryStream<'a>;
+    fn instances(&self) -> Option<InstanceStream<'a>>;
+    fn material(&self) -> &'a MaterialKernel;
+    fn target(&self) -> Target;
+    fn policy_config(&self) -> DrawPolicyConfig;
+
+    fn policy(&self) -> DrawPolicy {
+        self.policy_config().policy
+    }
+
+    fn contract(&self) -> DrawContract {
+        let geometry = self.geometry();
+        let instances = self.instances();
+        let material = self.material();
+        let target = self.target();
+        let policy_config = self.policy_config();
+        let policy = policy_config.policy;
+        let backend = self.backend();
+        DrawContract {
+            geometry_vertex_count: geometry.mesh().desc().vertex_count,
+            geometry_index_count: geometry.mesh().desc().index_count,
+            instance_count: instances.map(|instances| instances.instances().desc().instance_count),
+            instance_layout: instances.map(|instances| instances.instances().layout_label()),
+            material_kernel: material.label().to_string(),
+            material_kind_label: material.kind_label().to_string(),
+            target_width: target.width,
+            target_height: target.height,
+            policy,
+            policy_config,
+            backend,
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DrawContract {
+    pub geometry_vertex_count: u32,
+    pub geometry_index_count: u32,
+    pub instance_count: Option<u32>,
+    pub instance_layout: Option<String>,
+    pub material_kernel: String,
+    pub material_kind_label: String,
+    pub target_width: u32,
+    pub target_height: u32,
+    pub policy: DrawPolicy,
+    pub policy_config: DrawPolicyConfig,
+    pub backend: DrawBackend,
+}
+
+#[cfg(windows)]
+impl DrawContract {
+    pub fn policy_label(&self) -> &'static str {
+        self.policy_config.policy_label()
+    }
+
+    pub fn backend_label(&self) -> &'static str {
+        self.policy_config.backend_label()
+    }
+
+    pub fn depth_label(&self) -> &'static str {
+        self.policy_config.depth_label()
+    }
+
+    pub fn uses_depth(&self) -> bool {
+        self.policy_config.uses_depth()
+    }
+
+    pub fn cull_order_label(&self) -> &'static str {
+        self.policy_config.cull_order_label()
+    }
+
+    pub fn visibility_label(&self) -> &'static str {
+        self.policy_config.visibility_label()
+    }
+
+    pub fn min_projected_pixels(&self) -> f32 {
+        self.policy_config.min_projected_pixels()
+    }
+
+    pub fn material_label(&self) -> &str {
+        &self.material_kernel
+    }
+
+    pub fn material_kind_label(&self) -> &str {
+        &self.material_kind_label
+    }
+}
+
+#[cfg(windows)]
+pub struct DrawExecution<'a> {
+    geometry: GeometryStream<'a>,
+    instances: Option<InstanceStream<'a>>,
+    material: &'a MaterialKernel,
+    target: Target,
+    policy: DrawPolicyConfig,
+}
+
+#[cfg(windows)]
+pub type RasterDraw<'a> = DrawExecution<'a>;
+
+#[cfg(windows)]
+pub type RasterDrawBuilder<'a> = DrawExecutionBuilder<'a>;
+
+#[cfg(windows)]
+impl<'a> DrawExecution<'a> {
+    pub fn execution_builder(
+        geometry: GeometryStream<'a>,
+        material: &'a MaterialKernel,
+        target: Target,
+    ) -> DrawExecutionBuilder<'a> {
+        Self::builder(geometry, material, target)
+    }
+
+    pub fn builder(
+        geometry: GeometryStream<'a>,
+        material: &'a MaterialKernel,
+        target: Target,
+    ) -> DrawExecutionBuilder<'a> {
+        DrawExecutionBuilder {
+            geometry,
+            instances: None,
+            material,
+            target,
+            policy: DrawPolicyConfig::draw_all(),
+        }
+    }
+
+    pub fn geometry(&self) -> GeometryStream<'a> {
+        self.geometry
+    }
+
+    pub fn instances(&self) -> Option<InstanceStream<'a>> {
+        self.instances
+    }
+
+    pub fn material(&self) -> &'a MaterialKernel {
+        self.material
+    }
+
+    pub fn target(&self) -> Target {
+        self.target
+    }
+
+    pub fn policy(&self) -> DrawPolicy {
+        self.policy.policy
+    }
+
+    pub fn policy_config(&self) -> DrawPolicyConfig {
+        self.policy
+    }
+
+    pub fn backend(&self) -> DrawBackend {
+        DrawBackend::HardwareRaster
+    }
+
+    pub fn contract(&self) -> DrawContract {
+        DrawRecipe::contract(self)
+    }
+}
+
+#[cfg(windows)]
+impl<'a> DrawRecipe<'a> for DrawExecution<'a> {
+    fn backend(&self) -> DrawBackend {
+        DrawBackend::HardwareRaster
+    }
+
+    fn geometry(&self) -> GeometryStream<'a> {
+        self.geometry
+    }
+
+    fn instances(&self) -> Option<InstanceStream<'a>> {
+        self.instances
+    }
+
+    fn material(&self) -> &'a MaterialKernel {
+        self.material
+    }
+
+    fn target(&self) -> Target {
+        self.target
+    }
+
+    fn policy_config(&self) -> DrawPolicyConfig {
+        self.policy
+    }
+}
+
+#[cfg(windows)]
+pub struct DrawExecutionBuilder<'a> {
+    geometry: GeometryStream<'a>,
+    instances: Option<InstanceStream<'a>>,
+    material: &'a MaterialKernel,
+    target: Target,
+    policy: DrawPolicyConfig,
+}
+
+#[cfg(windows)]
+impl<'a> DrawExecutionBuilder<'a> {
+    pub fn instance_stream(mut self, instances: InstanceStream<'a>) -> Self {
+        self.instances = Some(instances);
+        self
+    }
+
+    pub fn draw_policy(mut self, policy: DrawPolicy) -> Self {
+        self.policy = policy.into();
+        self
+    }
+
+    pub fn draw_policy_config(mut self, policy: DrawPolicyConfig) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn compute_culled(mut self, cull_order: CullOrder) -> Self {
+        self.policy = DrawPolicyConfig::compute_culled(cull_order);
+        self
+    }
+
+    pub fn compute_culled_with_visibility(
+        mut self,
+        cull_order: CullOrder,
+        visibility: VisibilityMode,
+    ) -> Self {
+        self.policy = DrawPolicyConfig::compute_culled_with_visibility(cull_order, visibility);
+        self
+    }
+
+    pub fn compute_culled_projected(
+        mut self,
+        cull_order: CullOrder,
+        min_projected_millipixels: u32,
+    ) -> Self {
+        self.policy = DrawPolicyConfig::compute_culled_with_visibility(
+            cull_order,
+            VisibilityMode::ProjectedSize,
+        )
+        .with_min_projected_millipixels(min_projected_millipixels);
+        self
+    }
+
+    pub fn try_build(self) -> Result<DrawExecution<'a>, RuntimeError> {
+        let abi = self.material.abi();
+        if abi.is_cuda_tiled() {
+            return Err(RuntimeError::Raster(format!(
+                "DrawExecution requires a draw-execution MaterialKernel, got CUDA tiled material `{}`",
+                self.material.label()
+            )));
+        }
+        let policy = self.policy.policy;
+        if policy == DrawPolicy::CudaTiled {
+            return Err(RuntimeError::Raster(format!(
+                "DrawExecution material `{}` cannot use DrawPolicy::CudaTiled",
+                self.material.label()
+            )));
+        }
+        if abi.requires_instance_stream() && self.instances.is_none() {
+            return Err(RuntimeError::Raster(format!(
+                "raster material `{}` requires an explicit InstanceStream",
+                self.material.label()
+            )));
+        }
+        if abi.requires_compute_culling() && policy != DrawPolicy::ComputeCulled {
+            return Err(RuntimeError::Raster(format!(
+                "raster material `{}` requires DrawPolicy::ComputeCulled",
+                self.material.label()
+            )));
+        }
+        if policy == DrawPolicy::ComputeCulled && !abi.requires_compute_culling() {
+            return Err(RuntimeError::Raster(format!(
+                "DrawPolicy::ComputeCulled requires material `{}` to read the visible InstanceStream",
+                self.material.label()
+            )));
+        }
+        if policy == DrawPolicy::ComputeCulled && self.instances.is_none() {
+            return Err(RuntimeError::Raster(
+                "DrawPolicy::ComputeCulled requires an explicit InstanceStream".to_string(),
+            ));
+        }
+        Ok(DrawExecution {
+            geometry: self.geometry,
+            instances: self.instances,
+            material: self.material,
+            target: self.target,
+            policy: self.policy,
+        })
+    }
+
+    pub fn build(self) -> DrawExecution<'a> {
+        self.try_build()
+            .expect("invalid draw execution recipe; use try_build for recoverable validation")
+    }
+}
+
+#[cfg(windows)]
+pub struct CudaDraw<'a> {
+    geometry: GeometryStream<'a>,
+    instances: InstanceStream<'a>,
+    material: &'a MaterialKernel,
+    target: Target,
+    policy: DrawPolicyConfig,
+}
+
+#[cfg(windows)]
+impl<'a> CudaDraw<'a> {
+    pub fn builder(
+        geometry: GeometryStream<'a>,
+        material: &'a MaterialKernel,
+        target: Target,
+    ) -> CudaDrawBuilder<'a> {
+        CudaDrawBuilder {
+            geometry,
+            instances: None,
+            material,
+            target,
+            policy: DrawPolicyConfig::cuda_tiled(),
+        }
+    }
+
+    pub fn geometry(&self) -> GeometryStream<'a> {
+        self.geometry
+    }
+
+    pub fn instances(&self) -> InstanceStream<'a> {
+        self.instances
+    }
+
+    pub fn material(&self) -> &'a MaterialKernel {
+        self.material
+    }
+
+    pub fn target(&self) -> Target {
+        self.target
+    }
+
+    pub fn policy(&self) -> DrawPolicy {
+        self.policy.policy
+    }
+
+    pub fn policy_config(&self) -> DrawPolicyConfig {
+        self.policy
+    }
+
+    pub fn backend(&self) -> DrawBackend {
+        DrawBackend::CudaTiled
+    }
+
+    pub fn contract(&self) -> DrawContract {
+        DrawRecipe::contract(self)
+    }
+}
+
+#[cfg(windows)]
+impl<'a> DrawRecipe<'a> for CudaDraw<'a> {
+    fn backend(&self) -> DrawBackend {
+        DrawBackend::CudaTiled
+    }
+
+    fn geometry(&self) -> GeometryStream<'a> {
+        self.geometry
+    }
+
+    fn instances(&self) -> Option<InstanceStream<'a>> {
+        Some(self.instances)
+    }
+
+    fn material(&self) -> &'a MaterialKernel {
+        self.material
+    }
+
+    fn target(&self) -> Target {
+        self.target
+    }
+
+    fn policy_config(&self) -> DrawPolicyConfig {
+        self.policy
+    }
+}
+
+#[cfg(windows)]
+pub struct CudaDrawBuilder<'a> {
+    geometry: GeometryStream<'a>,
+    instances: Option<InstanceStream<'a>>,
+    material: &'a MaterialKernel,
+    target: Target,
+    policy: DrawPolicyConfig,
+}
+
+#[cfg(windows)]
+impl<'a> CudaDrawBuilder<'a> {
+    pub fn instance_stream(mut self, instances: InstanceStream<'a>) -> Self {
+        self.instances = Some(instances);
+        self
+    }
+
+    pub fn draw_policy_config(mut self, policy: DrawPolicyConfig) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn try_build(self) -> Result<CudaDraw<'a>, RuntimeError> {
+        let abi = self.material.abi();
+        if !abi.is_cuda_tiled() {
+            return Err(RuntimeError::Raster(format!(
+                "CudaDraw requires a CUDA tiled MaterialKernel, got hardware raster material `{}`",
+                self.material.label()
+            )));
+        }
+        if self.policy.policy != DrawPolicy::CudaTiled {
+            return Err(RuntimeError::Raster(format!(
+                "CudaDraw material `{}` requires DrawPolicy::CudaTiled",
+                self.material.label()
+            )));
+        }
+        let instances = self.instances.ok_or_else(|| {
+            RuntimeError::Raster(format!(
+                "CudaDraw material `{}` requires an explicit InstanceStream",
+                self.material.label()
+            ))
+        })?;
+        Ok(CudaDraw {
+            geometry: self.geometry,
+            instances,
+            material: self.material,
+            target: self.target,
+            policy: self.policy,
+        })
+    }
+
+    pub fn build(self) -> CudaDraw<'a> {
+        self.try_build()
+            .expect("invalid CUDA draw recipe; use try_build for recoverable validation")
+    }
+}
+
+#[cfg(windows)]
+pub struct IndirectDrawBuffer {
+    buffer: SharedGpuBuffer,
+    command_capacity: u32,
+}
+
+#[cfg(windows)]
+impl IndirectDrawBuffer {
+    pub fn new(
+        device: &NeoD3d12InteropDevice,
+        command_capacity: u32,
+    ) -> Result<Self, RuntimeError> {
+        if command_capacity == 0 {
+            return Err(RuntimeError::Raster(
+                "indirect draw command capacity must be greater than zero".to_string(),
+            ));
+        }
+        let byte_len = u64::from(command_capacity)
+            .checked_mul(std::mem::size_of::<DrawIndexedIndirectCommand>() as u64)
+            .ok_or_else(|| {
+                RuntimeError::Raster("indirect draw buffer size overflow".to_string())
+            })?;
+        Ok(Self {
+            buffer: device.create_shared_gpu_buffer(byte_len)?,
+            command_capacity,
+        })
+    }
+
+    pub fn buffer(&self) -> &SharedGpuBuffer {
+        &self.buffer
+    }
+
+    pub fn buffer_mut(&mut self) -> &mut SharedGpuBuffer {
+        &mut self.buffer
+    }
+
+    pub fn command_capacity(&self) -> u32 {
+        self.command_capacity
+    }
+}
+
+#[cfg(windows)]
+pub struct VisibleInstanceStream {
+    buffer: SharedGpuBuffer,
+    capacity: u32,
+}
+
+#[cfg(windows)]
+impl VisibleInstanceStream {
+    pub fn new(device: &NeoD3d12InteropDevice, capacity: u32) -> Result<Self, RuntimeError> {
+        if capacity == 0 {
+            return Err(RuntimeError::Raster(
+                "visible instance stream capacity must be greater than zero".to_string(),
+            ));
+        }
+        let byte_len = u64::from(capacity)
+            .checked_mul(std::mem::size_of::<u32>() as u64)
+            .ok_or(RuntimeError::HostBufferTooLarge)?;
+        Ok(Self {
+            buffer: device.create_shared_gpu_buffer(byte_len)?,
+            capacity,
+        })
+    }
+
+    pub fn buffer(&self) -> &SharedGpuBuffer {
+        &self.buffer
+    }
+
+    pub fn buffer_mut(&mut self) -> &mut SharedGpuBuffer {
+        &mut self.buffer
+    }
+
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+}
+
+#[cfg(windows)]
+pub struct SharedInstanceStream {
+    buffer: SharedGpuBuffer,
+    desc: InstanceBufferDesc,
+    data_layout: DataLayout,
+    byte_len: usize,
+}
+
+#[cfg(windows)]
+impl SharedInstanceStream {
+    pub fn upload_typed<I>(
+        ctx: &Context,
+        device: &NeoD3d12InteropDevice,
+        desc: InstanceBufferDesc,
+        instances: &[I],
+        data_layout: DataLayout,
+    ) -> Result<Self, RuntimeError>
+    where
+        I: Copy,
+    {
+        let packed = InstanceBuffer::pack_typed_with_layout(&desc, instances, data_layout)?;
+        let byte_len = packed.len();
+        let mut buffer = device.create_shared_gpu_buffer(byte_len as u64)?;
+        let stream = ctx.default_stream();
+        buffer.upload_bytes_on_stream(&stream, &packed)?;
+        ctx.synchronize()?;
+        Ok(Self {
+            buffer,
+            desc,
+            data_layout,
+            byte_len,
+        })
+    }
+
+    pub fn buffer(&self) -> &SharedGpuBuffer {
+        &self.buffer
+    }
+
+    pub fn buffer_mut(&mut self) -> &mut SharedGpuBuffer {
+        &mut self.buffer
+    }
+
+    pub fn desc(&self) -> &InstanceBufferDesc {
+        &self.desc
+    }
+
+    pub fn data_layout(&self) -> DataLayout {
+        self.data_layout
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DrawIndexedIndirectCommand {
+    pub index_count_per_instance: u32,
+    pub instance_count: u32,
+    pub start_index_location: u32,
+    pub base_vertex_location: i32,
+    pub start_instance_location: u32,
+}
+
+impl DrawIndexedIndirectCommand {
+    pub const BYTE_LEN: usize = std::mem::size_of::<Self>();
+
+    pub fn indexed_quad(instance_count: u32) -> Self {
+        Self {
+            index_count_per_instance: 6,
+            instance_count,
+            start_index_location: 0,
+            base_vertex_location: 0,
+            start_instance_location: 0,
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                (self as *const Self).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            )
+        }
+    }
+}
+
+#[cfg(windows)]
+pub struct SharedGpuBuffer {
+    slot: SharedFrameSlot,
+}
+
+#[cfg(windows)]
+impl SharedGpuBuffer {
+    pub fn new(
+        device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+        byte_len: u64,
+    ) -> Result<Self, RuntimeError> {
+        if byte_len == 0 {
+            return Err(RuntimeError::Raster(
+                "shared GPU buffer size must be greater than zero".to_string(),
+            ));
+        }
+        Ok(Self {
+            slot: SharedFrameSlot::new(device, 0, byte_len)?,
+        })
+    }
+
+    pub fn resource(&self) -> &windows::Win32::Graphics::Direct3D12::ID3D12Resource {
+        self.slot.resource()
+    }
+
+    pub fn device_ptr_arg(&self) -> CudaDevicePtrArg {
+        self.slot.device_ptr_arg()
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.slot.bytes()
+    }
+
+    pub fn upload_bytes_on_stream(
+        &mut self,
+        stream: &Stream,
+        bytes: &[u8],
+    ) -> Result<(), RuntimeError> {
+        if bytes.len() as u64 > self.bytes() {
+            return Err(RuntimeError::HostBufferTooLarge);
+        }
+        unsafe {
+            sys::cuMemcpyHtoDAsync_v2(
+                self.slot.device_ptr,
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                stream.inner.cu_stream(),
+            )
+            .result()
+            .map_err(RuntimeError::Driver)?;
+        }
+        Ok(())
+    }
+
+    pub fn wait_available_on_stream(&self, stream: &Stream) -> Result<(), RuntimeError> {
+        self.slot.wait_available_on_stream(stream)
+    }
+
+    pub fn signal_cuda_complete_on_stream(&mut self, stream: &Stream) -> Result<u64, RuntimeError> {
+        self.slot.signal_cuda_complete_on_stream(stream)
+    }
+
+    pub fn wait_d3d_for_value(
+        &self,
+        queue: &windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue,
+        value: u64,
+    ) -> Result<(), RuntimeError> {
+        self.slot.wait_d3d_for_value(queue, value)
+    }
+
+    pub fn is_fence_complete(&self, value: u64) -> bool {
+        self.slot.is_fence_complete(value)
+    }
+
+    pub fn signal_available_on_d3d(
+        &mut self,
+        queue: &windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue,
+    ) -> Result<u64, RuntimeError> {
+        self.slot.signal_available_on_d3d(queue)
     }
 }
 
@@ -2632,6 +4368,38 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn assert_draw_recipe_contract<'a, D: DrawRecipe<'a>>(
+        draw: &D,
+        backend: DrawBackend,
+        policy: DrawPolicy,
+        target: Target,
+        material_label: &str,
+    ) {
+        assert_eq!(draw.backend(), backend);
+        assert_eq!(draw.policy(), policy);
+        assert_eq!(draw.policy_config().policy, policy);
+        assert_eq!(draw.target(), target);
+        assert_eq!(draw.material().label(), material_label);
+        assert_eq!(draw.geometry().mesh().desc().vertex_count, 1);
+        assert!(draw.instances().is_some());
+        let contract = draw.contract();
+        assert_eq!(contract.backend, backend);
+        assert_eq!(contract.policy, policy);
+        assert_eq!(contract.policy_config, draw.policy_config());
+        assert_eq!(contract.backend_label(), backend.label());
+        assert_eq!(contract.policy_label(), policy.label());
+        assert_eq!(contract.depth_label(), draw.policy_config().depth_label());
+        assert_eq!(contract.uses_depth(), draw.policy_config().uses_depth());
+        assert_eq!(contract.material_kernel, material_label);
+        assert_eq!(contract.material_label(), material_label);
+        assert_eq!(contract.material_kind_label(), draw.material().kind_label());
+        assert_eq!(contract.target_width, target.width);
+        assert_eq!(contract.target_height, target.height);
+        assert_eq!(contract.geometry_vertex_count, 1);
+        assert!(contract.instance_count.is_some());
+    }
+
     fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
         u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
     }
@@ -2919,11 +4687,916 @@ mod tests {
     }
 
     #[test]
+    fn module_entrypoint_validation_ignores_graphics_stages() {
+        let ctx = match Context::new_default_device() {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                eprintln!("skipping graphics entrypoint validation test without CUDA: {err}");
+                return;
+            }
+        };
+        let err = match Module::from_neo_source(&ctx, "vertex fn image() {}", &["image"]) {
+            Ok(_) => panic!("expected missing CUDA entrypoint error"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, RuntimeError::MissingEntrypoint(name) if name == "image"));
+    }
+
+    #[test]
+    fn indirect_draw_command_packing_is_stable() {
+        assert_eq!(DrawIndexedIndirectCommand::BYTE_LEN, 20);
+        let command = DrawIndexedIndirectCommand::indexed_quad(123);
+        assert_eq!(
+            command,
+            DrawIndexedIndirectCommand {
+                index_count_per_instance: 6,
+                instance_count: 123,
+                start_index_location: 0,
+                base_vertex_location: 0,
+                start_instance_location: 0,
+            }
+        );
+        assert_eq!(
+            command.as_bytes().len(),
+            DrawIndexedIndirectCommand::BYTE_LEN
+        );
+        assert_eq!(&command.as_bytes()[0..4], &6u32.to_le_bytes());
+        assert_eq!(&command.as_bytes()[4..8], &123u32.to_le_bytes());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn draw_execution_vocabulary_is_explicit() {
+        let pipeline = DrawPipeline::new("quad-pipeline");
+        let legacy_pipeline = RasterPipeline::new("legacy-quad-pipeline");
+        let material = MaterialKernel::from_stages("quad-material", "quad_vs", "quad_fs");
+        let cuda_material = MaterialKernel::from_cuda_tiled("cuda-material", "instance_raster");
+        assert_eq!(pipeline.label(), "quad-pipeline");
+        assert_eq!(legacy_pipeline.label(), "legacy-quad-pipeline");
+        assert_eq!(material.label(), "quad-material");
+        assert_eq!(material.kind_label(), "draw-execution");
+        assert_eq!(material.vertex_entrypoint(), "quad_vs");
+        assert_eq!(material.fragment_entrypoint(), "quad_fs");
+        assert_eq!(material.backend(), DrawBackend::HardwareRaster);
+        assert_eq!(material.abi().backend(), DrawBackend::HardwareRaster);
+        assert_eq!(material.abi().kind_label(), "draw-execution");
+        assert!(material.kernel_entrypoint().is_none());
+        assert_eq!(cuda_material.label(), "cuda-material");
+        assert_eq!(cuda_material.kind_label(), "cuda-tiled");
+        assert_eq!(cuda_material.kernel_entrypoint(), Some("instance_raster"));
+        assert_eq!(cuda_material.backend(), DrawBackend::CudaTiled);
+        assert_eq!(cuda_material.abi().backend(), DrawBackend::CudaTiled);
+        assert_eq!(cuda_material.abi().kind_label(), "cuda-tiled");
+        assert_eq!(
+            MaterialKernelKind::DrawExecution.backend(),
+            DrawBackend::HardwareRaster
+        );
+        assert_eq!(MaterialKernelKind::DrawExecution.label(), "draw-execution");
+        assert_eq!(
+            MaterialKernelKind::DrawExecution.to_string(),
+            "draw-execution"
+        );
+        assert_eq!(
+            MaterialKernelKind::HardwareRaster.backend(),
+            DrawBackend::HardwareRaster
+        );
+        assert!(MaterialKernelKind::HardwareRaster.is_draw_execution());
+        assert_eq!(
+            MaterialKernelKind::HardwareRaster.label(),
+            "hardware-raster"
+        );
+        assert_eq!(
+            MaterialKernelKind::CudaTiled.backend(),
+            DrawBackend::CudaTiled
+        );
+        assert_eq!(MaterialKernelKind::CudaTiled.label(), "cuda-tiled");
+        assert!(cuda_material.abi().is_cuda_tiled());
+        assert!(cuda_material.abi().requires_instance_stream());
+        assert!(!cuda_material.abi().requires_compute_culling());
+        assert_eq!(
+            material.abi().vertex_requirements,
+            vec![
+                MaterialVertexRequirement::ClipPositionOutput,
+                MaterialVertexRequirement::VertexColorOutput
+            ]
+        );
+        assert_eq!(DrawPolicy::DrawAll, DrawPolicy::DrawAll);
+        assert_ne!(DrawPolicy::DrawAll, DrawPolicy::ComputeCulled);
+        assert_eq!(DrawPolicy::DrawAll.backend(), DrawBackend::HardwareRaster);
+        assert_eq!(DrawPolicy::DrawAll.label(), "draw-all");
+        assert_eq!(DrawPolicy::DrawAll.to_string(), "draw-all");
+        assert_eq!(
+            DrawPolicy::ComputeCulled.backend(),
+            DrawBackend::HardwareRaster
+        );
+        assert_eq!(DrawPolicy::ComputeCulled.label(), "compute-culled");
+        assert_eq!(DrawPolicy::CudaTiled.backend(), DrawBackend::CudaTiled);
+        assert_eq!(DrawPolicy::CudaTiled.label(), "cuda-tiled");
+        assert_eq!(DrawBackend::primary_neo(), DrawBackend::CudaTiled);
+        assert!(DrawBackend::CudaTiled.is_primary_neo());
+        assert!(!DrawBackend::HardwareRaster.is_primary_neo());
+        assert_eq!(DrawBackend::HardwareRaster.label(), "hardware-raster");
+        assert_eq!(DrawBackend::HardwareRaster.to_string(), "hardware-raster");
+        assert_eq!(DrawBackend::CudaTiled.label(), "cuda-tiled");
+        assert_eq!(CullOrder::AtomicCompact.label(), "atomic-compact");
+        assert_eq!(CullOrder::StableDense.to_string(), "stable-dense");
+        let neutral_cull_order: CullOrder = CullOrder::StableDense;
+        assert_eq!(neutral_cull_order.label(), "stable-dense");
+        let legacy_cull_order: RasterCullOrder = RasterCullOrder::StableDense;
+        assert_eq!(legacy_cull_order, neutral_cull_order);
+        assert_eq!(VisibilityMode::Frustum.label(), "frustum");
+        assert_eq!(VisibilityMode::ProjectedSize.to_string(), "projected-size");
+        let neutral_visibility: VisibilityMode = VisibilityMode::ProjectedSize;
+        assert_eq!(neutral_visibility.label(), "projected-size");
+        let legacy_visibility: RasterVisibilityMode = RasterVisibilityMode::ProjectedSize;
+        assert_eq!(legacy_visibility, neutral_visibility);
+        assert_eq!(DrawDepthMode::Auto.label(), "auto");
+        assert_eq!(DrawDepthMode::Auto.to_string(), "auto");
+        assert!(!DrawDepthMode::Auto.uses_depth(DrawPolicy::DrawAll));
+        assert!(DrawDepthMode::Auto.uses_depth(DrawPolicy::ComputeCulled));
+        assert!(DrawDepthMode::On.uses_depth(DrawPolicy::DrawAll));
+        assert!(!DrawDepthMode::Off.uses_depth(DrawPolicy::ComputeCulled));
+        assert_eq!(
+            DEFAULT_MIN_PROJECTED_MILLIPIXELS,
+            DEFAULT_RASTER_MIN_PROJECTED_MILLIPIXELS
+        );
+        assert_eq!(
+            DrawPolicyConfig::draw_all().backend(),
+            DrawBackend::HardwareRaster
+        );
+        assert_eq!(DrawPolicyConfig::draw_all().policy_label(), "draw-all");
+        assert_eq!(
+            DrawPolicyConfig::draw_all().backend_label(),
+            "hardware-raster"
+        );
+        assert_eq!(DrawPolicyConfig::draw_all().depth_label(), "auto");
+        assert!(!DrawPolicyConfig::draw_all().uses_depth());
+        assert!(DrawPolicyConfig::compute_culled(CullOrder::AtomicCompact).uses_depth());
+        assert!(
+            DrawPolicyConfig::draw_all()
+                .with_depth(DrawDepthMode::On)
+                .uses_depth()
+        );
+        assert_eq!(
+            DrawPolicyConfig::draw_all().cull_order_label(),
+            "stable-dense"
+        );
+        assert_eq!(DrawPolicyConfig::draw_all().visibility_label(), "frustum");
+        assert_eq!(
+            DrawPolicyConfig::compute_culled(CullOrder::AtomicCompact).backend(),
+            DrawBackend::HardwareRaster
+        );
+        assert_eq!(
+            DrawPolicyConfig::compute_culled(CullOrder::AtomicCompact).policy_label(),
+            "compute-culled"
+        );
+        assert_eq!(
+            DrawPolicyConfig::compute_culled(CullOrder::AtomicCompact).cull_order_label(),
+            "atomic-compact"
+        );
+        assert_eq!(
+            DrawPolicyConfig::cuda_tiled().backend(),
+            DrawBackend::CudaTiled
+        );
+        assert_eq!(DrawPolicyConfig::cuda_tiled().policy_label(), "cuda-tiled");
+        assert_eq!(
+            DrawPolicyConfig::cuda_tiled().visibility_label(),
+            "projected-size"
+        );
+        assert_eq!(DrawPolicyConfig::cuda_tiled().min_projected_pixels(), 0.85);
+    }
+
+    #[test]
+    fn material_kernel_abi_describes_cuda_tiled_instance_material() {
+        let abi = MaterialKernelAbi::cuda_tiled_instance_color("instance_raster");
+        assert!(abi.is_cuda_tiled());
+        assert!(!abi.is_draw_execution());
+        assert!(!abi.is_hardware_raster());
+        assert_eq!(abi.vertex_entrypoint(), None);
+        assert_eq!(abi.fragment_entrypoint(), None);
+        assert_eq!(abi.kernel_entrypoint(), Some("instance_raster"));
+        assert_eq!(abi.backend(), DrawBackend::CudaTiled);
+        assert!(abi.requires_instance_stream());
+        assert!(!abi.requires_compute_culling());
+        assert_eq!(
+            abi.binding(MaterialBindingKind::DrawParams).unwrap().kind,
+            MaterialBindingKind::DrawParams
+        );
+        assert_eq!(
+            abi.binding(MaterialBindingKind::RasterParams)
+                .unwrap()
+                .root_parameter_index,
+            0
+        );
+        assert_eq!(
+            abi.binding(MaterialBindingKind::InstanceStream)
+                .unwrap()
+                .root_parameter_index,
+            1
+        );
+        assert_eq!(
+            abi.binding(MaterialBindingKind::GeometryStream)
+                .unwrap()
+                .root_parameter_index,
+            2
+        );
+    }
+
+    #[test]
+    fn material_kernel_abi_describes_compute_culled_instance_material() {
+        let abi = MaterialKernelAbi::compute_culled_instance_color("quad_vs", "quad_fs");
+        assert_eq!(abi.vertex_entrypoint, "quad_vs");
+        assert_eq!(abi.fragment_entrypoint, "quad_fs");
+        assert_eq!(abi.backend(), DrawBackend::HardwareRaster);
+        assert!(abi.is_draw_execution());
+        assert!(abi.is_hardware_raster());
+        assert!(
+            abi.vertex_requirements
+                .contains(&MaterialVertexRequirement::VisibleInstanceStream)
+        );
+        assert!(
+            abi.vertex_requirements
+                .contains(&MaterialVertexRequirement::InstancePosition)
+        );
+        assert!(
+            abi.vertex_requirements
+                .contains(&MaterialVertexRequirement::ClipPositionOutput)
+        );
+        assert!(
+            abi.fragment_requirements
+                .contains(&MaterialFragmentRequirement::InterpolatedColorInput)
+        );
+        assert_eq!(
+            abi.binding(MaterialBindingKind::DrawParams).unwrap().kind,
+            MaterialBindingKind::DrawParams
+        );
+        assert_eq!(
+            abi.binding(MaterialBindingKind::RasterParams)
+                .unwrap()
+                .root_parameter_index,
+            0
+        );
+
+        let material = MaterialKernel::new("material").with_abi(abi);
+        assert_eq!(material.vertex_entrypoint(), "quad_vs");
+        assert_eq!(material.fragment_entrypoint(), "quad_fs");
+        assert_eq!(material.backend(), DrawBackend::HardwareRaster);
+        assert!(
+            material
+                .abi()
+                .vertex_requirements
+                .contains(&MaterialVertexRequirement::VisibleInstanceStream)
+        );
+    }
+
+    #[test]
+    fn material_kernel_abi_describes_direct_instance_material() {
+        let abi = MaterialKernelAbi::direct_instance_color("quad_vs_direct", "quad_fs");
+        assert_eq!(abi.vertex_entrypoint, "quad_vs_direct");
+        assert_eq!(abi.fragment_entrypoint, "quad_fs");
+        assert_eq!(abi.backend(), DrawBackend::HardwareRaster);
+        assert!(abi.is_draw_execution());
+        assert!(abi.is_hardware_raster());
+        assert!(!abi.requires_compute_culling());
+        assert!(abi.requires_instance_stream());
+        assert!(
+            abi.vertex_requirements
+                .contains(&MaterialVertexRequirement::DirectInstanceId)
+        );
+        assert!(
+            abi.vertex_requirements
+                .contains(&MaterialVertexRequirement::InstancePosition)
+        );
+        assert!(
+            abi.vertex_requirements
+                .contains(&MaterialVertexRequirement::GeometryPosition)
+        );
+        assert!(
+            abi.binding(MaterialBindingKind::VisibleInstanceStream)
+                .is_none()
+        );
+        assert_eq!(
+            abi.binding(MaterialBindingKind::DrawParams).unwrap().kind,
+            MaterialBindingKind::DrawParams
+        );
+        assert_eq!(
+            abi.binding(MaterialBindingKind::RasterParams)
+                .unwrap()
+                .root_parameter_index,
+            0
+        );
+        assert_eq!(
+            abi.binding(MaterialBindingKind::InstanceStream)
+                .unwrap()
+                .root_parameter_index,
+            1
+        );
+        assert_eq!(
+            abi.binding(MaterialBindingKind::GeometryStream)
+                .unwrap()
+                .root_parameter_index,
+            2
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_is_the_primary_render_destination_vocabulary() {
+        let target = Target::new(64, 32).unwrap();
+        let raster_alias = RasterTarget::new(64, 32).unwrap();
+        let render_alias = RenderTarget::new(64, 32).unwrap();
+        let draw_pass = DrawPass { target };
+        let raster_pass = RasterPass { target };
+
+        assert_eq!(target.width, 64);
+        assert_eq!(target.height, 32);
+        assert_eq!(target, raster_alias);
+        assert_eq!(target, render_alias);
+        assert_eq!(draw_pass.target, target);
+        assert_eq!(raster_pass, draw_pass);
+
+        let err = Target::new(0, 32).unwrap_err();
+        assert!(err.to_string().contains("target width and height"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn draw_execution_recipe_composes_streams_material_target_and_policy() {
+        let mesh_bytes = [0u8; 16];
+        let instance_bytes = [0u8; 40];
+        let ctx = match Context::new_default_device() {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                eprintln!("skipping raster draw recipe test without CUDA: {err}");
+                return;
+            }
+        };
+        let mesh = MeshBuffer::upload(
+            &ctx,
+            MeshBufferDesc {
+                vertex_count: 1,
+                vertex_layout: VertexLayout {
+                    stride: 16,
+                    attributes: vec![VertexAttribute {
+                        semantic: VertexSemantic::Position,
+                        format: VertexFormat::F32x3,
+                        offset: 0,
+                    }],
+                },
+                index_format: IndexFormat::None,
+                index_count: 0,
+                topology: PrimitiveTopology::TriangleList,
+            },
+            &mesh_bytes,
+            &[],
+        )
+        .unwrap();
+        let instances = InstanceBuffer::upload(
+            &ctx,
+            InstanceBufferDesc {
+                instance_count: 1,
+                instance_layout: InstanceLayout {
+                    stride: 40,
+                    attributes: vec![InstanceAttribute {
+                        semantic: InstanceSemantic::Position,
+                        format: InstanceFormat::F32x3,
+                        offset: 0,
+                    }],
+                },
+            },
+            &instance_bytes,
+        )
+        .unwrap();
+        let material = MaterialKernel::new("material").with_abi(
+            MaterialKernelAbi::compute_culled_instance_color("quad_vs", "quad_fs"),
+        );
+        let draw = DrawExecution::builder(
+            GeometryStream::from_mesh(&mesh),
+            &material,
+            Target::new(64, 32).unwrap(),
+        )
+        .instance_stream(InstanceStream::from_instances(&instances))
+        .draw_policy(DrawPolicy::ComputeCulled)
+        .try_build()
+        .unwrap();
+        assert_eq!(draw.target(), Target::new(64, 32).unwrap());
+        assert_eq!(draw.backend(), DrawBackend::HardwareRaster);
+        assert_eq!(draw.policy(), DrawPolicy::ComputeCulled);
+        assert_eq!(
+            draw.policy_config(),
+            DrawPolicyConfig::compute_culled(CullOrder::AtomicCompact)
+        );
+        assert_eq!(draw.policy_config().visibility, VisibilityMode::Frustum);
+        assert_eq!(
+            draw.policy_config().min_projected_millipixels,
+            DEFAULT_RASTER_MIN_PROJECTED_MILLIPIXELS
+        );
+        assert!(draw.instances().is_some());
+        assert_eq!(draw.material().label(), "material");
+        assert_eq!(draw.geometry().mesh().desc().vertex_count, 1);
+        assert_draw_recipe_contract(
+            &draw,
+            DrawBackend::HardwareRaster,
+            DrawPolicy::ComputeCulled,
+            Target::new(64, 32).unwrap(),
+            "material",
+        );
+
+        let neutral_draw: DrawExecution<'_> = DrawExecution::execution_builder(
+            GeometryStream::from_mesh(&mesh),
+            &material,
+            Target::new(64, 32).unwrap(),
+        )
+        .instance_stream(InstanceStream::from_instances(&instances))
+        .draw_policy(DrawPolicy::ComputeCulled)
+        .try_build()
+        .unwrap();
+        let _neutral_builder: DrawExecutionBuilder<'_> = DrawExecution::execution_builder(
+            GeometryStream::from_mesh(&mesh),
+            &material,
+            Target::new(64, 32).unwrap(),
+        );
+        let legacy_draw: RasterDraw<'_> = RasterDraw::builder(
+            GeometryStream::from_mesh(&mesh),
+            &material,
+            Target::new(64, 32).unwrap(),
+        )
+        .instance_stream(InstanceStream::from_instances(&instances))
+        .draw_policy(DrawPolicy::ComputeCulled)
+        .try_build()
+        .unwrap();
+        assert_eq!(neutral_draw.contract(), draw.contract());
+        assert_eq!(legacy_draw.contract(), draw.contract());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cuda_draw_recipe_composes_streams_material_target_and_policy() {
+        let mesh_bytes = [0u8; 16];
+        let instance_bytes = [0u8; 40];
+        let ctx = match Context::new_default_device() {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                eprintln!("skipping CUDA draw recipe test without CUDA: {err}");
+                return;
+            }
+        };
+        let mesh = MeshBuffer::upload(
+            &ctx,
+            MeshBufferDesc {
+                vertex_count: 1,
+                vertex_layout: VertexLayout {
+                    stride: 16,
+                    attributes: vec![VertexAttribute {
+                        semantic: VertexSemantic::Position,
+                        format: VertexFormat::F32x3,
+                        offset: 0,
+                    }],
+                },
+                index_format: IndexFormat::None,
+                index_count: 0,
+                topology: PrimitiveTopology::TriangleList,
+            },
+            &mesh_bytes,
+            &[],
+        )
+        .unwrap();
+        let instances = InstanceBuffer::upload(
+            &ctx,
+            InstanceBufferDesc {
+                instance_count: 1,
+                instance_layout: InstanceLayout {
+                    stride: 40,
+                    attributes: vec![InstanceAttribute {
+                        semantic: InstanceSemantic::Position,
+                        format: InstanceFormat::F32x3,
+                        offset: 0,
+                    }],
+                },
+            },
+            &instance_bytes,
+        )
+        .unwrap();
+        let material = MaterialKernel::from_cuda_tiled("cuda-material", "instance_raster");
+        let draw = CudaDraw::builder(
+            GeometryStream::from_mesh(&mesh),
+            &material,
+            Target::new(64, 32).unwrap(),
+        )
+        .instance_stream(InstanceStream::from_instances(&instances))
+        .try_build()
+        .unwrap();
+
+        assert_eq!(draw.target(), Target::new(64, 32).unwrap());
+        assert_eq!(draw.backend(), DrawBackend::CudaTiled);
+        assert_eq!(draw.policy(), DrawPolicy::CudaTiled);
+        assert_eq!(draw.policy_config(), DrawPolicyConfig::cuda_tiled());
+        assert_eq!(draw.material().kernel_entrypoint(), Some("instance_raster"));
+        assert_eq!(draw.instances().instances().desc().instance_count, 1);
+        assert_eq!(draw.geometry().mesh().desc().vertex_count, 1);
+        assert_draw_recipe_contract(
+            &draw,
+            DrawBackend::CudaTiled,
+            DrawPolicy::CudaTiled,
+            Target::new(64, 32).unwrap(),
+            "cuda-material",
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn draw_execution_recipe_preserves_explicit_policy_config() {
+        let mesh_bytes = [0u8; 16];
+        let instance_bytes = [0u8; 40];
+        let ctx = match Context::new_default_device() {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                eprintln!("skipping raster draw policy config test without CUDA: {err}");
+                return;
+            }
+        };
+        let mesh = MeshBuffer::upload(
+            &ctx,
+            MeshBufferDesc {
+                vertex_count: 1,
+                vertex_layout: VertexLayout {
+                    stride: 16,
+                    attributes: vec![VertexAttribute {
+                        semantic: VertexSemantic::Position,
+                        format: VertexFormat::F32x3,
+                        offset: 0,
+                    }],
+                },
+                index_format: IndexFormat::None,
+                index_count: 0,
+                topology: PrimitiveTopology::TriangleList,
+            },
+            &mesh_bytes,
+            &[],
+        )
+        .unwrap();
+        let instances = InstanceBuffer::upload(
+            &ctx,
+            InstanceBufferDesc {
+                instance_count: 1,
+                instance_layout: InstanceLayout {
+                    stride: 40,
+                    attributes: vec![InstanceAttribute {
+                        semantic: InstanceSemantic::Position,
+                        format: InstanceFormat::F32x3,
+                        offset: 0,
+                    }],
+                },
+            },
+            &instance_bytes,
+        )
+        .unwrap();
+        let material = MaterialKernel::new("material").with_abi(
+            MaterialKernelAbi::compute_culled_instance_color("quad_vs", "quad_fs"),
+        );
+        let draw = DrawExecution::builder(
+            GeometryStream::from_mesh(&mesh),
+            &material,
+            Target::new(64, 32).unwrap(),
+        )
+        .instance_stream(InstanceStream::from_instances(&instances))
+        .compute_culled_with_visibility(CullOrder::StableDense, VisibilityMode::ProjectedSize)
+        .draw_policy_config(
+            DrawPolicyConfig::compute_culled_with_visibility(
+                CullOrder::StableDense,
+                VisibilityMode::ProjectedSize,
+            )
+            .with_min_projected_millipixels(500),
+        )
+        .try_build()
+        .unwrap();
+
+        assert_eq!(draw.policy(), DrawPolicy::ComputeCulled);
+        assert_eq!(
+            draw.policy_config(),
+            DrawPolicyConfig::compute_culled_with_visibility(
+                CullOrder::StableDense,
+                VisibilityMode::ProjectedSize
+            )
+            .with_min_projected_millipixels(500)
+        );
+
+        let helper_draw = DrawExecution::builder(
+            GeometryStream::from_mesh(&mesh),
+            &material,
+            Target::new(64, 32).unwrap(),
+        )
+        .instance_stream(InstanceStream::from_instances(&instances))
+        .compute_culled_projected(CullOrder::StableDense, 500)
+        .try_build()
+        .unwrap();
+        assert_eq!(helper_draw.policy_config(), draw.policy_config());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn draw_execution_recipe_rejects_missing_required_instance_stream() {
+        let mesh_bytes = [0u8; 16];
+        let ctx = match Context::new_default_device() {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                eprintln!("skipping raster draw validation test without CUDA: {err}");
+                return;
+            }
+        };
+        let mesh = MeshBuffer::upload(
+            &ctx,
+            MeshBufferDesc {
+                vertex_count: 1,
+                vertex_layout: VertexLayout {
+                    stride: 16,
+                    attributes: vec![VertexAttribute {
+                        semantic: VertexSemantic::Position,
+                        format: VertexFormat::F32x3,
+                        offset: 0,
+                    }],
+                },
+                index_format: IndexFormat::None,
+                index_count: 0,
+                topology: PrimitiveTopology::TriangleList,
+            },
+            &mesh_bytes,
+            &[],
+        )
+        .unwrap();
+        let material = MaterialKernel::new("material").with_abi(
+            MaterialKernelAbi::compute_culled_instance_color("quad_vs", "quad_fs"),
+        );
+        let err = match DrawExecution::builder(
+            GeometryStream::from_mesh(&mesh),
+            &material,
+            Target::new(64, 32).unwrap(),
+        )
+        .draw_policy(DrawPolicy::ComputeCulled)
+        .try_build()
+        {
+            Ok(_) => panic!("expected missing InstanceStream validation error"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("requires an explicit InstanceStream"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn draw_execution_recipe_rejects_mismatched_draw_policy_and_material() {
+        let mesh_bytes = [0u8; 16];
+        let instance_bytes = [0u8; 40];
+        let ctx = match Context::new_default_device() {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                eprintln!("skipping raster draw policy validation test without CUDA: {err}");
+                return;
+            }
+        };
+        let mesh = MeshBuffer::upload(
+            &ctx,
+            MeshBufferDesc {
+                vertex_count: 1,
+                vertex_layout: VertexLayout {
+                    stride: 16,
+                    attributes: vec![VertexAttribute {
+                        semantic: VertexSemantic::Position,
+                        format: VertexFormat::F32x3,
+                        offset: 0,
+                    }],
+                },
+                index_format: IndexFormat::None,
+                index_count: 0,
+                topology: PrimitiveTopology::TriangleList,
+            },
+            &mesh_bytes,
+            &[],
+        )
+        .unwrap();
+        let instances = InstanceBuffer::upload(
+            &ctx,
+            InstanceBufferDesc {
+                instance_count: 1,
+                instance_layout: InstanceLayout {
+                    stride: 40,
+                    attributes: vec![InstanceAttribute {
+                        semantic: InstanceSemantic::Position,
+                        format: InstanceFormat::F32x3,
+                        offset: 0,
+                    }],
+                },
+            },
+            &instance_bytes,
+        )
+        .unwrap();
+
+        let compute_material = MaterialKernel::new("compute-material").with_abi(
+            MaterialKernelAbi::compute_culled_instance_color("quad_vs", "quad_fs"),
+        );
+        let err = match DrawExecution::builder(
+            GeometryStream::from_mesh(&mesh),
+            &compute_material,
+            Target::new(64, 32).unwrap(),
+        )
+        .instance_stream(InstanceStream::from_instances(&instances))
+        .try_build()
+        {
+            Ok(_) => panic!("expected missing compute culling policy validation error"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("requires DrawPolicy::ComputeCulled"));
+
+        let simple_material = MaterialKernel::new("simple-material");
+        let err = match DrawExecution::builder(
+            GeometryStream::from_mesh(&mesh),
+            &simple_material,
+            Target::new(64, 32).unwrap(),
+        )
+        .instance_stream(InstanceStream::from_instances(&instances))
+        .draw_policy(DrawPolicy::ComputeCulled)
+        .try_build()
+        {
+            Ok(_) => panic!("expected visible InstanceStream material validation error"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("read the visible InstanceStream"));
+
+        let cuda_material = MaterialKernel::from_cuda_tiled("cuda-material", "instance_raster");
+        let err = match DrawExecution::builder(
+            GeometryStream::from_mesh(&mesh),
+            &cuda_material,
+            Target::new(64, 32).unwrap(),
+        )
+        .instance_stream(InstanceStream::from_instances(&instances))
+        .try_build()
+        {
+            Ok(_) => panic!("expected CUDA MaterialKernel rejection"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("requires a draw-execution MaterialKernel"));
+
+        let err = match DrawExecution::builder(
+            GeometryStream::from_mesh(&mesh),
+            &simple_material,
+            Target::new(64, 32).unwrap(),
+        )
+        .instance_stream(InstanceStream::from_instances(&instances))
+        .draw_policy(DrawPolicy::CudaTiled)
+        .try_build()
+        {
+            Ok(_) => panic!("expected DrawExecution CUDA policy rejection"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("cannot use DrawPolicy::CudaTiled"));
+
+        let err = match CudaDraw::builder(
+            GeometryStream::from_mesh(&mesh),
+            &simple_material,
+            Target::new(64, 32).unwrap(),
+        )
+        .instance_stream(InstanceStream::from_instances(&instances))
+        .try_build()
+        {
+            Ok(_) => panic!("expected CudaDraw hardware material rejection"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("requires a CUDA tiled MaterialKernel"));
+
+        let err = match CudaDraw::builder(
+            GeometryStream::from_mesh(&mesh),
+            &cuda_material,
+            Target::new(64, 32).unwrap(),
+        )
+        .draw_policy_config(DrawPolicyConfig::draw_all())
+        .instance_stream(InstanceStream::from_instances(&instances))
+        .try_build()
+        {
+            Ok(_) => panic!("expected CudaDraw policy rejection"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("requires DrawPolicy::CudaTiled"));
+
+        let err = match CudaDraw::builder(
+            GeometryStream::from_mesh(&mesh),
+            &cuda_material,
+            Target::new(64, 32).unwrap(),
+        )
+        .try_build()
+        {
+            Ok(_) => panic!("expected CudaDraw missing InstanceStream rejection"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("requires an explicit InstanceStream"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shared_raster_stream_wrappers_skip_without_interop() {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct TestInstance {
+            position: [f32; 3],
+            color: u32,
+        }
+
+        let ctx = match Context::new_default_device() {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                eprintln!("skipping shared raster stream test without CUDA: {err}");
+                return;
+            }
+        };
+        let interop = match NeoD3d12InteropDevice::new(&ctx) {
+            Ok(interop) => interop,
+            Err(err) => {
+                eprintln!("skipping shared raster stream test without D3D12 interop: {err}");
+                return;
+            }
+        };
+        let desc = InstanceBufferDesc {
+            instance_count: 1,
+            instance_layout: InstanceLayout {
+                stride: std::mem::size_of::<TestInstance>() as u32,
+                attributes: vec![
+                    InstanceAttribute {
+                        semantic: InstanceSemantic::Position,
+                        format: InstanceFormat::F32x3,
+                        offset: 0,
+                    },
+                    InstanceAttribute {
+                        semantic: InstanceSemantic::Color0,
+                        format: InstanceFormat::U8x4Unorm,
+                        offset: 12,
+                    },
+                ],
+            },
+        };
+        let instances = [TestInstance {
+            position: [1.0, 2.0, 3.0],
+            color: 0xff00_ffff,
+        }];
+        let stream = SharedInstanceStream::upload_typed(
+            &ctx,
+            &interop,
+            desc.clone(),
+            &instances,
+            DataLayout::aosoa32(),
+        )
+        .unwrap();
+        let visible = VisibleInstanceStream::new(&interop, 4).unwrap();
+        let indirect = IndirectDrawBuffer::new(&interop, 1).unwrap();
+        assert_eq!(stream.desc(), &desc);
+        assert_eq!(stream.data_layout(), DataLayout::aosoa32());
+        assert!(stream.byte_len() >= INSTANCE_HEADER_BYTES);
+        assert_eq!(visible.capacity(), 4);
+        assert_eq!(visible.buffer().bytes(), 16);
+        assert_eq!(indirect.command_capacity(), 1);
+    }
+
+    #[test]
     fn diagnostics_collect_without_panicking() {
         let diagnostics = RuntimeDiagnostics::collect();
         if diagnostics.nvrtc_loadable {
-            assert!(!diagnostics.nvrtc_found.is_empty());
+            assert!(!diagnostics.nvrtc_compatible.is_empty());
         }
+    }
+
+    #[test]
+    fn runtime_can_compile_native_cuda_image_smoke() {
+        let ctx = match Context::new_default_device() {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                eprintln!("skipping native CUDA image smoke test without CUDA: {err}");
+                return;
+            }
+        };
+        if !nvrtc_available() {
+            eprintln!("skipping native CUDA image smoke test without NVRTC");
+            return;
+        }
+        let module = Module::from_cuda_source(
+            &ctx,
+            "extern \"C\" __global__ void noop_kernel() {}".to_string(),
+        )
+        .unwrap();
+        module.kernel("noop_kernel").unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cuda_root_expands_to_x64_bin_before_plain_bin() {
+        let mut dirs = Vec::new();
+        push_cuda_root_bin_dirs(
+            &mut dirs,
+            PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"),
+        );
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64"),
+                PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin"),
+            ]
+        );
     }
 
     #[test]

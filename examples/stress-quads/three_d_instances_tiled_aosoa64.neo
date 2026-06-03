@@ -224,6 +224,9 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
     let layer_i: i32 = tile_window[0];
     let end_i: i32 = tile_window[1];
     let step_i: i32 = tile_window[2];
+    let grid_xy: u32 = grid_x * grid_y;
+    let t_guess: f32 = (((as_f32(as_u32(layer_i)) - half_z) * spacing) - cam->origin.z) / dir_z;
+    let t_step: f32 = as_f32(step_i) * spacing / dir_z;
 
     for (int visited = 0; visited < as_i32(grid_z_pixel); ++visited) {
         if ((step_i > 0 && layer_i > end_i) || (step_i < 0 && layer_i < end_i)) {
@@ -232,8 +235,6 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
         visited_count = visited_count + 1u;
 
         let layer: u32 = as_u32(layer_i);
-        let layer_z: f32 = (as_f32(layer) - half_z) * spacing;
-        let t_guess: f32 = (layer_z - cam->origin.z) / dir_z;
         let guess_x: f32 = cam->origin.x + dir_x * t_guess;
         let guess_y: f32 = cam->origin.y + dir_y * t_guess;
         let ix_i: i32 = as_i32(floorf(guess_x * inv_spacing + half_x + 0.5f));
@@ -242,7 +243,7 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
         if (ix_i >= 0 && iy_i >= 0 && ix_i < as_i32(grid_x) && iy_i < as_i32(grid_y)) {
             let ix: u32 = as_u32(ix_i);
             let iy: u32 = as_u32(iy_i);
-            let instance_id: u32 = layer * grid_x * grid_y + iy * grid_x + ix;
+            let instance_id: u32 = layer * grid_xy + iy * grid_x + ix;
             if (instance_id < instance_count) {
                 let group: u32 = instance_id / group_size;
                 let lane: u32 = instance_id - group * group_size;
@@ -309,6 +310,7 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
         }
 
         layer_i = layer_i + step_i;
+        t_guess = t_guess + t_step;
     }
 
     if (debug_view == 2u) {

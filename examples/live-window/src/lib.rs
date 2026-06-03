@@ -1,4 +1,6 @@
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
@@ -12,11 +14,16 @@ use std::{
 use anyhow::{Context as _, Result, anyhow, bail};
 use neo_lang::{AddressSpace, TypeName};
 use neo_runtime::{
-    Context as NeoContext, CudaFence, CudaGraph, DataLayout, DeviceBuffer, IndexFormat,
-    InstanceAttribute, InstanceBuffer, InstanceBufferDesc, InstanceFormat, InstanceLayout,
-    InstanceSemantic, Kernel, LaunchDims, MeshBuffer, MeshBufferDesc, NeoD3d12InteropDevice,
-    PrimitiveTopology, ReadablePinnedHostBuffer, SharedFrameRing, Stream as CudaStream,
-    VertexAttribute, VertexFormat, VertexLayout, VertexSemantic,
+    Context as NeoContext, CudaFence, CudaGraph, DataLayout, DeviceBuffer, DrawBackend,
+    DrawDepthMode as RuntimeDrawDepthMode, DrawExecution, DrawIndexedIndirectCommand, DrawPolicy,
+    DrawPolicyConfig, GeometryStream, IndexFormat, IndirectDrawBuffer, InstanceAttribute,
+    InstanceBuffer, InstanceBufferDesc, InstanceFormat, InstanceLayout, InstanceSemantic,
+    InstanceStream, Kernel, LaunchDims, MaterialBindingKind, MaterialFragmentRequirement,
+    MaterialKernel, MaterialKernelAbi, MaterialVertexRequirement, MeshBuffer, MeshBufferDesc,
+    NeoD3d12InteropDevice, PrimitiveTopology, RasterCullOrder as RuntimeRasterCullOrder,
+    RasterVisibilityMode as RuntimeRasterVisibilityMode, ReadablePinnedHostBuffer, SharedFrameRing,
+    SharedGpuBuffer, SharedInstanceStream, Stream as CudaStream, Target, VertexAttribute,
+    VertexFormat, VertexLayout, VertexSemantic, VisibleInstanceStream,
 };
 use notify::{Event as NotifyEvent, RecursiveMode, Watcher as _};
 use winit::{
@@ -36,6 +43,7 @@ const EMPTY_IDLE_FPS: f32 = 15.0;
 const UNFOCUSED_IDLE_FPS: f32 = 15.0;
 const CAMERA_MOVE_UNITS_PER_SEC: f32 = 4.0;
 const CAMERA_MAX_STEP_SECONDS: f32 = 1.0 / 30.0;
+const DEFAULT_MIN_PROJECTED_MILLIPIXELS: u32 = 850;
 const DEFAULT_INSTANCE_GRID: InstanceGrid = InstanceGrid {
     x: 256,
     y: 256,
@@ -50,8 +58,659 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()> {
     run(LiveOptions::parse(args)?)
 }
 
+pub fn run_from_args_with_draw_plan(
+    args: impl IntoIterator<Item = String>,
+    draw_plan: DrawPlan,
+) -> Result<()> {
+    run_from_args_with_draw_execution_plan(args, draw_plan)
+}
+
+pub fn run_from_args_with_draw_execution_plan(
+    args: impl IntoIterator<Item = String>,
+    draw_plan: DrawExecutionPlan,
+) -> Result<()> {
+    let mut options = LiveOptions::parse(args)?;
+    options.raster_plan = draw_plan;
+    run(options)
+}
+
+pub fn run_from_args_with_raster_plan(
+    args: impl IntoIterator<Item = String>,
+    raster_plan: HardwareRasterPlan,
+) -> Result<()> {
+    run_from_args_with_draw_plan(args, raster_plan)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrawExecutionPlan {
+    pub draw_name: String,
+    pub geometry_stream: GeometryStreamPlan,
+    pub instance_stream: InstanceStreamPlan,
+    pub target: TargetPlan,
+    pub material: MaterialKernelPlan,
+    pub draw_policy: DrawPolicyPlan,
+    pub depth: DrawDepthMode,
+    pub cull_order: DrawCullOrder,
+    pub visibility: DrawVisibilityMode,
+    pub min_projected_millipixels: u32,
+}
+
+pub type DrawPlan = DrawExecutionPlan;
+pub type HardwareRasterPlan = DrawExecutionPlan;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrawExecutionContract {
+    pub draw_name: String,
+    pub geometry_stream: String,
+    pub instance_stream: String,
+    pub instance_layout: StressInstanceLayout,
+    pub material: String,
+    pub target: String,
+    pub target_width: u32,
+    pub target_height: u32,
+    pub policy_config: DrawPolicyConfig,
+    pub backend: DrawBackend,
+}
+
+pub type DrawContract = DrawExecutionContract;
+pub type HardwareRasterDrawContract = DrawExecutionContract;
+
+impl DrawExecutionContract {
+    pub fn policy(&self) -> DrawPolicy {
+        self.policy_config.policy
+    }
+
+    pub fn policy_label(&self) -> &'static str {
+        self.policy_config.policy_label()
+    }
+
+    pub fn backend_label(&self) -> &'static str {
+        self.policy_config.backend_label()
+    }
+
+    pub fn depth_label(&self) -> &'static str {
+        self.policy_config.depth_label()
+    }
+
+    pub fn uses_depth(&self) -> bool {
+        self.policy_config.uses_depth()
+    }
+
+    pub fn cull_order_label(&self) -> &'static str {
+        self.policy_config.cull_order_label()
+    }
+
+    pub fn visibility_label(&self) -> &'static str {
+        self.policy_config.visibility_label()
+    }
+
+    pub fn min_projected_pixels(&self) -> f32 {
+        self.policy_config.min_projected_pixels()
+    }
+
+    pub fn instance_layout_label(&self) -> &'static str {
+        self.instance_layout.label()
+    }
+
+    pub fn target_dimensions(&self) -> (u32, u32) {
+        (self.target_width, self.target_height)
+    }
+}
+
+impl DrawExecutionPlan {
+    pub fn stock() -> Self {
+        Self {
+            draw_name: "main".to_string(),
+            geometry_stream: GeometryStreamPlan::stock_quad(),
+            instance_stream: InstanceStreamPlan::stock_instances(
+                DEFAULT_INSTANCE_GRID,
+                StressInstanceLayout::AoSoA32,
+            ),
+            target: TargetPlan::window(DEFAULT_WIDTH, DEFAULT_HEIGHT),
+            material: MaterialKernelPlan::direct_instance_color(
+                "hardware-raster",
+                "quad_vs_direct",
+                "quad_fs",
+            ),
+            draw_policy: DrawPolicyPlan::DrawAll,
+            depth: DrawDepthMode::Auto,
+            cull_order: DrawCullOrder::StableDense,
+            visibility: DrawVisibilityMode::Frustum,
+            min_projected_millipixels: DEFAULT_MIN_PROJECTED_MILLIPIXELS,
+        }
+    }
+
+    fn material_kernel(&self) -> MaterialKernel {
+        self.material.material_kernel()
+    }
+
+    pub fn draw_name(&self) -> &str {
+        &self.draw_name
+    }
+
+    pub fn backend(&self) -> DrawBackend {
+        DrawBackend::HardwareRaster
+    }
+
+    pub fn geometry_stream(&self) -> &GeometryStreamPlan {
+        &self.geometry_stream
+    }
+
+    pub fn instance_stream(&self) -> &InstanceStreamPlan {
+        &self.instance_stream
+    }
+
+    pub fn target(&self) -> &TargetPlan {
+        &self.target
+    }
+
+    pub fn material(&self) -> &MaterialKernelPlan {
+        &self.material
+    }
+
+    pub fn draw_policy(&self) -> DrawPolicyPlan {
+        self.draw_policy
+    }
+
+    pub fn depth(&self) -> DrawDepthMode {
+        self.depth
+    }
+
+    pub fn uses_depth(&self) -> bool {
+        self.depth.uses_depth(self.draw_policy)
+    }
+
+    pub fn policy(&self) -> DrawPolicy {
+        self.draw_policy.into()
+    }
+
+    pub fn cull_order(&self) -> DrawCullOrder {
+        self.cull_order
+    }
+
+    pub fn visibility(&self) -> DrawVisibilityMode {
+        self.visibility
+    }
+
+    pub fn min_projected_pixels(&self) -> f32 {
+        self.min_projected_millipixels as f32 / 1000.0
+    }
+
+    pub fn policy_config(&self) -> DrawPolicyConfig {
+        match self.draw_policy {
+            DrawPolicyPlan::DrawAll => DrawPolicyConfig::draw_all(),
+            DrawPolicyPlan::ComputeCulled => DrawPolicyConfig::compute_culled_with_visibility(
+                self.cull_order.runtime_order(),
+                self.visibility.runtime_visibility(),
+            )
+            .with_min_projected_millipixels(self.min_projected_millipixels),
+        }
+        .with_depth(self.depth.runtime_mode())
+    }
+
+    pub fn contract(&self) -> DrawExecutionContract {
+        DrawExecutionContract {
+            draw_name: self.draw_name.clone(),
+            geometry_stream: self.geometry_stream.name.clone(),
+            instance_stream: self.instance_stream.name.clone(),
+            instance_layout: self.instance_stream.layout,
+            material: self.material.name.clone(),
+            target: self.target.name.clone(),
+            target_width: self.target.width,
+            target_height: self.target.height,
+            policy_config: self.policy_config(),
+            backend: self.backend(),
+        }
+    }
+
+    fn sync_stock_material_to_draw_policy(&mut self) {
+        if !self.material.is_stock_hardware_raster() {
+            return;
+        }
+        self.material = match self.draw_policy {
+            DrawPolicyPlan::DrawAll => MaterialKernelPlan::direct_instance_color(
+                "hardware-raster",
+                "quad_vs_direct",
+                "quad_fs",
+            ),
+            DrawPolicyPlan::ComputeCulled => MaterialKernelPlan::compute_culled_instance_color(
+                "hardware-raster",
+                "quad_vs",
+                "quad_fs",
+            ),
+        };
+    }
+
+    fn validate_executor_contract(&self) -> Result<()> {
+        if self.geometry_stream.indices_u16.is_empty() {
+            bail!(
+                "hardware raster draw `{}` references GeometryStream `{}` with no indices",
+                self.draw_name,
+                self.geometry_stream.name
+            );
+        }
+        if self.geometry_stream.vertex_bytes.is_empty() {
+            bail!(
+                "hardware raster draw `{}` references GeometryStream `{}` with no vertex data",
+                self.draw_name,
+                self.geometry_stream.name
+            );
+        }
+        if self.geometry_stream.vertex_stride < 16 {
+            bail!(
+                "hardware raster draw `{}` references GeometryStream `{}` with vertex stride smaller than position+color payload",
+                self.draw_name,
+                self.geometry_stream.name
+            );
+        }
+        if self.geometry_stream.indices_u16.len() > u32::MAX as usize {
+            bail!(
+                "hardware raster draw `{}` references GeometryStream `{}` with too many indices",
+                self.draw_name,
+                self.geometry_stream.name
+            );
+        }
+        self.instance_stream.grid.validate()?;
+        if self.target.width == 0 || self.target.height == 0 {
+            bail!(
+                "hardware raster draw `{}` references Target `{}` with zero size",
+                self.draw_name,
+                self.target.name
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DrawPolicyPlan {
+    DrawAll,
+    ComputeCulled,
+}
+
+pub type HardwareRasterDrawPolicy = DrawPolicyPlan;
+
+impl DrawPolicyPlan {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DrawAll => "draw-all",
+            Self::ComputeCulled => "compute-culled",
+        }
+    }
+}
+
+impl From<DrawPolicyPlan> for DrawPolicy {
+    fn from(value: DrawPolicyPlan) -> Self {
+        match value {
+            DrawPolicyPlan::DrawAll => Self::DrawAll,
+            DrawPolicyPlan::ComputeCulled => Self::ComputeCulled,
+        }
+    }
+}
+
+impl std::str::FromStr for DrawPolicyPlan {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "draw-all" | "all" => Ok(Self::DrawAll),
+            "compute-culled" | "culled" => Ok(Self::ComputeCulled),
+            _ => bail!("unknown raster draw policy `{value}`; expected draw-all or compute-culled"),
+        }
+    }
+}
+
+impl std::fmt::Display for DrawPolicyPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DrawDepthMode {
+    Auto,
+    On,
+    Off,
+}
+
+impl DrawDepthMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn uses_depth(self, policy: DrawPolicyPlan) -> bool {
+        match self {
+            Self::Auto => policy != DrawPolicyPlan::DrawAll,
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+
+    fn runtime_mode(self) -> RuntimeDrawDepthMode {
+        match self {
+            Self::Auto => RuntimeDrawDepthMode::Auto,
+            Self::On => RuntimeDrawDepthMode::On,
+            Self::Off => RuntimeDrawDepthMode::Off,
+        }
+    }
+}
+
+impl std::str::FromStr for DrawDepthMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "on" | "true" | "depth" => Ok(Self::On),
+            "off" | "false" | "none" | "no-depth" => Ok(Self::Off),
+            _ => bail!("unknown draw depth mode `{value}`; expected auto, on, or off"),
+        }
+    }
+}
+
+impl std::fmt::Display for DrawDepthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DrawCullOrder {
+    AtomicCompact,
+    StableDense,
+}
+
+pub type HardwareRasterCullOrder = DrawCullOrder;
+
+impl DrawCullOrder {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AtomicCompact => "atomic-compact",
+            Self::StableDense => "stable-dense",
+        }
+    }
+
+    fn code(self) -> u32 {
+        match self {
+            Self::AtomicCompact => 0,
+            Self::StableDense => 1,
+        }
+    }
+
+    fn runtime_order(self) -> RuntimeRasterCullOrder {
+        match self {
+            Self::AtomicCompact => RuntimeRasterCullOrder::AtomicCompact,
+            Self::StableDense => RuntimeRasterCullOrder::StableDense,
+        }
+    }
+}
+
+impl std::str::FromStr for DrawCullOrder {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "atomic" | "atomic-compact" => Ok(Self::AtomicCompact),
+            "stable" | "stable-dense" => Ok(Self::StableDense),
+            _ => bail!(
+                "unknown raster cull order `{value}`; expected atomic-compact or stable-dense"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for DrawCullOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DrawVisibilityMode {
+    Frustum,
+    ProjectedSize,
+}
+
+pub type HardwareRasterVisibilityMode = DrawVisibilityMode;
+
+impl DrawVisibilityMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Frustum => "frustum",
+            Self::ProjectedSize => "projected-size",
+        }
+    }
+
+    fn code(&self) -> u32 {
+        match self {
+            Self::Frustum => 0,
+            Self::ProjectedSize => 1,
+        }
+    }
+
+    fn runtime_visibility(self) -> RuntimeRasterVisibilityMode {
+        match self {
+            Self::Frustum => RuntimeRasterVisibilityMode::Frustum,
+            Self::ProjectedSize => RuntimeRasterVisibilityMode::ProjectedSize,
+        }
+    }
+}
+
+impl std::str::FromStr for DrawVisibilityMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "frustum" | "frustum-only" => Ok(Self::Frustum),
+            "projected-size" | "projected" | "pixel-size" => Ok(Self::ProjectedSize),
+            _ => bail!(
+                "unknown raster visibility mode `{value}`; expected frustum or projected-size"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for DrawVisibilityMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeometryStreamPlan {
+    pub name: String,
+    pub vertex_bytes: Vec<u8>,
+    pub vertex_stride: u32,
+    pub color_offset: u32,
+    pub indices_u16: Vec<u16>,
+}
+
+pub type HardwareRasterGeometryStreamPlan = GeometryStreamPlan;
+
+impl GeometryStreamPlan {
+    pub fn stock_quad() -> Self {
+        let vertices = [
+            DemoVertex {
+                position: [-1.0, -1.0, 0.0],
+                color_bgra: 0xffff_ffff,
+            },
+            DemoVertex {
+                position: [1.0, -1.0, 0.0],
+                color_bgra: 0xffff_ffff,
+            },
+            DemoVertex {
+                position: [-1.0, 1.0, 0.0],
+                color_bgra: 0xffff_ffff,
+            },
+            DemoVertex {
+                position: [1.0, 1.0, 0.0],
+                color_bgra: 0xffff_ffff,
+            },
+        ];
+        Self {
+            name: "quad".to_string(),
+            vertex_bytes: vertices_as_bytes(&vertices),
+            vertex_stride: std::mem::size_of::<DemoVertex>() as u32,
+            color_offset: 12,
+            indices_u16: vec![0, 1, 2, 2, 1, 3],
+        }
+    }
+
+    pub fn indexed_u16(
+        name: impl Into<String>,
+        vertex_bytes: impl Into<Vec<u8>>,
+        vertex_stride: u32,
+        color_offset: u32,
+        indices: impl Into<Vec<u16>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            vertex_bytes: vertex_bytes.into(),
+            vertex_stride,
+            color_offset,
+            indices_u16: indices.into(),
+        }
+    }
+
+    pub fn index_count(&self) -> u32 {
+        self.indices_u16.len() as u32
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceStreamPlan {
+    pub name: String,
+    pub grid: InstanceGrid,
+    pub layout: StressInstanceLayout,
+}
+
+pub type HardwareRasterInstanceStreamPlan = InstanceStreamPlan;
+
+impl InstanceStreamPlan {
+    pub fn stock_instances(grid: InstanceGrid, layout: StressInstanceLayout) -> Self {
+        Self {
+            name: "instances".to_string(),
+            grid,
+            layout,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetPlan {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub type HardwareRasterTargetPlan = TargetPlan;
+
+impl TargetPlan {
+    pub fn window(width: u32, height: u32) -> Self {
+        Self {
+            name: "window".to_string(),
+            width,
+            height,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterialKernelPlan {
+    pub name: String,
+    pub vertex_entrypoint: String,
+    pub fragment_entrypoint: String,
+    pub kind: MaterialKernelPlanKind,
+}
+
+pub type HardwareRasterMaterialPlan = MaterialKernelPlan;
+
+impl MaterialKernelPlan {
+    pub fn direct_instance_color(
+        name: impl Into<String>,
+        vertex_entrypoint: impl Into<String>,
+        fragment_entrypoint: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            vertex_entrypoint: vertex_entrypoint.into(),
+            fragment_entrypoint: fragment_entrypoint.into(),
+            kind: MaterialKernelPlanKind::DirectInstanceColor,
+        }
+    }
+
+    pub fn compute_culled_instance_color(
+        name: impl Into<String>,
+        vertex_entrypoint: impl Into<String>,
+        fragment_entrypoint: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            vertex_entrypoint: vertex_entrypoint.into(),
+            fragment_entrypoint: fragment_entrypoint.into(),
+            kind: MaterialKernelPlanKind::ComputeCulledInstanceColor,
+        }
+    }
+
+    fn material_kernel(&self) -> MaterialKernel {
+        let material = MaterialKernel::from_stages(
+            self.name.clone(),
+            self.vertex_entrypoint.clone(),
+            self.fragment_entrypoint.clone(),
+        );
+        match self.kind {
+            MaterialKernelPlanKind::DirectInstanceColor => {
+                material.with_abi(MaterialKernelAbi::direct_instance_color(
+                    self.vertex_entrypoint.clone(),
+                    self.fragment_entrypoint.clone(),
+                ))
+            }
+            MaterialKernelPlanKind::ComputeCulledInstanceColor => {
+                material.with_abi(MaterialKernelAbi::compute_culled_instance_color(
+                    self.vertex_entrypoint.clone(),
+                    self.fragment_entrypoint.clone(),
+                ))
+            }
+        }
+    }
+
+    fn is_stock_hardware_raster(&self) -> bool {
+        self.name == "hardware-raster"
+            && self.fragment_entrypoint == "quad_fs"
+            && matches!(
+                self.vertex_entrypoint.as_str(),
+                "quad_vs" | "quad_vs_direct"
+            )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MaterialKernelPlanKind {
+    DirectInstanceColor,
+    ComputeCulledInstanceColor,
+}
+
+pub type HardwareRasterMaterialKind = MaterialKernelPlanKind;
+
+impl MaterialKernelPlanKind {
+    fn requires_visible_stream(self) -> bool {
+        matches!(self, Self::ComputeCulledInstanceColor)
+    }
+}
+
 #[allow(deprecated)]
-fn run(options: LiveOptions) -> Result<()> {
+fn run(mut options: LiveOptions) -> Result<()> {
+    if options.mode == RunMode::DrawStress {
+        options.raster_plan.validate_executor_contract()?;
+        options.instance_grid = options.raster_plan.instance_stream.grid;
+        options.instance_layout = options.raster_plan.instance_stream.layout;
+        options.width = options.raster_plan.target.width;
+        options.height = options.raster_plan.target.height;
+    }
     let source_path = options
         .source_path
         .canonicalize()
@@ -60,6 +719,8 @@ fn run(options: LiveOptions) -> Result<()> {
         options
             .instance_stress_variant
             .source_path(&source_path, options.instance_layout)
+    } else if options.mode == RunMode::DrawStress {
+        raster_stress_source_path(&source_path)
     } else {
         source_path.clone()
     };
@@ -82,8 +743,10 @@ fn run(options: LiveOptions) -> Result<()> {
     } else {
         options.presenter
     };
-    if matches!(options.mode, RunMode::MeshDemo | RunMode::InstanceStress)
-        && presenter_kind != PresenterKind::D3d12Interop
+    if matches!(
+        options.mode,
+        RunMode::MeshDemo | RunMode::InstanceStress | RunMode::DrawStress
+    ) && presenter_kind != PresenterKind::D3d12Interop
     {
         bail!(
             "{} requires D3D12/CUDA interop; use --presenter d3d12-interop --interop-fallback fail",
@@ -110,7 +773,10 @@ fn run(options: LiveOptions) -> Result<()> {
             neo.disable_automatic_event_tracking();
         }
     }
-    let mut live_reload = if matches!(options.mode, RunMode::MeshDemo | RunMode::InstanceStress) {
+    let mut live_reload = if matches!(
+        options.mode,
+        RunMode::MeshDemo | RunMode::InstanceStress | RunMode::DrawStress
+    ) {
         None
     } else {
         Some(ReloadState::new(LiveKernel::compile(&neo, &source_path)?))
@@ -129,21 +795,35 @@ fn run(options: LiveOptions) -> Result<()> {
     } else {
         None
     };
+    let mut raster_reload = if options.mode == RunMode::DrawStress {
+        Some(ReloadState::new(RasterStressKernel::compile(
+            &neo,
+            &instance_source_path,
+            &options.raster_plan,
+        )?))
+    } else {
+        None
+    };
     let mesh_buffer = if options.mode == RunMode::MeshDemo {
         Some(create_demo_mesh(&neo)?)
     } else {
         None
     };
-    let mut instance_assets = if options.mode == RunMode::InstanceStress {
-        Some(create_instance_stress_assets(
-            &neo,
-            options.instance_grid,
-            options.present_ring,
-            options.instance_layout,
-        )?)
-    } else {
-        None
-    };
+    let mut instance_assets =
+        if matches!(options.mode, RunMode::InstanceStress | RunMode::DrawStress) {
+            Some(create_instance_stress_assets(
+                &neo,
+                interop_device
+                    .as_ref()
+                    .filter(|_| options.mode == RunMode::DrawStress),
+                options.instance_grid,
+                options.present_ring,
+                options.instance_layout,
+            )?)
+        } else {
+            None
+        };
+    let mut raster_resources: Option<RasterStressResources> = None;
     let watched_source_path = if options.mode == RunMode::InstanceStress {
         &instance_source_path
     } else {
@@ -163,6 +843,7 @@ fn run(options: LiveOptions) -> Result<()> {
         .map(|reload| reload.generation)
         .or_else(|| mesh_reload.as_ref().map(|reload| reload.generation))
         .or_else(|| instance_reload.as_ref().map(|reload| reload.generation))
+        .or_else(|| raster_reload.as_ref().map(|reload| reload.generation))
         .unwrap_or(0);
     let mut fps = FpsCounter::new();
     let mut throughput = ThroughputCounter::new();
@@ -200,6 +881,15 @@ fn run(options: LiveOptions) -> Result<()> {
                             instance_reload
                                 .as_mut()
                                 .expect("instance reload exists in instance-stress mode"),
+                        ),
+                        RunMode::DrawStress => handle_raster_reload_events(
+                            &neo,
+                            &instance_source_path,
+                            &options.raster_plan,
+                            reload_rx,
+                            raster_reload
+                                .as_mut()
+                                .expect("draw reload exists in draw-stress mode"),
                         ),
                         _ => handle_reload_events(
                             &neo,
@@ -313,6 +1003,15 @@ fn run(options: LiveOptions) -> Result<()> {
                                     .as_ref()
                                     .map(|assets| assets.instances.layout_label()),
                                 instance_debug_view: Some(options.instance_debug_view),
+                                renderer: None,
+                                draw_policy: None,
+                                draw_depth: None,
+                                uses_depth: None,
+                                cull_order: None,
+                                draw_visibility: None,
+                                min_projected_millipixels: None,
+                                visible_instances: None,
+                                indirect_draws: None,
                                 render_policy: options.render_policy,
                                 visibility,
                             });
@@ -355,6 +1054,96 @@ fn run(options: LiveOptions) -> Result<()> {
                                 &mut interop_throughput_resources,
                                 interop_device.as_ref(),
                             );
+                            elwt.exit();
+                        }
+                    }
+                    return;
+                }
+
+                if matches!(options.mode, RunMode::DrawStress) {
+                    let reload = raster_reload
+                        .as_mut()
+                        .expect("draw reload exists in draw-stress mode");
+                    if presenter.kind() != PresenterKind::D3d12Interop {
+                        eprintln!("draw-stress requires --presenter d3d12-interop");
+                        elwt.exit();
+                        return;
+                    }
+                    if throughput_generation != reload.generation {
+                        raster_resources = None;
+                        throughput_generation = reload.generation;
+                    }
+                    let now = Instant::now();
+                    let camera_params =
+                        camera.params(size, start.elapsed().as_secs_f32(), options.instance_grid);
+                    let max_inflight = kernel_limiter.grant(now, options.max_inflight);
+                    let result = match interop_device.as_ref() {
+                        Some(interop) => run_raster_stress_batch(RasterStressBatch {
+                            neo: &neo,
+                            interop,
+                            resources: &mut raster_resources,
+                            kernel: &reload.active,
+                            assets: instance_assets
+                                .as_mut()
+                                .expect("draw-stress creates instance assets"),
+                            presenter: &mut presenter,
+                            size,
+                            start,
+                            next_frame: &mut frame,
+                            completed_kernels: &mut completed_kernels,
+                            present_limiter: &mut interop_present_limiter,
+                            max_inflight,
+                            present_ring: options.present_ring,
+                            instance_grid: options.instance_grid,
+                            camera: camera_params,
+                            raster_plan: &options.raster_plan,
+                        }),
+                        None => Err(anyhow!("missing D3D12 interop device")),
+                    };
+                    match result {
+                        Ok(batch) => {
+                            throughput.record(batch);
+                            throughput.log_if_due(ThroughputLogContext {
+                                size,
+                                frame,
+                                presenter: presenter.kind(),
+                                reload_error: reload.last_error.as_deref(),
+                                kernel_cap: options.kernel_cap(),
+                                instance_variant: None,
+                                instance_layout: Some(
+                                    options.raster_plan.instance_stream.layout.to_string(),
+                                ),
+                                instance_debug_view: None,
+                                renderer: Some(options.raster_plan.backend()),
+                                draw_policy: Some(options.raster_plan.draw_policy),
+                                draw_depth: Some(options.raster_plan.depth),
+                                uses_depth: Some(options.raster_plan.uses_depth()),
+                                cull_order: Some(options.raster_plan.cull_order),
+                                draw_visibility: Some(options.raster_plan.visibility),
+                                min_projected_millipixels: Some(
+                                    options.raster_plan.min_projected_millipixels,
+                                ),
+                                visible_instances: hardware_raster_visible_instances_for_log(
+                                    options.raster_plan.draw_policy,
+                                    options.instance_grid,
+                                ),
+                                indirect_draws: Some(1),
+                                render_policy: options.render_policy,
+                                visibility: RenderVisibility::Visible,
+                            });
+                            if options.should_stop_completed(completed_kernels, start.elapsed()) {
+                                raster_resources = None;
+                                elwt.exit();
+                            }
+                            if max_inflight == 0
+                                && let Some(next_kernel_at) = kernel_limiter.next_token_at(now)
+                            {
+                                elwt.set_control_flow(ControlFlow::WaitUntil(next_kernel_at));
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("raster stress error: {err:#}");
+                            raster_resources = None;
                             elwt.exit();
                         }
                     }
@@ -410,6 +1199,15 @@ fn run(options: LiveOptions) -> Result<()> {
                                 instance_variant: None,
                                 instance_layout: None,
                                 instance_debug_view: None,
+                                renderer: None,
+                                draw_policy: None,
+                                draw_depth: None,
+                                uses_depth: None,
+                                cull_order: None,
+                                draw_visibility: None,
+                                min_projected_millipixels: None,
+                                visible_instances: None,
+                                indirect_draws: None,
                                 render_policy: options.render_policy,
                                 visibility: window_visibility.render_visibility(),
                             });
@@ -496,6 +1294,15 @@ fn run(options: LiveOptions) -> Result<()> {
                                 instance_variant: None,
                                 instance_layout: None,
                                 instance_debug_view: None,
+                                renderer: None,
+                                draw_policy: None,
+                                draw_depth: None,
+                                uses_depth: None,
+                                cull_order: None,
+                                draw_visibility: None,
+                                min_projected_millipixels: None,
+                                visible_instances: None,
+                                indirect_draws: None,
                                 render_policy: options.render_policy,
                                 visibility: window_visibility.render_visibility(),
                             });
@@ -779,6 +1586,7 @@ struct LiveOptions {
     d3d_upload: D3dUploadMode,
     interop_fallback: InteropFallback,
     hot_reload: bool,
+    raster_plan: HardwareRasterPlan,
 }
 
 impl LiveOptions {
@@ -805,6 +1613,7 @@ impl LiveOptions {
             d3d_upload: D3dUploadMode::MappedCopy,
             interop_fallback: InteropFallback::NoInterop,
             hot_reload: true,
+            raster_plan: HardwareRasterPlan::stock(),
         };
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -839,6 +1648,25 @@ impl LiveOptions {
                 "--instance-layout" => {
                     options.instance_layout = parse_next(&mut args, "--instance-layout")?
                 }
+                "--draw-policy" | "--raster-draw-policy" => {
+                    options.raster_plan.draw_policy = parse_next(&mut args, arg.as_str())?;
+                    options.raster_plan.sync_stock_material_to_draw_policy();
+                }
+                "--draw-depth" | "--raster-depth" => {
+                    options.raster_plan.depth = parse_next(&mut args, arg.as_str())?
+                }
+                "--cull-order" | "--raster-cull-order" => {
+                    options.raster_plan.cull_order = parse_next(&mut args, arg.as_str())?
+                }
+                "--visibility" | "--raster-visibility" => {
+                    options.raster_plan.visibility = parse_next(&mut args, arg.as_str())?
+                }
+                "--min-projected-pixels" | "--raster-min-projected-pixels" => {
+                    options.raster_plan.min_projected_millipixels = parse_min_projected_pixels(
+                        arg.as_str(),
+                        parse_next::<String>(&mut args, arg.as_str())?,
+                    )?
+                }
                 "--render-policy" => {
                     options.render_policy = parse_next(&mut args, "--render-policy")?
                 }
@@ -849,7 +1677,7 @@ impl LiveOptions {
                 "--hot-reload" => options.hot_reload = true,
                 "--no-hot-reload" => options.hot_reload = false,
                 "--help" | "-h" => bail!(
-                    "usage: neo-live-window [path.neo] [--title TEXT] [--width N] [--height N] [--frames N] [--seconds N] [--presenter d3d12-interop|d3d12|d3d11|gdi] [--mode live|kernel-throughput|mesh-demo|instance-stress] [--sample-every N] [--present-target-fps N] [--kernel-target-fps N] [--max-inflight N] [--present-ring N] [--instance-grid XxYxZ] [--instance-stress-variant baseline|fast|culled|tiled] [--instance-debug-view off|tile-range|iterations|hit-miss] [--instance-layout aosoa32|aosoa64] [--render-policy auto|force-render|pause-when-empty] [--d3d-upload mapped-copy|update-subresource] [--interop-fallback no-interop|fail] [--hot-reload|--no-hot-reload]"
+                    "usage: neo-live-window [path.neo] [--title TEXT] [--width N] [--height N] [--frames N] [--seconds N] [--presenter d3d12-interop|d3d12|d3d11|gdi] [--mode live|kernel-throughput|mesh-demo|instance-stress|draw-stress|raster-stress] [--sample-every N] [--present-target-fps N] [--kernel-target-fps N] [--max-inflight N] [--present-ring N] [--instance-grid XxYxZ] [--instance-stress-variant baseline|fast|culled|tiled] [--instance-debug-view off|tile-range|iterations|hit-miss] [--instance-layout aosoa32|aosoa64] [--draw-policy draw-all|compute-culled] [--draw-depth auto|on|off] [--cull-order atomic-compact|stable-dense] [--visibility frustum|projected-size] [--min-projected-pixels N] [--render-policy auto|force-render|pause-when-empty] [--d3d-upload mapped-copy|update-subresource] [--interop-fallback no-interop|fail] [--hot-reload|--no-hot-reload]"
                 ),
                 value if value.starts_with('-') => bail!("unknown option `{value}`"),
                 value => options.source_path = PathBuf::from(value),
@@ -922,6 +1750,7 @@ enum RunMode {
     KernelThroughput,
     MeshDemo,
     InstanceStress,
+    DrawStress,
 }
 
 impl std::str::FromStr for RunMode {
@@ -933,8 +1762,9 @@ impl std::str::FromStr for RunMode {
             "kernel-throughput" => Ok(Self::KernelThroughput),
             "mesh-demo" => Ok(Self::MeshDemo),
             "instance-stress" => Ok(Self::InstanceStress),
+            "draw-stress" | "raster-stress" => Ok(Self::DrawStress),
             _ => bail!(
-                "unknown mode `{value}`; expected live, kernel-throughput, mesh-demo, or instance-stress"
+                "unknown mode `{value}`; expected live, kernel-throughput, mesh-demo, instance-stress, draw-stress, or raster-stress"
             ),
         }
     }
@@ -947,6 +1777,7 @@ impl std::fmt::Display for RunMode {
             Self::KernelThroughput => f.write_str("kernel-throughput"),
             Self::MeshDemo => f.write_str("mesh-demo"),
             Self::InstanceStress => f.write_str("instance-stress"),
+            Self::DrawStress => f.write_str("draw-stress"),
         }
     }
 }
@@ -1041,14 +1872,30 @@ impl WindowVisibilityState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct InstanceGrid {
+pub struct InstanceGrid {
     x: u32,
     y: u32,
     z: u32,
 }
 
 impl InstanceGrid {
-    fn validate(self) -> Result<()> {
+    pub fn new(x: u32, y: u32, z: u32) -> Self {
+        Self { x, y, z }
+    }
+
+    pub fn x(self) -> u32 {
+        self.x
+    }
+
+    pub fn y(self) -> u32 {
+        self.y
+    }
+
+    pub fn z(self) -> u32 {
+        self.z
+    }
+
+    pub fn validate(self) -> Result<()> {
         if self.x == 0 || self.y == 0 || self.z == 0 {
             bail!("--instance-grid dimensions must be greater than zero");
         }
@@ -1057,7 +1904,7 @@ impl InstanceGrid {
         Ok(())
     }
 
-    fn count(self) -> Option<u32> {
+    pub fn count(self) -> Option<u32> {
         self.x.checked_mul(self.y)?.checked_mul(self.z)
     }
 }
@@ -1192,20 +2039,27 @@ impl std::fmt::Display for InstanceDebugView {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StressInstanceLayout {
+pub enum StressInstanceLayout {
     AoSoA32,
     AoSoA64,
 }
 
 impl StressInstanceLayout {
-    fn group_size(self) -> u32 {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AoSoA32 => "aosoa32",
+            Self::AoSoA64 => "aosoa64",
+        }
+    }
+
+    pub fn group_size(self) -> u32 {
         match self {
             Self::AoSoA32 => 32,
             Self::AoSoA64 => 64,
         }
     }
 
-    fn data_layout(self) -> DataLayout {
+    pub fn data_layout(self) -> DataLayout {
         DataLayout::AoSoA {
             group_size: self.group_size(),
         }
@@ -1226,10 +2080,7 @@ impl std::str::FromStr for StressInstanceLayout {
 
 impl std::fmt::Display for StressInstanceLayout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AoSoA32 => f.write_str("aosoa32"),
-            Self::AoSoA64 => f.write_str("aosoa64"),
-        }
+        f.write_str(self.label())
     }
 }
 
@@ -1334,6 +2185,20 @@ where
         .map_err(|err| anyhow!("invalid value for {name}: {err}"))
 }
 
+fn parse_min_projected_pixels(flag: &str, value: String) -> Result<u32> {
+    let pixels = value
+        .parse::<f32>()
+        .map_err(|err| anyhow!("invalid value for {flag}: {err}"))?;
+    if !pixels.is_finite() || pixels < 0.0 {
+        bail!("{flag} must be finite and non-negative");
+    }
+    let millipixels = f64::from(pixels) * 1000.0;
+    if millipixels > f64::from(u32::MAX) {
+        bail!("{flag} is too large");
+    }
+    Ok(millipixels.round() as u32)
+}
+
 #[allow(deprecated)]
 fn create_window(
     event_loop: &EventLoop<()>,
@@ -1397,7 +2262,7 @@ fn validate_live_kernel_abi(source: &str) -> Result<()> {
     let kernel = program
         .kernels
         .iter()
-        .find(|kernel| kernel.name == "image")
+        .find(|kernel| kernel.kind == neo_lang::EntryPointKind::Kernel && kernel.name == "image")
         .ok_or_else(|| anyhow!("live kernel must define `kernel fn image(...)`"))?;
     let expected = [
         ("pixels", Some(AddressSpace::Global), TypeName::U8, 1usize),
@@ -1450,7 +2315,7 @@ fn validate_mesh_kernel_abi(source: &str) -> Result<()> {
     let kernel = program
         .kernels
         .iter()
-        .find(|kernel| kernel.name == "raster")
+        .find(|kernel| kernel.kind == neo_lang::EntryPointKind::Kernel && kernel.name == "raster")
         .ok_or_else(|| anyhow!("mesh demo kernel must define `kernel fn raster(...)`"))?;
     let expected = [
         ("pixels", Some(AddressSpace::Global), TypeName::U8, 1usize),
@@ -1521,6 +2386,397 @@ impl InstanceKernel {
     }
 }
 
+struct RasterStressKernel {
+    cull_init: Kernel,
+    cull: Kernel,
+    graphics: neo_lang::GraphicsShaders,
+    material: MaterialKernel,
+}
+
+impl RasterStressKernel {
+    fn compile(ctx: &NeoContext, path: &Path, raster_plan: &HardwareRasterPlan) -> Result<Self> {
+        let source = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let material = raster_plan.material_kernel();
+        validate_raster_stress_abi_with_material(&source, material.abi())?;
+        let graphics = neo_lang::lower_graphics_to_hlsl_for_entries_with_bindings(
+            &source,
+            &material.abi().vertex_entrypoint,
+            &material.abi().fragment_entrypoint,
+            graphics_bindings_for_material(material.abi())?,
+        )?;
+        let module = neo_runtime::Module::from_neo_source(
+            ctx,
+            &source,
+            &["raster_cull_init", "raster_cull"],
+        )?;
+        Ok(Self {
+            cull_init: module.kernel("raster_cull_init")?,
+            cull: module.kernel("raster_cull")?,
+            graphics,
+            material,
+        })
+    }
+}
+
+fn raster_stress_source_path(requested: &Path) -> PathBuf {
+    if requested.ends_with(Path::new("examples/live-window/live.neo")) {
+        PathBuf::from("examples/stress-quads/hardware_raster.neo")
+    } else {
+        requested.to_path_buf()
+    }
+}
+
+fn hardware_raster_visible_instances_for_log(
+    policy: HardwareRasterDrawPolicy,
+    grid: InstanceGrid,
+) -> Option<u32> {
+    match policy {
+        HardwareRasterDrawPolicy::DrawAll => grid.count(),
+        HardwareRasterDrawPolicy::ComputeCulled => None,
+    }
+}
+
+#[cfg(test)]
+fn validate_raster_stress_abi(source: &str) -> Result<()> {
+    let material = hardware_raster_material();
+    validate_raster_stress_abi_with_material(source, material.abi())
+}
+
+#[cfg(test)]
+fn hardware_raster_material() -> MaterialKernel {
+    MaterialKernel::from_stages("hardware-raster", "quad_vs", "quad_fs").with_abi(
+        MaterialKernelAbi::compute_culled_instance_color("quad_vs", "quad_fs"),
+    )
+}
+
+fn validate_raster_stress_abi_with_material(
+    source: &str,
+    material: &MaterialKernelAbi,
+) -> Result<()> {
+    let program = neo_lang::parse(source)?;
+    validate_kernel_signature(
+        &program,
+        "raster_cull_init",
+        &[
+            ("args", Some(AddressSpace::Global), TypeName::U8, 1usize),
+            ("camera", Some(AddressSpace::Global), TypeName::U8, 1usize),
+        ],
+        "hardware raster cull init kernel",
+        "global u8* args, global u8* camera",
+    )?;
+    validate_kernel_signature(
+        &program,
+        "raster_cull",
+        &[
+            ("args", Some(AddressSpace::Global), TypeName::U8, 1usize),
+            ("visible", Some(AddressSpace::Global), TypeName::U8, 1usize),
+            (
+                "instances",
+                Some(AddressSpace::Global),
+                TypeName::U8,
+                1usize,
+            ),
+            ("camera", Some(AddressSpace::Global), TypeName::U8, 1usize),
+            ("instance_count", None, TypeName::U32, 0),
+            ("frame", None, TypeName::U32, 0),
+        ],
+        "hardware raster cull kernel",
+        "global u8* args, global u8* visible, global u8* instances, global u8* camera, u32 instance_count, u32 frame",
+    )?;
+    let cull_init = program
+        .kernels
+        .iter()
+        .find(|entry| {
+            entry.kind == neo_lang::EntryPointKind::Kernel && entry.name == "raster_cull_init"
+        })
+        .ok_or_else(|| {
+            anyhow!("hardware raster source must define `kernel fn raster_cull_init(...)`")
+        })?;
+    let cull_init_body = effective_shader_body(&cull_init.body);
+    require_shader_body(
+        &cull_init_body,
+        "args",
+        "hardware raster compute cull init kernel must write D3D12 indirect draw arguments",
+    )?;
+    let cull = program
+        .kernels
+        .iter()
+        .find(|entry| entry.kind == neo_lang::EntryPointKind::Kernel && entry.name == "raster_cull")
+        .ok_or_else(|| {
+            anyhow!("hardware raster source must define `kernel fn raster_cull(...)`")
+        })?;
+    let cull_body = effective_shader_body(&cull.body);
+    require_shader_body(
+        &cull_body,
+        "camera",
+        "hardware raster compute cull kernel must read the explicit camera parameters",
+    )?;
+    require_shader_body(
+        &cull_body,
+        "visible",
+        "hardware raster compute cull kernel must write the explicit visible InstanceStream",
+    )?;
+    require_shader_body(
+        &cull_body,
+        "args",
+        "hardware raster compute cull kernel must write D3D12 indirect draw arguments",
+    )?;
+    validate_material_kernel_abi(&program, material)?;
+    Ok(())
+}
+
+fn validate_material_kernel_abi(
+    program: &neo_lang::Program,
+    material: &MaterialKernelAbi,
+) -> Result<()> {
+    let vertex = program
+        .kernels
+        .iter()
+        .find(|entry| {
+            entry.kind == neo_lang::EntryPointKind::Vertex
+                && entry.name == material.vertex_entrypoint
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "hardware raster source must define `vertex fn {}()`",
+                material.vertex_entrypoint
+            )
+        })?;
+    if !vertex.params.is_empty() {
+        bail!(
+            "hardware raster vertex stage must use ABI `vertex fn {}()`; use vertex_id(), instance_id(), and raster_* builtins for inputs",
+            material.vertex_entrypoint
+        );
+    }
+    let vertex_body = effective_shader_body(&vertex.body);
+    for requirement in &material.vertex_requirements {
+        validate_material_vertex_requirement(
+            &vertex_body,
+            *requirement,
+            &material.vertex_entrypoint,
+        )?;
+    }
+    let fragment = program
+        .kernels
+        .iter()
+        .find(|entry| {
+            entry.kind == neo_lang::EntryPointKind::Fragment
+                && entry.name == material.fragment_entrypoint
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "hardware raster source must define `fragment fn {}()`",
+                material.fragment_entrypoint
+            )
+        })?;
+    if !fragment.params.is_empty() {
+        bail!(
+            "hardware raster fragment stage must use ABI `fragment fn {}()`; use input_color() for interpolated color",
+            material.fragment_entrypoint
+        );
+    }
+    let fragment_body = effective_shader_body(&fragment.body);
+    for requirement in &material.fragment_requirements {
+        validate_material_fragment_requirement(
+            &fragment_body,
+            *requirement,
+            &material.fragment_entrypoint,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_material_vertex_requirement(
+    body: &str,
+    requirement: MaterialVertexRequirement,
+    entrypoint: &str,
+) -> Result<()> {
+    match requirement {
+        MaterialVertexRequirement::VisibleInstanceStream => require_shader_body(
+            body,
+            "visible_instance_id(instance_id())",
+            &format!(
+                "hardware raster MaterialKernel `{entrypoint}` must read the compute-culled InstanceStream with `visible_instance_id(instance_id())`"
+            ),
+        ),
+        MaterialVertexRequirement::DirectInstanceId => require_shader_body(
+            body,
+            "instance_id()",
+            &format!(
+                "hardware raster MaterialKernel `{entrypoint}` must read the explicit InstanceStream directly with `instance_id()`"
+            ),
+        ),
+        MaterialVertexRequirement::InstancePosition => require_shader_body_any(
+            body,
+            &["neo_instance_position3f", "neo_stress_instance_position3f"],
+            &format!(
+                "hardware raster MaterialKernel `{entrypoint}` must read positions from the explicit InstanceStream"
+            ),
+        ),
+        MaterialVertexRequirement::GeometryPosition => require_shader_body(
+            body,
+            "neo_geometry_position3f",
+            &format!(
+                "hardware raster MaterialKernel `{entrypoint}` must read vertex positions from the explicit GeometryStream"
+            ),
+        ),
+        MaterialVertexRequirement::ClipPositionOutput => require_shader_body(
+            body,
+            "set_position(",
+            &format!(
+                "hardware raster MaterialKernel `{entrypoint}` must write a clip-space position with `set_position(...)`"
+            ),
+        ),
+        MaterialVertexRequirement::VertexColorOutput => require_shader_body(
+            body,
+            "set_color(",
+            &format!(
+                "hardware raster MaterialKernel `{entrypoint}` must write material color with `set_color(...)`"
+            ),
+        ),
+    }
+}
+
+fn validate_material_fragment_requirement(
+    body: &str,
+    requirement: MaterialFragmentRequirement,
+    entrypoint: &str,
+) -> Result<()> {
+    match requirement {
+        MaterialFragmentRequirement::InterpolatedColorInput => require_shader_body(
+            body,
+            "input_color()",
+            &format!(
+                "hardware raster MaterialKernel `{entrypoint}` must return or consume `input_color()` from the vertex stage"
+            ),
+        ),
+    }
+}
+
+fn require_shader_body(body: &str, required: &str, message: &str) -> Result<()> {
+    if body.contains(required) {
+        Ok(())
+    } else {
+        bail!("{message}")
+    }
+}
+
+fn require_shader_body_any(body: &str, required: &[&str], message: &str) -> Result<()> {
+    if required.iter().any(|required| body.contains(required)) {
+        Ok(())
+    } else {
+        bail!("{message}")
+    }
+}
+
+fn effective_shader_body(body: &str) -> String {
+    remove_disabled_false_blocks(&strip_shader_comments(body))
+}
+
+fn strip_shader_comments(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() {
+                if bytes[i] == b'\n' {
+                    out.push('\n');
+                }
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn remove_disabled_false_blocks(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0usize;
+    while i < body.len() {
+        if let Some(end) = disabled_if_false_block_end(body, i) {
+            i = end;
+        } else {
+            out.push(body.as_bytes()[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn disabled_if_false_block_end(body: &str, start: usize) -> Option<usize> {
+    let bytes = body.as_bytes();
+    if start + 2 > bytes.len() || &bytes[start..start + 2] != b"if" {
+        return None;
+    }
+    if start > 0 && is_ident_byte(bytes[start - 1]) {
+        return None;
+    }
+    if start + 2 < bytes.len() && is_ident_byte(bytes[start + 2]) {
+        return None;
+    }
+    let mut i = skip_ascii_ws(bytes, start + 2);
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return None;
+    }
+    i = skip_ascii_ws(bytes, i + 1);
+    let literal = b"false";
+    if i + literal.len() > bytes.len() || &bytes[i..i + literal.len()] != literal {
+        return None;
+    }
+    i = skip_ascii_ws(bytes, i + literal.len());
+    if i >= bytes.len() || bytes[i] != b')' {
+        return None;
+    }
+    i = skip_ascii_ws(bytes, i + 1);
+    if i >= bytes.len() || bytes[i] != b'{' {
+        return None;
+    }
+    let mut depth = 1usize;
+    i += 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Some(bytes.len())
+}
+
+fn skip_ascii_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 fn validate_instance_kernel_abi(source: &str) -> Result<()> {
     let program = neo_lang::parse(source)?;
     validate_kernel_signature(
@@ -1588,7 +2844,7 @@ fn validate_kernel_signature(
     let kernel = program
         .kernels
         .iter()
-        .find(|kernel| kernel.name == name)
+        .find(|kernel| kernel.kind == neo_lang::EntryPointKind::Kernel && kernel.name == name)
         .ok_or_else(|| anyhow!("{label} must define `kernel fn {name}(...)`"))?;
     if kernel.params.len() != expected.len() {
         bail!(
@@ -1733,6 +2989,33 @@ fn handle_instance_reload_events(
     Ok(())
 }
 
+fn handle_raster_reload_events(
+    ctx: &NeoContext,
+    source_path: &Path,
+    raster_plan: &HardwareRasterPlan,
+    rx: &Receiver<notify::Result<NotifyEvent>>,
+    reload: &mut ReloadState<RasterStressKernel>,
+) -> Result<()> {
+    let mut should_reload = false;
+    for event in rx.try_iter() {
+        let event = event?;
+        if event.paths.iter().any(|path| path == source_path) {
+            should_reload = true;
+        }
+    }
+
+    if should_reload {
+        let replaced =
+            reload.try_replace(RasterStressKernel::compile(ctx, source_path, raster_plan));
+        if replaced {
+            println!("hot reload: compiled {}", source_path.display());
+        } else if let Some(err) = &reload.last_error {
+            eprintln!("hot reload failed; keeping last good hardware raster source:\n{err}");
+        }
+    }
+    Ok(())
+}
+
 struct FrameResources {
     width: u32,
     height: u32,
@@ -1757,6 +3040,16 @@ impl FrameResources {
 struct DemoVertex {
     position: [f32; 3],
     color_bgra: u32,
+}
+
+fn vertices_as_bytes(vertices: &[DemoVertex]) -> Vec<u8> {
+    unsafe {
+        std::slice::from_raw_parts(
+            vertices.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(vertices),
+        )
+        .to_vec()
+    }
 }
 
 fn create_demo_mesh(neo: &NeoContext) -> Result<MeshBuffer> {
@@ -1832,6 +3125,7 @@ struct CameraParams {
 struct InstanceStressAssets {
     mesh: MeshBuffer,
     instances: InstanceBuffer,
+    raster_instances: Option<SharedInstanceStream>,
     camera_buffers: Vec<DeviceBuffer<u8>>,
     tile_cull_width: u32,
     tile_cull_height: u32,
@@ -1840,6 +3134,7 @@ struct InstanceStressAssets {
 
 fn create_instance_stress_assets(
     neo: &NeoContext,
+    raster_interop: Option<&NeoD3d12InteropDevice>,
     grid: InstanceGrid,
     present_ring: usize,
     instance_layout: StressInstanceLayout,
@@ -1849,40 +3144,56 @@ fn create_instance_stress_assets(
         .count()
         .ok_or_else(|| anyhow!("instance grid count overflow"))?;
     let instances = create_stress_instances(grid)?;
+    let instance_desc = InstanceBufferDesc {
+        instance_count,
+        instance_layout: InstanceLayout {
+            stride: std::mem::size_of::<StressInstance>() as u32,
+            attributes: vec![
+                InstanceAttribute {
+                    semantic: InstanceSemantic::Position,
+                    format: InstanceFormat::F32x3,
+                    offset: 0,
+                },
+                InstanceAttribute {
+                    semantic: InstanceSemantic::Rotation,
+                    format: InstanceFormat::F32x4,
+                    offset: 12,
+                },
+                InstanceAttribute {
+                    semantic: InstanceSemantic::Scale,
+                    format: InstanceFormat::F32x2,
+                    offset: 28,
+                },
+                InstanceAttribute {
+                    semantic: InstanceSemantic::Color0,
+                    format: InstanceFormat::U8x4Unorm,
+                    offset: 36,
+                },
+            ],
+        },
+    };
+    let data_layout = instance_layout.data_layout();
     let instance_buffer = InstanceBuffer::upload_typed_with_layout(
         neo,
-        InstanceBufferDesc {
-            instance_count,
-            instance_layout: InstanceLayout {
-                stride: std::mem::size_of::<StressInstance>() as u32,
-                attributes: vec![
-                    InstanceAttribute {
-                        semantic: InstanceSemantic::Position,
-                        format: InstanceFormat::F32x3,
-                        offset: 0,
-                    },
-                    InstanceAttribute {
-                        semantic: InstanceSemantic::Rotation,
-                        format: InstanceFormat::F32x4,
-                        offset: 12,
-                    },
-                    InstanceAttribute {
-                        semantic: InstanceSemantic::Scale,
-                        format: InstanceFormat::F32x2,
-                        offset: 28,
-                    },
-                    InstanceAttribute {
-                        semantic: InstanceSemantic::Color0,
-                        format: InstanceFormat::U8x4Unorm,
-                        offset: 36,
-                    },
-                ],
-            },
-        },
+        instance_desc.clone(),
         &instances,
-        instance_layout.data_layout(),
+        data_layout,
     )
     .context("failed to upload instance stress InstanceBuffer")?;
+    let raster_instances = if let Some(interop) = raster_interop {
+        Some(
+            SharedInstanceStream::upload_typed(
+                neo,
+                interop,
+                instance_desc.clone(),
+                &instances,
+                data_layout,
+            )
+            .context("failed to upload shared raster InstanceStream")?,
+        )
+    } else {
+        None
+    };
     let camera_len = std::mem::size_of::<CameraParams>();
     let mut camera_buffers = Vec::with_capacity(present_ring);
     for _ in 0..present_ring {
@@ -1891,6 +3202,7 @@ fn create_instance_stress_assets(
     Ok(InstanceStressAssets {
         mesh,
         instances: instance_buffer,
+        raster_instances,
         camera_buffers,
         tile_cull_width: 0,
         tile_cull_height: 0,
@@ -2226,7 +3538,12 @@ impl CameraController {
             up: [up[0], up[1], up[2], 0.0],
             forward: [forward[0], forward[1], forward[2], 0.0],
             grid: [grid.x, grid.y, grid.z, grid.count().unwrap_or(0)],
-            view: [tan_x, tan_y, 0.085, 0.0],
+            view: [
+                tan_x,
+                tan_y,
+                0.085,
+                2.0 / size.width.min(size.height).max(1) as f32,
+            ],
             config: [0, 32, 0, 0],
         }
     }
@@ -2613,6 +3930,389 @@ impl InteropThroughputResources {
         interop_trace("presented shared frame");
         Ok(())
     }
+}
+
+struct RasterStressResources {
+    slots: Vec<RasterStressSlot>,
+    shaders: neo_lang::GraphicsShaders,
+    visible_capacity: u32,
+}
+
+struct RasterStressSlot {
+    stream: CudaStream,
+    args: IndirectDrawBuffer,
+    visible_ids: VisibleInstanceStream,
+    draw_all_key: Option<DrawAllStaticKey>,
+    camera: CameraParams,
+    state: InteropSlotState,
+    frame: u32,
+    cuda_done_value: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DrawAllStaticKey {
+    instance_count: u32,
+    index_count: u32,
+}
+
+struct RasterDrainInput<'a> {
+    presenter: &'a mut WindowPresenter,
+    size: PhysicalSize<u32>,
+    raster_instances: &'a mut SharedInstanceStream,
+    material: &'a MaterialKernelAbi,
+    geometry: &'a HardwareRasterGeometryStreamPlan,
+    use_depth: bool,
+    present_limiter: &'a mut PresentRateLimiter,
+    grid: InstanceGrid,
+}
+
+impl RasterStressResources {
+    fn new(
+        neo: &NeoContext,
+        interop: &NeoD3d12InteropDevice,
+        slots: usize,
+        shaders: neo_lang::GraphicsShaders,
+        visible_capacity: u32,
+    ) -> Result<Self> {
+        if visible_capacity == 0 {
+            bail!("hardware raster visible instance capacity must be greater than zero");
+        }
+        let mut ring = Vec::with_capacity(slots);
+        for _ in 0..slots {
+            ring.push(RasterStressSlot {
+                stream: neo.create_stream()?,
+                args: IndirectDrawBuffer::new(interop, 1)?,
+                visible_ids: VisibleInstanceStream::new(interop, visible_capacity)?,
+                draw_all_key: None,
+                camera: CameraParams::default(),
+                state: InteropSlotState::Free,
+                frame: 0,
+                cuda_done_value: 0,
+            });
+        }
+        Ok(Self {
+            slots: ring,
+            shaders,
+            visible_capacity,
+        })
+    }
+
+    fn drain_completed(&mut self, input: RasterDrainInput<'_>) -> Result<ThroughputBatchStats> {
+        let mut stats = ThroughputBatchStats::default();
+        for index in 0..self.slots.len() {
+            if self.slots[index].state != InteropSlotState::Pending {
+                continue;
+            }
+            let complete = self.slots[index]
+                .args
+                .buffer()
+                .is_fence_complete(self.slots[index].cuda_done_value);
+            if !complete {
+                continue;
+            }
+            stats.completed_kernels += 1;
+            self.slots[index].state = InteropSlotState::Completed;
+        }
+
+        let newest = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.state == InteropSlotState::Completed)
+            .max_by_key(|(_, slot)| slot.frame)
+            .map(|(index, _)| index);
+        if newest.is_some() && input.present_limiter.try_consume(Instant::now()) {
+            let index = newest.expect("checked is_some");
+            let slot = &mut self.slots[index];
+            let cuda_done_value = slot.cuda_done_value;
+            let frame = slot.frame;
+            let timings = input
+                .presenter
+                .present_raster_indirect(RasterPresentInput {
+                    size: input.size,
+                    args: slot.args.buffer_mut(),
+                    visible_ids: slot.visible_ids.buffer_mut(),
+                    raster_instances: input.raster_instances.buffer_mut(),
+                    material: input.material,
+                    geometry: input.geometry,
+                    cuda_done_value,
+                    frame,
+                    grid: input.grid,
+                    camera: slot.camera,
+                    shaders: &self.shaders,
+                    use_depth: input.use_depth,
+                })?;
+            stats.present += timings.total;
+            stats.draw += timings.draw;
+            stats.swap_present += timings.swap_present;
+            stats.sampled_frames += 1;
+            stats.presented_frames += 1;
+            slot.state = InteropSlotState::Free;
+        }
+        for index in 0..self.slots.len() {
+            if self.slots[index].state == InteropSlotState::Completed && Some(index) != newest {
+                self.slots[index].state = InteropSlotState::Free;
+            }
+        }
+        Ok(stats)
+    }
+}
+
+fn draw_all_identity_visible_bytes(instance_count: u32) -> Result<Vec<u8>> {
+    let byte_len = usize::try_from(instance_count)
+        .ok()
+        .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
+        .ok_or_else(|| anyhow!("draw-all visible stream size overflow"))?;
+    let mut bytes = Vec::with_capacity(byte_len);
+    for id in 0..instance_count {
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+fn draw_all_indirect_command(index_count: u32, instance_count: u32) -> DrawIndexedIndirectCommand {
+    DrawIndexedIndirectCommand {
+        index_count_per_instance: index_count,
+        instance_count,
+        start_index_location: 0,
+        base_vertex_location: 0,
+        start_instance_location: 0,
+    }
+}
+
+fn ensure_draw_all_slot_static_streams(
+    slot: &mut RasterStressSlot,
+    key: DrawAllStaticKey,
+    needs_visible_stream: bool,
+) -> Result<u64> {
+    if slot.draw_all_key == Some(key) {
+        return Ok(0);
+    }
+    slot.args
+        .buffer()
+        .wait_available_on_stream(&slot.stream)
+        .context("failed to make CUDA wait for hardware raster argument buffer")?;
+    if needs_visible_stream {
+        let visible = draw_all_identity_visible_bytes(key.instance_count)?;
+        slot.visible_ids
+            .buffer_mut()
+            .upload_bytes_on_stream(&slot.stream, &visible)
+            .context("failed to upload draw-all identity visible stream")?;
+    }
+    let args = draw_all_indirect_command(key.index_count, key.instance_count);
+    slot.args
+        .buffer_mut()
+        .upload_bytes_on_stream(&slot.stream, args.as_bytes())
+        .context("failed to upload draw-all indirect args")?;
+    let done = slot
+        .args
+        .buffer_mut()
+        .signal_cuda_complete_on_stream(&slot.stream)
+        .context("failed to signal draw-all static raster upload")?;
+    slot.draw_all_key = Some(key);
+    Ok(done)
+}
+
+fn ensure_raster_stress_resources(
+    neo: &NeoContext,
+    interop: &NeoD3d12InteropDevice,
+    resources: &mut Option<RasterStressResources>,
+    present_ring: usize,
+    shaders: &neo_lang::GraphicsShaders,
+    visible_capacity: u32,
+) -> Result<()> {
+    if resources.as_ref().is_none_or(|resources| {
+        resources.slots.len() != present_ring
+            || resources.shaders != *shaders
+            || resources.visible_capacity != visible_capacity
+    }) {
+        *resources = Some(RasterStressResources::new(
+            neo,
+            interop,
+            present_ring,
+            shaders.clone(),
+            visible_capacity,
+        )?);
+    }
+    Ok(())
+}
+
+struct RasterStressBatch<'a> {
+    neo: &'a NeoContext,
+    interop: &'a NeoD3d12InteropDevice,
+    resources: &'a mut Option<RasterStressResources>,
+    kernel: &'a RasterStressKernel,
+    assets: &'a mut InstanceStressAssets,
+    presenter: &'a mut PresentSink,
+    size: PhysicalSize<u32>,
+    start: Instant,
+    next_frame: &'a mut u32,
+    completed_kernels: &'a mut u64,
+    present_limiter: &'a mut PresentRateLimiter,
+    max_inflight: u32,
+    present_ring: usize,
+    instance_grid: InstanceGrid,
+    camera: CameraParams,
+    raster_plan: &'a HardwareRasterPlan,
+}
+
+#[cfg(windows)]
+fn hardware_raster_draw_recipe<'a>(
+    assets: &'a InstanceStressAssets,
+    material: &'a MaterialKernel,
+    size: PhysicalSize<u32>,
+    plan: &HardwareRasterPlan,
+) -> Result<DrawExecution<'a>> {
+    let target = Target::new(size.width.max(1), size.height.max(1))?;
+    let builder = DrawExecution::builder(GeometryStream::from_mesh(&assets.mesh), material, target)
+        .instance_stream(InstanceStream::from_instances(&assets.instances));
+    let builder = match plan.draw_policy {
+        HardwareRasterDrawPolicy::DrawAll => builder.draw_policy(DrawPolicy::DrawAll),
+        HardwareRasterDrawPolicy::ComputeCulled => {
+            builder.compute_culled(plan.cull_order.runtime_order())
+        }
+    };
+    Ok(builder.try_build()?)
+}
+
+fn run_raster_stress_batch(input: RasterStressBatch<'_>) -> Result<ThroughputBatchStats> {
+    let material_abi = input.kernel.material.abi().clone();
+    {
+        let draw = hardware_raster_draw_recipe(
+            input.assets,
+            &input.kernel.material,
+            input.size,
+            input.raster_plan,
+        )?;
+        debug_assert_eq!(
+            draw.material().vertex_entrypoint(),
+            input.raster_plan.material.vertex_entrypoint
+        );
+        debug_assert!(draw.instances().is_some());
+    }
+    let instance_count = input
+        .instance_grid
+        .count()
+        .ok_or_else(|| anyhow!("instance grid count overflow"))?;
+    ensure_raster_stress_resources(
+        input.neo,
+        input.interop,
+        input.resources,
+        input.present_ring,
+        &input.kernel.graphics,
+        instance_count,
+    )?;
+    let resources = input
+        .resources
+        .as_mut()
+        .expect("raster resources were just created");
+    let mut stats = ThroughputBatchStats::default();
+    let direct_presenter = match input.presenter {
+        PresentSink::Direct(presenter) => presenter,
+        PresentSink::Threaded(_) => bail!("draw-stress does not use the present thread"),
+    };
+    let raster_instances = input
+        .assets
+        .raster_instances
+        .as_mut()
+        .context("draw-stress is missing its shared InstanceStream")?;
+
+    let _ = input.start;
+    stats += resources.drain_completed(RasterDrainInput {
+        presenter: direct_presenter,
+        size: input.size,
+        raster_instances,
+        material: &material_abi,
+        geometry: &input.raster_plan.geometry_stream,
+        use_depth: input.raster_plan.uses_depth(),
+        present_limiter: input.present_limiter,
+        grid: input.instance_grid,
+    })?;
+    if stats.completed_kernels > 0 {
+        *input.completed_kernels += u64::from(stats.completed_kernels);
+    }
+    if input.max_inflight == 0 {
+        return Ok(stats);
+    }
+
+    let mut camera = input.camera;
+    camera.config[0] = input.raster_plan.visibility.code();
+    camera.config[2] = input.raster_plan.geometry_stream.index_count();
+    camera.config[3] = input.raster_plan.cull_order.code();
+    let min_dimension = input.size.width.min(input.size.height).max(1) as f32;
+    camera.view[3] =
+        (input.raster_plan.min_projected_millipixels as f32 / 1000.0) * 2.0 / min_dimension;
+    let camera_bytes = camera_params_bytes(&camera);
+    let draw_all_key = DrawAllStaticKey {
+        instance_count,
+        index_count: input.raster_plan.geometry_stream.index_count(),
+    };
+    let mut launched = 0u32;
+    for (index, slot) in resources.slots.iter_mut().enumerate() {
+        if launched >= input.max_inflight {
+            break;
+        }
+        if slot.state != InteropSlotState::Free {
+            continue;
+        }
+        let launch_start = Instant::now();
+        let frame = *input.next_frame;
+        let cuda_done_value = match input.raster_plan.draw_policy {
+            HardwareRasterDrawPolicy::DrawAll => ensure_draw_all_slot_static_streams(
+                slot,
+                draw_all_key,
+                input.raster_plan.material.kind.requires_visible_stream(),
+            )?,
+            HardwareRasterDrawPolicy::ComputeCulled => {
+                slot.args
+                    .buffer()
+                    .wait_available_on_stream(&slot.stream)
+                    .context("failed to make CUDA wait for hardware raster argument buffer")?;
+                let arg_ptr = slot.args.buffer().device_ptr_arg();
+                let visible_ptr = slot.visible_ids.buffer().device_ptr_arg();
+                let instances_ptr = raster_instances.buffer().device_ptr_arg();
+                input.assets.camera_buffers[index]
+                    .upload_from_on_stream(&slot.stream, camera_bytes)
+                    .context("failed to upload hardware raster camera params")?;
+                let init_kernel = input.kernel.cull_init.on_stream(&slot.stream);
+                let mut init_launch = init_kernel.launcher();
+                init_launch
+                    .arg_device_ptr(&arg_ptr)
+                    .arg_buffer(&input.assets.camera_buffers[index]);
+                unsafe {
+                    init_launch
+                        .launch(LaunchDims::for_2d(1, 1, (1, 1)))
+                        .context("failed to launch hardware raster cull init kernel")?;
+                }
+                let stream_kernel = input.kernel.cull.on_stream(&slot.stream);
+                let mut launch = stream_kernel.launcher();
+                launch
+                    .arg_device_ptr(&arg_ptr)
+                    .arg_device_ptr(&visible_ptr)
+                    .arg_device_ptr(&instances_ptr)
+                    .arg_buffer(&input.assets.camera_buffers[index])
+                    .arg(&instance_count)
+                    .arg(&frame);
+                unsafe {
+                    launch
+                        .launch(LaunchDims::for_2d(instance_count, 1, (256, 1)))
+                        .context("failed to launch hardware raster cull/indirect kernel")?;
+                }
+                slot.args
+                    .buffer_mut()
+                    .signal_cuda_complete_on_stream(&slot.stream)
+                    .context("failed to signal hardware raster indirect buffer completion")?
+            }
+        };
+        slot.state = InteropSlotState::Pending;
+        slot.frame = frame;
+        slot.camera = camera;
+        slot.cuda_done_value = cuda_done_value;
+        stats.launch += launch_start.elapsed();
+        launched += 1;
+        *input.next_frame = input.next_frame.wrapping_add(1);
+    }
+    Ok(stats)
 }
 
 fn ensure_interop_throughput_resources(
@@ -3370,8 +5070,67 @@ struct ThroughputLogContext<'a> {
     instance_variant: Option<InstanceStressVariant>,
     instance_layout: Option<String>,
     instance_debug_view: Option<InstanceDebugView>,
+    renderer: Option<DrawBackend>,
+    draw_policy: Option<HardwareRasterDrawPolicy>,
+    draw_depth: Option<DrawDepthMode>,
+    uses_depth: Option<bool>,
+    cull_order: Option<HardwareRasterCullOrder>,
+    draw_visibility: Option<HardwareRasterVisibilityMode>,
+    min_projected_millipixels: Option<u32>,
+    visible_instances: Option<u32>,
+    indirect_draws: Option<u32>,
     render_policy: RenderPolicy,
     visibility: RenderVisibility,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DrawPolicyLogFields {
+    draw_policy: Option<HardwareRasterDrawPolicy>,
+    draw_depth: Option<DrawDepthMode>,
+    uses_depth: Option<bool>,
+    cull_order: Option<HardwareRasterCullOrder>,
+    draw_visibility: Option<HardwareRasterVisibilityMode>,
+    min_projected_millipixels: Option<u32>,
+    visible_instances: Option<u32>,
+    indirect_draws: Option<u32>,
+}
+
+fn draw_policy_log_markers(fields: DrawPolicyLogFields) -> String {
+    let draw_policy_marker = fields
+        .draw_policy
+        .map(|policy| format!(" | draw_policy {policy}"))
+        .unwrap_or_default();
+    let draw_depth_marker = fields
+        .draw_depth
+        .map(|mode| format!(" | draw_depth {mode}"))
+        .unwrap_or_default();
+    let depth_resolved_marker = fields
+        .uses_depth
+        .map(|enabled| format!(" | depth {}", if enabled { "on" } else { "off" }))
+        .unwrap_or_default();
+    let cull_order_marker = fields
+        .cull_order
+        .map(|order| format!(" | cull_order {order}"))
+        .unwrap_or_default();
+    let draw_visibility_marker = fields
+        .draw_visibility
+        .map(|mode| format!(" | draw_visibility {mode}"))
+        .unwrap_or_default();
+    let min_projected_marker = fields
+        .min_projected_millipixels
+        .map(|millipixels| format!(" | min_projected_px {:.3}", millipixels as f32 / 1000.0))
+        .unwrap_or_default();
+    let visible_marker = fields
+        .visible_instances
+        .map(|count| format!(" | visible_instances {count}"))
+        .unwrap_or_default();
+    let indirect_marker = fields
+        .indirect_draws
+        .map(|count| format!(" | indirect_draws {count}"))
+        .unwrap_or_default();
+    format!(
+        "{draw_policy_marker}{draw_depth_marker}{depth_resolved_marker}{cull_order_marker}{draw_visibility_marker}{min_projected_marker}{visible_marker}{indirect_marker}"
+    )
 }
 
 impl ThroughputCounter {
@@ -3486,12 +5245,26 @@ impl ThroughputCounter {
             .instance_debug_view
             .map(|view| format!(" | instance_debug {view}"))
             .unwrap_or_default();
+        let renderer_marker = context
+            .renderer
+            .map(|renderer| format!(" | renderer {renderer}"))
+            .unwrap_or_default();
+        let draw_markers = draw_policy_log_markers(DrawPolicyLogFields {
+            draw_policy: context.draw_policy,
+            draw_depth: context.draw_depth,
+            uses_depth: context.uses_depth,
+            cull_order: context.cull_order,
+            draw_visibility: context.draw_visibility,
+            min_projected_millipixels: context.min_projected_millipixels,
+            visible_instances: context.visible_instances,
+            indirect_draws: context.indirect_draws,
+        });
         let presenter = context.presenter;
         let render_policy = context.render_policy;
         let visibility = context.visibility;
         let frame = context.frame;
         println!(
-            "kernel_fps {kernel_fps:>9.1} | sample_fps {sample_fps:>6.1} | present_fps {present_fps:>6.1} | completed {:>10} | frame {frame:>8} | {}x{} | {mb_frame:>5.1} MB/frame | dtoh {dtoh_gbps:>5.1} GB/s {sample_us:>6.1} us | upload {upload_gbps:>5.1} GB/s map_copy {map_copy_us:>6.1} us | gpu_copy {draw_us:>6.1} us | swap {swap_us:>6.1} us | present {present_us:>6.1} us | launch {launch_us:>5.1} us/k | wait {wait_us:>5.1} us/k | presenter {presenter} | kernel_cap {kernel_cap} | render_policy {render_policy} | visibility {visibility} | kernel {reload_state}{interop_marker}{variant_marker}{layout_marker}{debug_marker}",
+            "kernel_fps {kernel_fps:>9.1} | sample_fps {sample_fps:>6.1} | present_fps {present_fps:>6.1} | completed {:>10} | frame {frame:>8} | {}x{} | {mb_frame:>5.1} MB/frame | dtoh {dtoh_gbps:>5.1} GB/s {sample_us:>6.1} us | upload {upload_gbps:>5.1} GB/s map_copy {map_copy_us:>6.1} us | gpu_copy {draw_us:>6.1} us | swap {swap_us:>6.1} us | present {present_us:>6.1} us | launch {launch_us:>5.1} us/k | wait {wait_us:>5.1} us/k | presenter {presenter} | kernel_cap {kernel_cap} | render_policy {render_policy} | visibility {visibility} | kernel {reload_state}{interop_marker}{variant_marker}{layout_marker}{debug_marker}{renderer_marker}{draw_markers}",
             self.total_completed, context.size.width, context.size.height
         );
         self.completed_since_log = 0;
@@ -3794,6 +5567,22 @@ enum PresenterImpl {
 }
 
 #[cfg(windows)]
+struct RasterPresentInput<'a> {
+    size: PhysicalSize<u32>,
+    args: &'a mut SharedGpuBuffer,
+    visible_ids: &'a mut SharedGpuBuffer,
+    raster_instances: &'a mut SharedGpuBuffer,
+    material: &'a MaterialKernelAbi,
+    geometry: &'a HardwareRasterGeometryStreamPlan,
+    cuda_done_value: u64,
+    frame: u32,
+    grid: InstanceGrid,
+    camera: CameraParams,
+    shaders: &'a neo_lang::GraphicsShaders,
+    use_depth: bool,
+}
+
+#[cfg(windows)]
 impl WindowPresenter {
     fn new(
         window: &Window,
@@ -3841,6 +5630,14 @@ impl WindowPresenter {
                 presenter.present_shared(size, pitch_bytes, slot, cuda_done_value)
             }
             _ => bail!("shared frame presentation requires d3d12-interop presenter"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn present_raster_indirect(&mut self, input: RasterPresentInput<'_>) -> Result<PresentTimings> {
+        match &mut self.inner {
+            PresenterImpl::D3d12Interop(presenter) => presenter.present_raster_indirect(input),
+            _ => bail!("hardware raster presentation requires d3d12-interop presenter"),
         }
     }
 
@@ -3949,18 +5746,591 @@ impl Drop for GdiPresenter {
 const D3D12_SWAPCHAIN_BUFFER_COUNT: usize = 3;
 
 #[cfg(windows)]
+const RASTER_ROOT_CONSTANT_DWORDS: u32 = 28;
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HardwareRasterSubmitKind {
+    DirectIndexedInstanced,
+    IndirectIndexedInstanced,
+}
+
+#[cfg(windows)]
+fn hardware_raster_submit_kind(material: &MaterialKernelAbi) -> HardwareRasterSubmitKind {
+    if material.requires_compute_culling() {
+        HardwareRasterSubmitKind::IndirectIndexedInstanced
+    } else {
+        HardwareRasterSubmitKind::DirectIndexedInstanced
+    }
+}
+
+#[cfg(windows)]
+fn raster_root_constants(
+    grid: InstanceGrid,
+    size: PhysicalSize<u32>,
+    camera: CameraParams,
+    geometry: &HardwareRasterGeometryStreamPlan,
+    frame: u32,
+) -> [u32; RASTER_ROOT_CONSTANT_DWORDS as usize] {
+    [
+        grid.x,
+        grid.y,
+        grid.z,
+        frame,
+        size.width,
+        size.height,
+        geometry.vertex_stride,
+        geometry.color_offset,
+        camera.origin[0].to_bits(),
+        camera.origin[1].to_bits(),
+        camera.origin[2].to_bits(),
+        camera.origin[3].to_bits(),
+        camera.right[0].to_bits(),
+        camera.right[1].to_bits(),
+        camera.right[2].to_bits(),
+        camera.right[3].to_bits(),
+        camera.up[0].to_bits(),
+        camera.up[1].to_bits(),
+        camera.up[2].to_bits(),
+        camera.up[3].to_bits(),
+        camera.forward[0].to_bits(),
+        camera.forward[1].to_bits(),
+        camera.forward[2].to_bits(),
+        camera.forward[3].to_bits(),
+        camera.view[0].to_bits(),
+        camera.view[1].to_bits(),
+        camera.view[2].to_bits(),
+        camera.view[3].to_bits(),
+    ]
+}
+
+#[cfg(windows)]
+const D3D12_RASTER_VS_TARGET: &[u8; 7] = b"vs_5_1\0";
+#[cfg(windows)]
+const D3D12_RASTER_PS_TARGET: &[u8; 7] = b"ps_5_1\0";
+
+#[cfg(windows)]
+struct D3d12RasterState {
+    root_signature: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
+    pipeline: windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
+    command_signature: windows::Win32::Graphics::Direct3D12::ID3D12CommandSignature,
+    geometry_buffer: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    index_buffer: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    index_view: windows::Win32::Graphics::Direct3D12::D3D12_INDEX_BUFFER_VIEW,
+    shader_hash: u64,
+}
+
+#[cfg(windows)]
+impl D3d12RasterState {
+    fn new(
+        device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+        shaders: &neo_lang::GraphicsShaders,
+        material: &MaterialKernelAbi,
+        geometry: &HardwareRasterGeometryStreamPlan,
+        use_depth: bool,
+        shader_hash: u64,
+    ) -> Result<Self> {
+        use windows::{
+            Win32::Graphics::{
+                Direct3D::ID3DBlob,
+                Direct3D12::{
+                    D3D_ROOT_SIGNATURE_VERSION_1, D3D12_BLEND_DESC, D3D12_COLOR_WRITE_ENABLE_ALL,
+                    D3D12_COMMAND_SIGNATURE_DESC, D3D12_COMPARISON_FUNC_LESS,
+                    D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                    D3D12_CULL_MODE_NONE, D3D12_DEFAULT_DEPTH_BIAS, D3D12_DEFAULT_DEPTH_BIAS_CLAMP,
+                    D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS, D3D12_DEPTH_STENCIL_DESC,
+                    D3D12_DEPTH_WRITE_MASK_ALL, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_FILL_MODE_SOLID,
+                    D3D12_GRAPHICS_PIPELINE_STATE_DESC, D3D12_HEAP_FLAG_NONE,
+                    D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_UPLOAD, D3D12_INDEX_BUFFER_VIEW,
+                    D3D12_INDIRECT_ARGUMENT_DESC, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
+                    D3D12_INPUT_LAYOUT_DESC, D3D12_LOGIC_OP_NOOP, D3D12_MEMORY_POOL_UNKNOWN,
+                    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RASTERIZER_DESC,
+                    D3D12_RENDER_TARGET_BLEND_DESC, D3D12_RESOURCE_DESC,
+                    D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_NONE,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR,
+                    D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
+                    D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    D3D12_ROOT_SIGNATURE_DESC,
+                    D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+                    D3D12_SHADER_BYTECODE, D3D12_SO_DECLARATION_ENTRY, D3D12_STATIC_SAMPLER_DESC,
+                    D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12SerializeRootSignature,
+                },
+                Dxgi::Common::{
+                    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R16_UINT,
+                    DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+                },
+            },
+            core::PCSTR,
+        };
+
+        validate_contiguous_material_root_bindings(material)?;
+
+        let mut root_params = Vec::with_capacity(material.bindings.len());
+        for binding in &material.bindings {
+            let root_param = match binding.kind {
+                MaterialBindingKind::DrawParams | MaterialBindingKind::RasterParams => {
+                    D3D12_ROOT_PARAMETER {
+                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                        Anonymous: D3D12_ROOT_PARAMETER_0 {
+                            Constants: D3D12_ROOT_CONSTANTS {
+                                ShaderRegister: binding.shader_register,
+                                RegisterSpace: binding.register_space,
+                                Num32BitValues: RASTER_ROOT_CONSTANT_DWORDS,
+                            },
+                        },
+                        ShaderVisibility:
+                            windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_ALL,
+                    }
+                }
+                MaterialBindingKind::VisibleInstanceStream
+                | MaterialBindingKind::InstanceStream
+                | MaterialBindingKind::GeometryStream => D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR {
+                            ShaderRegister: binding.shader_register,
+                            RegisterSpace: binding.register_space,
+                        },
+                    },
+                    ShaderVisibility:
+                        windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_ALL,
+                },
+            };
+            root_params.push(root_param);
+        }
+        let root_desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: root_params.len() as u32,
+            pParameters: root_params.as_mut_ptr(),
+            NumStaticSamplers: 0,
+            pStaticSamplers: std::ptr::null::<D3D12_STATIC_SAMPLER_DESC>(),
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+        };
+        let mut signature_blob: Option<ID3DBlob> = None;
+        let mut signature_error: Option<ID3DBlob> = None;
+        unsafe {
+            D3D12SerializeRootSignature(
+                &root_desc,
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &mut signature_blob,
+                Some(&mut signature_error),
+            )
+            .map_err(|err| anyhow!("failed to serialize D3D12 root signature: {err:?}"))?;
+        }
+        let signature_blob =
+            signature_blob.context("D3D12 root signature serialization returned no blob")?;
+        let root_signature: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature = unsafe {
+            device.CreateRootSignature(
+                0,
+                std::slice::from_raw_parts(
+                    signature_blob.GetBufferPointer().cast::<u8>(),
+                    signature_blob.GetBufferSize(),
+                ),
+            )?
+        };
+
+        let vertex_entrypoint = std::ffi::CString::new(material.vertex_entrypoint.as_str())
+            .context("hardware raster vertex entrypoint contains an interior NUL byte")?;
+        let fragment_entrypoint = std::ffi::CString::new(material.fragment_entrypoint.as_str())
+            .context("hardware raster fragment entrypoint contains an interior NUL byte")?;
+        let vs = compile_hlsl(
+            &shaders.vertex_source,
+            PCSTR(vertex_entrypoint.as_ptr().cast()),
+            PCSTR(D3D12_RASTER_VS_TARGET.as_ptr()),
+        )?;
+        let ps = compile_hlsl(
+            &shaders.fragment_source,
+            PCSTR(fragment_entrypoint.as_ptr().cast()),
+            PCSTR(D3D12_RASTER_PS_TARGET.as_ptr()),
+        )?;
+        let blend_desc = D3D12_BLEND_DESC {
+            AlphaToCoverageEnable: false.into(),
+            IndependentBlendEnable: false.into(),
+            RenderTarget: [D3D12_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: false.into(),
+                LogicOpEnable: false.into(),
+                SrcBlend: windows::Win32::Graphics::Direct3D12::D3D12_BLEND_ONE,
+                DestBlend: windows::Win32::Graphics::Direct3D12::D3D12_BLEND_ZERO,
+                BlendOp: windows::Win32::Graphics::Direct3D12::D3D12_BLEND_OP_ADD,
+                SrcBlendAlpha: windows::Win32::Graphics::Direct3D12::D3D12_BLEND_ONE,
+                DestBlendAlpha: windows::Win32::Graphics::Direct3D12::D3D12_BLEND_ZERO,
+                BlendOpAlpha: windows::Win32::Graphics::Direct3D12::D3D12_BLEND_OP_ADD,
+                LogicOp: D3D12_LOGIC_OP_NOOP,
+                RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            }; 8],
+        };
+        let rasterizer_desc = D3D12_RASTERIZER_DESC {
+            FillMode: D3D12_FILL_MODE_SOLID,
+            CullMode: D3D12_CULL_MODE_NONE,
+            FrontCounterClockwise: false.into(),
+            DepthBias: D3D12_DEFAULT_DEPTH_BIAS,
+            DepthBiasClamp: D3D12_DEFAULT_DEPTH_BIAS_CLAMP,
+            SlopeScaledDepthBias: D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS,
+            DepthClipEnable: true.into(),
+            MultisampleEnable: false.into(),
+            AntialiasedLineEnable: false.into(),
+            ForcedSampleCount: 0,
+            ConservativeRaster: D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF,
+        };
+        let depth_desc = D3D12_DEPTH_STENCIL_DESC {
+            DepthEnable: use_depth.into(),
+            DepthWriteMask: if use_depth {
+                D3D12_DEPTH_WRITE_MASK_ALL
+            } else {
+                D3D12_DEPTH_WRITE_MASK_ZERO
+            },
+            DepthFunc: D3D12_COMPARISON_FUNC_LESS,
+            StencilEnable: false.into(),
+            StencilReadMask: 0,
+            StencilWriteMask: 0,
+            FrontFace: Default::default(),
+            BackFace: Default::default(),
+        };
+        let mut rtv_formats = [DXGI_FORMAT_UNKNOWN; 8];
+        rtv_formats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+        let (vs_ptr, vs_len, ps_ptr, ps_len) = unsafe {
+            (
+                vs.GetBufferPointer(),
+                vs.GetBufferSize(),
+                ps.GetBufferPointer(),
+                ps.GetBufferSize(),
+            )
+        };
+        let pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(root_signature.clone())),
+            VS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: vs_ptr,
+                BytecodeLength: vs_len,
+            },
+            PS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: ps_ptr,
+                BytecodeLength: ps_len,
+            },
+            DS: D3D12_SHADER_BYTECODE::default(),
+            HS: D3D12_SHADER_BYTECODE::default(),
+            GS: D3D12_SHADER_BYTECODE::default(),
+            StreamOutput: windows::Win32::Graphics::Direct3D12::D3D12_STREAM_OUTPUT_DESC {
+                pSODeclaration: std::ptr::null::<D3D12_SO_DECLARATION_ENTRY>(),
+                NumEntries: 0,
+                pBufferStrides: std::ptr::null(),
+                NumStrides: 0,
+                RasterizedStream: 0,
+            },
+            BlendState: blend_desc,
+            SampleMask: u32::MAX,
+            RasterizerState: rasterizer_desc,
+            DepthStencilState: depth_desc,
+            InputLayout: D3D12_INPUT_LAYOUT_DESC {
+                pInputElementDescs: std::ptr::null(),
+                NumElements: 0,
+            },
+            IBStripCutValue:
+                windows::Win32::Graphics::Direct3D12::D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 1,
+            RTVFormats: rtv_formats,
+            DSVFormat: if use_depth {
+                DXGI_FORMAT_D32_FLOAT
+            } else {
+                DXGI_FORMAT_UNKNOWN
+            },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            NodeMask: 0,
+            CachedPSO: Default::default(),
+            Flags: windows::Win32::Graphics::Direct3D12::D3D12_PIPELINE_STATE_FLAG_NONE,
+        };
+        let pipeline = unsafe { device.CreateGraphicsPipelineState(&pso_desc)? };
+
+        let arg_desc = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
+            Anonymous: Default::default(),
+        };
+        let command_desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: DrawIndexedIndirectCommand::BYTE_LEN as u32,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &arg_desc,
+            NodeMask: 0,
+        };
+        let mut command_signature = None;
+        unsafe {
+            device.CreateCommandSignature(
+                &command_desc,
+                None::<&windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>,
+                &mut command_signature,
+            )?;
+        }
+        let command_signature =
+            command_signature.context("D3D12 returned no indirect command signature")?;
+
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_UPLOAD,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+        };
+        let geometry_bytes = geometry.vertex_bytes.len() as u64;
+        let mut geometry_buffer = None;
+        unsafe {
+            device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Alignment: 0,
+                    Width: geometry_bytes,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_NONE,
+                },
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut geometry_buffer,
+            )?;
+        }
+        let geometry_buffer: windows::Win32::Graphics::Direct3D12::ID3D12Resource =
+            geometry_buffer.context("D3D12 returned no geometry buffer")?;
+        unsafe {
+            let read_range = windows::Win32::Graphics::Direct3D12::D3D12_RANGE { Begin: 0, End: 0 };
+            let mut mapped: *mut std::ffi::c_void = std::ptr::null_mut();
+            geometry_buffer.Map(0, Some(&read_range), Some(&mut mapped))?;
+            std::ptr::copy_nonoverlapping(
+                geometry.vertex_bytes.as_ptr(),
+                mapped.cast::<u8>(),
+                geometry.vertex_bytes.len(),
+            );
+            geometry_buffer.Unmap(0, None);
+        }
+
+        let indices = &geometry.indices_u16;
+        let index_bytes = std::mem::size_of_val(indices.as_slice()) as u64;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Alignment: 0,
+            Width: index_bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_UNKNOWN,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+        let mut index_buffer = None;
+        unsafe {
+            device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut index_buffer,
+            )?;
+        }
+        let index_buffer: windows::Win32::Graphics::Direct3D12::ID3D12Resource =
+            index_buffer.context("D3D12 returned no index buffer")?;
+        unsafe {
+            let read_range = windows::Win32::Graphics::Direct3D12::D3D12_RANGE { Begin: 0, End: 0 };
+            let mut mapped: *mut std::ffi::c_void = std::ptr::null_mut();
+            index_buffer.Map(0, Some(&read_range), Some(&mut mapped))?;
+            std::ptr::copy_nonoverlapping(
+                indices.as_ptr().cast::<u8>(),
+                mapped.cast::<u8>(),
+                index_bytes as usize,
+            );
+            index_buffer.Unmap(0, None);
+        }
+        let index_view = D3D12_INDEX_BUFFER_VIEW {
+            BufferLocation: unsafe { index_buffer.GetGPUVirtualAddress() },
+            SizeInBytes: index_bytes as u32,
+            Format: DXGI_FORMAT_R16_UINT,
+        };
+        Ok(Self {
+            root_signature,
+            pipeline,
+            command_signature,
+            geometry_buffer,
+            index_buffer,
+            index_view,
+            shader_hash,
+        })
+    }
+}
+
+#[cfg(windows)]
+fn compile_hlsl(
+    source: &str,
+    entry: windows::core::PCSTR,
+    target: windows::core::PCSTR,
+) -> Result<windows::Win32::Graphics::Direct3D::ID3DBlob> {
+    use windows::Win32::Graphics::{Direct3D::Fxc::D3DCompile, Direct3D::ID3DBlob};
+    let mut code: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
+    unsafe {
+        D3DCompile(
+            source.as_ptr().cast(),
+            source.len(),
+            windows::core::PCSTR::null(),
+            None,
+            None,
+            entry,
+            target,
+            0,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+        .map_err(|err| {
+            let message = errors
+                .as_ref()
+                .map(|blob| {
+                    let bytes = std::slice::from_raw_parts(
+                        blob.GetBufferPointer().cast::<u8>(),
+                        blob.GetBufferSize(),
+                    );
+                    String::from_utf8_lossy(bytes).to_string()
+                })
+                .unwrap_or_default();
+            anyhow!("failed to compile D3D12 raster HLSL: {err:?}\n{message}")
+        })?;
+    }
+    code.context("D3DCompile returned no shader bytecode")
+}
+
+#[cfg(windows)]
+fn raster_shader_hash(
+    shaders: &neo_lang::GraphicsShaders,
+    material: &MaterialKernelAbi,
+    geometry: &HardwareRasterGeometryStreamPlan,
+    use_depth: bool,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    shaders.vertex_source.hash(&mut hasher);
+    shaders.fragment_source.hash(&mut hasher);
+    material.hash(&mut hasher);
+    use_depth.hash(&mut hasher);
+    geometry.vertex_bytes.hash(&mut hasher);
+    geometry.vertex_stride.hash(&mut hasher);
+    geometry.color_offset.hash(&mut hasher);
+    geometry.indices_u16.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg(windows)]
+fn material_binding<'a>(
+    material: &'a MaterialKernelAbi,
+    kind: MaterialBindingKind,
+    label: &str,
+) -> Result<&'a neo_runtime::MaterialBinding> {
+    material.binding(kind).with_context(|| {
+        format!(
+            "hardware raster MaterialKernel `{}`/`{}` is missing its {label} binding",
+            material.vertex_entrypoint, material.fragment_entrypoint
+        )
+    })
+}
+
+#[cfg(windows)]
+fn validate_contiguous_material_root_bindings(material: &MaterialKernelAbi) -> Result<()> {
+    let mut expected = vec![(MaterialBindingKind::DrawParams, "draw params")];
+    if material.requires_compute_culling() {
+        expected.push((
+            MaterialBindingKind::VisibleInstanceStream,
+            "visible InstanceStream",
+        ));
+    }
+    if material.requires_instance_stream() {
+        expected.push((MaterialBindingKind::InstanceStream, "InstanceStream"));
+    }
+    if material
+        .vertex_requirements
+        .contains(&MaterialVertexRequirement::GeometryPosition)
+    {
+        expected.push((MaterialBindingKind::GeometryStream, "GeometryStream"));
+    }
+
+    for (expected_root, (kind, label)) in expected.into_iter().enumerate() {
+        let binding = material_binding(material, kind, label)?;
+        if binding.root_parameter_index != expected_root as u32 {
+            bail!(
+                "hardware raster MaterialKernel `{}`/`{}` binding `{label}` must use root parameter {expected_root}, got {}",
+                material.vertex_entrypoint,
+                material.fragment_entrypoint,
+                binding.root_parameter_index
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn graphics_bindings_for_material(
+    material: &MaterialKernelAbi,
+) -> Result<neo_lang::GraphicsBindings> {
+    let draw_params = material_binding(material, MaterialBindingKind::DrawParams, "draw params")?;
+    let visible_instances = material
+        .binding(MaterialBindingKind::VisibleInstanceStream)
+        .map(|binding| neo_lang::HlslRegister::new(binding.shader_register, binding.register_space))
+        .unwrap_or_else(|| neo_lang::HlslRegister::new(0, 0));
+    let instances = material_binding(
+        material,
+        MaterialBindingKind::InstanceStream,
+        "InstanceStream",
+    )?;
+    let geometry = material_binding(
+        material,
+        MaterialBindingKind::GeometryStream,
+        "GeometryStream",
+    )?;
+    Ok(neo_lang::GraphicsBindings {
+        raster_params: neo_lang::HlslRegister::new(
+            draw_params.shader_register,
+            draw_params.register_space,
+        ),
+        visible_instances,
+        instances: neo_lang::HlslRegister::new(instances.shader_register, instances.register_space),
+        geometry: neo_lang::HlslRegister::new(geometry.shader_register, geometry.register_space),
+    })
+}
+
+#[cfg(windows)]
 struct D3d12InteropPresenter {
+    device: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     queue: windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue,
-    command_allocator: windows::Win32::Graphics::Direct3D12::ID3D12CommandAllocator,
+    command_frames: Vec<D3d12InteropCommandFrame>,
+    command_frame_index: usize,
     command_list: windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList,
     swap_chain: windows::Win32::Graphics::Dxgi::IDXGISwapChain3,
     back_buffers: Vec<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+    rtv_heap: windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap,
+    dsv_heap: windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap,
+    depth_buffer: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+    rtv_descriptor_size: u32,
     fence: windows::Win32::Graphics::Direct3D12::ID3D12Fence,
     fence_value: u64,
     fence_event: windows::Win32::Foundation::HANDLE,
     width: u32,
     height: u32,
     tearing_supported: bool,
+    raster_state: Option<D3d12RasterState>,
+}
+
+#[cfg(windows)]
+struct D3d12InteropCommandFrame {
+    command_allocator: windows::Win32::Graphics::Direct3D12::ID3D12CommandAllocator,
+    fence_value: u64,
 }
 
 #[cfg(windows)]
@@ -3972,8 +6342,11 @@ impl D3d12InteropPresenter {
                 Foundation::HWND,
                 Graphics::{
                     Direct3D12::{
-                        D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_FENCE_FLAG_NONE,
-                        ID3D12CommandAllocator, ID3D12Fence, ID3D12GraphicsCommandList,
+                        D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_DESCRIPTOR_HEAP_DESC,
+                        D3D12_DESCRIPTOR_HEAP_FLAG_NONE, D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                        D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_FENCE_FLAG_NONE,
+                        ID3D12CommandAllocator, ID3D12DescriptorHeap, ID3D12Fence,
+                        ID3D12GraphicsCommandList,
                     },
                     Dxgi::{
                         Common::{
@@ -4000,13 +6373,20 @@ impl D3d12InteropPresenter {
         let height = size.height.max(1);
         let device = interop.device().clone();
         let queue = interop.queue().clone();
-        let command_allocator: ID3D12CommandAllocator =
-            unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)? };
+        let mut command_frames = Vec::with_capacity(D3D12_SWAPCHAIN_BUFFER_COUNT);
+        for _ in 0..D3D12_SWAPCHAIN_BUFFER_COUNT {
+            let command_allocator: ID3D12CommandAllocator =
+                unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)? };
+            command_frames.push(D3d12InteropCommandFrame {
+                command_allocator,
+                fence_value: 0,
+            });
+        }
         let command_list: ID3D12GraphicsCommandList = unsafe {
             device.CreateCommandList(
                 0,
                 D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &command_allocator,
+                &command_frames[0].command_allocator,
                 None::<&windows::Win32::Graphics::Direct3D12::ID3D12PipelineState>,
             )?
         };
@@ -4044,18 +6424,43 @@ impl D3d12InteropPresenter {
         .cast::<IDXGISwapChain3>()?;
         let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE)? };
         let fence_event = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }?;
+        let rtv_heap_desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+            NumDescriptors: D3D12_SWAPCHAIN_BUFFER_COUNT as u32,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+            NodeMask: 0,
+        };
+        let rtv_heap: ID3D12DescriptorHeap =
+            unsafe { device.CreateDescriptorHeap(&rtv_heap_desc)? };
+        let dsv_heap_desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+            NumDescriptors: 1,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+            NodeMask: 0,
+        };
+        let dsv_heap: ID3D12DescriptorHeap =
+            unsafe { device.CreateDescriptorHeap(&dsv_heap_desc)? };
+        let rtv_descriptor_size =
+            unsafe { device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) };
         let mut presenter = Self {
+            device,
             queue,
-            command_allocator,
+            command_frames,
+            command_frame_index: 0,
             command_list,
             swap_chain,
             back_buffers: Vec::new(),
+            rtv_heap,
+            dsv_heap,
+            depth_buffer: None,
+            rtv_descriptor_size,
             fence,
             fence_value: 0,
             fence_event,
             width,
             height,
             tearing_supported,
+            raster_state: None,
         };
         presenter.recreate_backbuffers()?;
         Ok(presenter)
@@ -4093,6 +6498,305 @@ impl D3d12InteropPresenter {
         })
     }
 
+    fn present_raster_indirect(&mut self, input: RasterPresentInput<'_>) -> Result<PresentTimings> {
+        let RasterPresentInput {
+            size,
+            args,
+            visible_ids,
+            raster_instances,
+            material,
+            geometry,
+            cuda_done_value,
+            frame,
+            grid,
+            camera,
+            shaders,
+            use_depth,
+        } = input;
+        use windows::{
+            Win32::Foundation::RECT,
+            Win32::Graphics::{
+                Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                Direct3D12::{
+                    D3D12_CLEAR_FLAG_DEPTH, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_VIEWPORT, ID3D12CommandList,
+                },
+                Dxgi::DXGI_PRESENT,
+            },
+            core::Interface as _,
+        };
+
+        let total_start = Instant::now();
+        self.ensure_size(size)?;
+        let shader_hash = raster_shader_hash(shaders, material, geometry, use_depth);
+        if self
+            .raster_state
+            .as_ref()
+            .is_none_or(|state| state.shader_hash != shader_hash)
+        {
+            self.raster_state = Some(D3d12RasterState::new(
+                &self.device,
+                shaders,
+                material,
+                geometry,
+                use_depth,
+                shader_hash,
+            )?);
+        }
+        let (command_frame, command_allocator) = self.acquire_command_frame()?;
+        let raster = self
+            .raster_state
+            .as_ref()
+            .context("missing D3D12 raster state")?;
+        let _keep_index_buffer_alive = &raster.index_buffer;
+        let draw_start = Instant::now();
+        let submit_kind = hardware_raster_submit_kind(material);
+        let uses_indirect_args = submit_kind == HardwareRasterSubmitKind::IndirectIndexedInstanced;
+        if cuda_done_value != 0 {
+            args.wait_d3d_for_value(&self.queue, cuda_done_value)?;
+        }
+        let direct_instance_count = grid
+            .count()
+            .context("hardware raster direct draw instance count overflow")?;
+        let back_index = unsafe { self.swap_chain.GetCurrentBackBufferIndex() } as usize;
+        let back_buffer = self
+            .back_buffers
+            .get(back_index)
+            .context("D3D12 interop backbuffer is not available")?;
+        let rtv_handle = windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: unsafe { self.rtv_heap.GetCPUDescriptorHandleForHeapStart() }.ptr
+                + back_index * self.rtv_descriptor_size as usize,
+        };
+        let _keep_depth_buffer_alive = if use_depth {
+            Some(
+                self.depth_buffer
+                    .as_ref()
+                    .context("D3D12 raster depth buffer is not available")?,
+            )
+        } else {
+            None
+        };
+        let dsv_handle = unsafe { self.dsv_heap.GetCPUDescriptorHandleForHeapStart() };
+        unsafe {
+            command_allocator.Reset()?;
+            self.command_list
+                .Reset(&command_allocator, Some(&raster.pipeline))?;
+
+            let mut back_to_rt = d3d12_transition(
+                back_buffer,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            );
+            self.command_list
+                .ResourceBarrier(std::slice::from_ref(&back_to_rt));
+            drop_d3d12_transition_barrier(&mut back_to_rt);
+            let mut args_to_indirect = if uses_indirect_args {
+                Some(d3d12_transition(
+                    args.resource(),
+                    windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                ))
+            } else {
+                None
+            };
+            if let Some(barrier) = args_to_indirect.as_ref() {
+                self.command_list
+                    .ResourceBarrier(std::slice::from_ref(barrier));
+            }
+            if let Some(barrier) = args_to_indirect.as_mut() {
+                drop_d3d12_transition_barrier(barrier);
+            }
+            let mut visible_to_srv = if material.requires_compute_culling() {
+                Some(d3d12_transition(
+                    visible_ids.resource(),
+                    windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                ))
+            } else {
+                None
+            };
+            if let Some(barrier) = visible_to_srv.as_ref() {
+                self.command_list
+                    .ResourceBarrier(std::slice::from_ref(barrier));
+            }
+            if let Some(barrier) = visible_to_srv.as_mut() {
+                drop_d3d12_transition_barrier(barrier);
+            }
+            let mut instances_to_srv = d3d12_transition(
+                raster_instances.resource(),
+                windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            );
+            self.command_list
+                .ResourceBarrier(std::slice::from_ref(&instances_to_srv));
+            drop_d3d12_transition_barrier(&mut instances_to_srv);
+
+            self.command_list
+                .SetGraphicsRootSignature(&raster.root_signature);
+            self.command_list.SetPipelineState(&raster.pipeline);
+            self.command_list
+                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            self.command_list.IASetIndexBuffer(Some(&raster.index_view));
+            let viewport = D3D12_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: size.width as f32,
+                Height: size.height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            self.command_list.RSSetViewports(&[viewport]);
+            let scissor = RECT {
+                left: 0,
+                top: 0,
+                right: size.width as i32,
+                bottom: size.height as i32,
+            };
+            self.command_list.RSSetScissorRects(&[scissor]);
+            self.command_list.OMSetRenderTargets(
+                1,
+                Some(&rtv_handle),
+                false,
+                use_depth.then_some(&dsv_handle),
+            );
+            let clear = [0.005, 0.006, 0.009, 1.0];
+            self.command_list
+                .ClearRenderTargetView(rtv_handle, &clear, None);
+            if use_depth {
+                self.command_list.ClearDepthStencilView(
+                    dsv_handle,
+                    D3D12_CLEAR_FLAG_DEPTH,
+                    1.0,
+                    0,
+                    None,
+                );
+            }
+            let constants = raster_root_constants(grid, size, camera, geometry, frame);
+            for binding in &material.bindings {
+                match binding.kind {
+                    MaterialBindingKind::DrawParams | MaterialBindingKind::RasterParams => {
+                        self.command_list.SetGraphicsRoot32BitConstants(
+                            binding.root_parameter_index,
+                            constants.len() as u32,
+                            constants.as_ptr().cast(),
+                            0,
+                        );
+                    }
+                    MaterialBindingKind::VisibleInstanceStream => {
+                        self.command_list.SetGraphicsRootShaderResourceView(
+                            binding.root_parameter_index,
+                            visible_ids.resource().GetGPUVirtualAddress(),
+                        );
+                    }
+                    MaterialBindingKind::InstanceStream => {
+                        self.command_list.SetGraphicsRootShaderResourceView(
+                            binding.root_parameter_index,
+                            raster_instances.resource().GetGPUVirtualAddress(),
+                        );
+                    }
+                    MaterialBindingKind::GeometryStream => {
+                        self.command_list.SetGraphicsRootShaderResourceView(
+                            binding.root_parameter_index,
+                            raster.geometry_buffer.GetGPUVirtualAddress(),
+                        );
+                    }
+                }
+            }
+            if uses_indirect_args {
+                self.command_list.ExecuteIndirect(
+                    &raster.command_signature,
+                    1,
+                    args.resource(),
+                    0,
+                    None,
+                    0,
+                );
+            } else {
+                self.command_list.DrawIndexedInstanced(
+                    geometry.index_count(),
+                    direct_instance_count,
+                    0,
+                    0,
+                    0,
+                );
+            }
+
+            let mut args_to_common = if uses_indirect_args {
+                Some(d3d12_transition(
+                    args.resource(),
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COMMON,
+                ))
+            } else {
+                None
+            };
+            if let Some(barrier) = args_to_common.as_ref() {
+                self.command_list
+                    .ResourceBarrier(std::slice::from_ref(barrier));
+            }
+            if let Some(barrier) = args_to_common.as_mut() {
+                drop_d3d12_transition_barrier(barrier);
+            }
+            let mut visible_to_common = if material.requires_compute_culling() {
+                Some(d3d12_transition(
+                    visible_ids.resource(),
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COMMON,
+                ))
+            } else {
+                None
+            };
+            if let Some(barrier) = visible_to_common.as_ref() {
+                self.command_list
+                    .ResourceBarrier(std::slice::from_ref(barrier));
+            }
+            if let Some(barrier) = visible_to_common.as_mut() {
+                drop_d3d12_transition_barrier(barrier);
+            }
+            let mut instances_to_common = d3d12_transition(
+                raster_instances.resource(),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COMMON,
+            );
+            self.command_list
+                .ResourceBarrier(std::slice::from_ref(&instances_to_common));
+            drop_d3d12_transition_barrier(&mut instances_to_common);
+            let mut back_to_present = d3d12_transition(
+                back_buffer,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_PRESENT,
+            );
+            self.command_list
+                .ResourceBarrier(std::slice::from_ref(&back_to_present));
+            drop_d3d12_transition_barrier(&mut back_to_present);
+            self.command_list.Close()?;
+            let list: ID3D12CommandList = self.command_list.cast()?;
+            self.queue.ExecuteCommandLists(&[Some(list)]);
+        }
+        self.signal_command_frame(command_frame)?;
+        let draw = draw_start.elapsed();
+        if uses_indirect_args {
+            let _ = args.signal_available_on_d3d(&self.queue)?;
+        }
+        let flags = if self.tearing_supported {
+            windows::Win32::Graphics::Dxgi::DXGI_PRESENT_ALLOW_TEARING
+        } else {
+            DXGI_PRESENT(0)
+        };
+        let swap_start = Instant::now();
+        unsafe {
+            self.swap_chain.Present(0, flags).ok()?;
+        }
+        let swap_present = swap_start.elapsed();
+        Ok(PresentTimings {
+            draw,
+            swap_present,
+            total: total_start.elapsed(),
+            ..PresentTimings::default()
+        })
+    }
+
     fn ensure_size(&mut self, size: PhysicalSize<u32>) -> Result<()> {
         let width = size.width.max(1);
         let height = size.height.max(1);
@@ -4101,6 +6805,7 @@ impl D3d12InteropPresenter {
         }
         self.wait_for_gpu()?;
         self.back_buffers.clear();
+        self.depth_buffer = None;
         let flags = if self.tearing_supported {
             windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
         } else {
@@ -4124,10 +6829,83 @@ impl D3d12InteropPresenter {
         use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
         self.back_buffers.clear();
+        let base = unsafe { self.rtv_heap.GetCPUDescriptorHandleForHeapStart() };
         for index in 0..D3D12_SWAPCHAIN_BUFFER_COUNT {
             let back_buffer: ID3D12Resource = unsafe { self.swap_chain.GetBuffer(index as u32)? };
+            let handle = windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: base.ptr + index * self.rtv_descriptor_size as usize,
+            };
+            unsafe {
+                self.device
+                    .CreateRenderTargetView(&back_buffer, None, handle);
+            }
             self.back_buffers.push(back_buffer);
         }
+        self.recreate_depth_target()?;
+        Ok(())
+    }
+
+    fn recreate_depth_target(&mut self) -> Result<()> {
+        use windows::Win32::Graphics::{
+            Direct3D12::{
+                D3D12_CLEAR_VALUE, D3D12_CLEAR_VALUE_0, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                D3D12_DEPTH_STENCIL_VALUE, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES,
+                D3D12_HEAP_TYPE_DEFAULT, D3D12_MEMORY_POOL_UNKNOWN, D3D12_RESOURCE_DESC,
+                D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_TEXTURE_LAYOUT_UNKNOWN, ID3D12Resource,
+            },
+            Dxgi::Common::{DXGI_FORMAT_D32_FLOAT, DXGI_SAMPLE_DESC},
+        };
+
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: self.width as u64,
+            Height: self.height,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_D32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+        };
+        let clear = D3D12_CLEAR_VALUE {
+            Format: DXGI_FORMAT_D32_FLOAT,
+            Anonymous: D3D12_CLEAR_VALUE_0 {
+                DepthStencil: D3D12_DEPTH_STENCIL_VALUE {
+                    Depth: 1.0,
+                    Stencil: 0,
+                },
+            },
+        };
+        let mut depth_buffer: Option<ID3D12Resource> = None;
+        unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                Some(&clear),
+                &mut depth_buffer,
+            )?;
+        }
+        let depth_buffer = depth_buffer.context("D3D12 returned no raster depth buffer")?;
+        let dsv_handle = unsafe { self.dsv_heap.GetCPUDescriptorHandleForHeapStart() };
+        unsafe {
+            self.device
+                .CreateDepthStencilView(&depth_buffer, None, dsv_handle);
+        }
+        self.depth_buffer = Some(depth_buffer);
         Ok(())
     }
 
@@ -4150,14 +6928,15 @@ impl D3d12InteropPresenter {
         };
 
         let back_index = unsafe { self.swap_chain.GetCurrentBackBufferIndex() } as usize;
+        let (command_frame, command_allocator) = self.acquire_command_frame()?;
         let back_buffer = self
             .back_buffers
             .get(back_index)
             .context("D3D12 interop backbuffer is not available")?;
         unsafe {
-            self.command_allocator.Reset()?;
+            command_allocator.Reset()?;
             self.command_list.Reset(
-                &self.command_allocator,
+                &command_allocator,
                 None::<&windows::Win32::Graphics::Direct3D12::ID3D12PipelineState>,
             )?;
             let mut shared_to_copy = d3d12_transition(
@@ -4226,22 +7005,55 @@ impl D3d12InteropPresenter {
             let list: ID3D12CommandList = self.command_list.cast()?;
             self.queue.ExecuteCommandLists(&[Some(list)]);
         }
+        self.signal_command_frame(command_frame)?;
         Ok(())
     }
 
-    fn wait_for_gpu(&mut self) -> Result<()> {
-        use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+    fn acquire_command_frame(
+        &mut self,
+    ) -> Result<(
+        usize,
+        windows::Win32::Graphics::Direct3D12::ID3D12CommandAllocator,
+    )> {
+        let index = self.command_frame_index;
+        self.command_frame_index = (self.command_frame_index + 1) % self.command_frames.len();
+        self.wait_for_fence(self.command_frames[index].fence_value)?;
+        Ok((index, self.command_frames[index].command_allocator.clone()))
+    }
 
+    fn signal_command_frame(&mut self, index: usize) -> Result<u64> {
+        let fence_value = self.signal_queue()?;
+        self.command_frames[index].fence_value = fence_value;
+        Ok(fence_value)
+    }
+
+    fn signal_queue(&mut self) -> Result<u64> {
         self.fence_value += 1;
         unsafe {
             self.queue.Signal(&self.fence, self.fence_value)?;
-            if self.fence.GetCompletedValue() < self.fence_value {
+        }
+        Ok(self.fence_value)
+    }
+
+    fn wait_for_fence(&self, fence_value: u64) -> Result<()> {
+        use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+
+        if fence_value == 0 {
+            return Ok(());
+        }
+        unsafe {
+            if self.fence.GetCompletedValue() < fence_value {
                 self.fence
-                    .SetEventOnCompletion(self.fence_value, self.fence_event)?;
+                    .SetEventOnCompletion(fence_value, self.fence_event)?;
                 WaitForSingleObject(self.fence_event, INFINITE);
             }
         }
         Ok(())
+    }
+
+    fn wait_for_gpu(&mut self) -> Result<()> {
+        let fence_value = self.signal_queue()?;
+        self.wait_for_fence(fence_value)
     }
 }
 
@@ -5362,6 +8174,699 @@ mod tests {
     }
 
     #[test]
+    fn hardware_raster_source_keeps_expected_abi() {
+        let source = include_str!("../../stress-quads/hardware_raster.neo");
+        validate_raster_stress_abi(source).unwrap();
+        assert!(source.contains("kernel fn raster_cull_init(global u8* args, global u8* camera)"));
+        assert!(source.contains("((unsigned int*)camera)[26]"));
+        assert!(source.contains("global u8* camera"));
+        assert!(source.contains("corner_x * s.x"));
+        assert!(!source.contains("* s.x * quad_scale"));
+        assert!(source.contains("atomicAdd"));
+        assert!(source.contains("shared u32 block_prefix[256]"));
+        assert!(source.contains("((unsigned int*)camera)[24]"));
+        assert!(source.contains("((unsigned int*)camera)[27]"));
+        assert!(source.contains("projected_x"));
+        assert!(source.contains("let min_projected: f32 = cam->view.w;"));
+        assert!(!source.contains("* 0.85f"));
+        assert!(source.contains("vertex fn quad_vs_direct()"));
+        validate_raster_stress_abi_with_material(
+            source,
+            HardwareRasterPlan::stock().material_kernel().abi(),
+        )
+        .unwrap();
+        let shaders = neo_lang::lower_graphics_to_hlsl(source).unwrap();
+        assert!(shaders.vertex_source.contains("quad_vs"));
+        assert!(shaders.vertex_source.contains("visible_instance_id"));
+        assert!(shaders.vertex_source.contains("raster_camera_origin"));
+        assert!(shaders.vertex_source.contains("raster_camera_tan_x"));
+        assert!(shaders.fragment_source.contains("quad_fs"));
+        let cuda = neo_lang::lower_to_cuda(source).unwrap();
+        assert!(cuda.contains("__shared__ unsigned int block_prefix[256];"));
+        assert!(cuda.contains("__syncthreads();"));
+        assert!(cuda.contains("block_base[0] + local_out"));
+        assert!(cuda.contains("unsigned int visibility_mode"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardware_raster_stock_hlsl_compiles() {
+        let source = include_str!("../../stress-quads/hardware_raster.neo");
+        let material = hardware_raster_material();
+        validate_raster_stress_abi_with_material(source, material.abi()).unwrap();
+        let shaders = neo_lang::lower_graphics_to_hlsl_for_entries_with_bindings(
+            source,
+            material.vertex_entrypoint(),
+            material.fragment_entrypoint(),
+            graphics_bindings_for_material(material.abi()).unwrap(),
+        )
+        .unwrap();
+        let vertex_entrypoint = std::ffi::CString::new(material.vertex_entrypoint()).unwrap();
+        let fragment_entrypoint = std::ffi::CString::new(material.fragment_entrypoint()).unwrap();
+        compile_hlsl(
+            &shaders.vertex_source,
+            windows::core::PCSTR(vertex_entrypoint.as_ptr().cast()),
+            windows::core::PCSTR(D3D12_RASTER_VS_TARGET.as_ptr()),
+        )
+        .unwrap();
+        compile_hlsl(
+            &shaders.fragment_source,
+            windows::core::PCSTR(fragment_entrypoint.as_ptr().cast()),
+            windows::core::PCSTR(D3D12_RASTER_PS_TARGET.as_ptr()),
+        )
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardware_raster_draw_all_stock_hlsl_compiles_without_visible_stream_binding() {
+        let source = include_str!("../../stress-quads/hardware_raster.neo");
+        let material = HardwareRasterPlan::stock().material_kernel();
+        assert_eq!(material.vertex_entrypoint(), "quad_vs_direct");
+        assert_eq!(material.abi().bindings.len(), 3);
+        assert!(
+            material
+                .abi()
+                .binding(MaterialBindingKind::VisibleInstanceStream)
+                .is_none()
+        );
+        validate_raster_stress_abi_with_material(source, material.abi()).unwrap();
+        let bindings = graphics_bindings_for_material(material.abi()).unwrap();
+        assert_eq!(bindings.instances, neo_lang::HlslRegister::new(1, 0));
+        assert_eq!(bindings.geometry, neo_lang::HlslRegister::new(2, 0));
+        let shaders = neo_lang::lower_graphics_to_hlsl_for_entries_with_bindings(
+            source,
+            material.vertex_entrypoint(),
+            material.fragment_entrypoint(),
+            bindings,
+        )
+        .unwrap();
+        assert!(shaders.vertex_source.contains("quad_vs_direct("));
+        assert!(
+            !shaders
+                .vertex_source
+                .contains("visible_instance_id(instance_id")
+        );
+        let vertex_entrypoint = std::ffi::CString::new(material.vertex_entrypoint()).unwrap();
+        let fragment_entrypoint = std::ffi::CString::new(material.fragment_entrypoint()).unwrap();
+        compile_hlsl(
+            &shaders.vertex_source,
+            windows::core::PCSTR(vertex_entrypoint.as_ptr().cast()),
+            windows::core::PCSTR(D3D12_RASTER_VS_TARGET.as_ptr()),
+        )
+        .unwrap();
+        compile_hlsl(
+            &shaders.fragment_source,
+            windows::core::PCSTR(fragment_entrypoint.as_ptr().cast()),
+            windows::core::PCSTR(D3D12_RASTER_PS_TARGET.as_ptr()),
+        )
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardware_raster_material_bindings_are_explicit() {
+        let material = hardware_raster_material();
+        let abi = material.abi();
+        let draw_params =
+            material_binding(abi, MaterialBindingKind::DrawParams, "draw params").unwrap();
+        let legacy_raster_params =
+            material_binding(abi, MaterialBindingKind::RasterParams, "raster params").unwrap();
+        let visible = material_binding(
+            abi,
+            MaterialBindingKind::VisibleInstanceStream,
+            "visible InstanceStream",
+        )
+        .unwrap();
+        let instances =
+            material_binding(abi, MaterialBindingKind::InstanceStream, "InstanceStream").unwrap();
+        assert_eq!(draw_params.kind, MaterialBindingKind::DrawParams);
+        assert_eq!(draw_params.root_parameter_index, 0);
+        assert_eq!(draw_params.shader_register, 0);
+        assert_eq!(legacy_raster_params.root_parameter_index, 0);
+        assert_eq!(visible.root_parameter_index, 1);
+        assert_eq!(visible.shader_register, 0);
+        assert_eq!(instances.root_parameter_index, 2);
+        assert_eq!(instances.shader_register, 1);
+        let geometry =
+            material_binding(abi, MaterialBindingKind::GeometryStream, "GeometryStream").unwrap();
+        assert_eq!(geometry.root_parameter_index, 3);
+        assert_eq!(geometry.shader_register, 2);
+        validate_contiguous_material_root_bindings(abi).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardware_raster_direct_material_bindings_are_explicit() {
+        let material =
+            MaterialKernel::from_stages("hardware-raster", "quad_vs_direct", "quad_fs").with_abi(
+                MaterialKernelAbi::direct_instance_color("quad_vs_direct", "quad_fs"),
+            );
+        let abi = material.abi();
+        let draw_params =
+            material_binding(abi, MaterialBindingKind::DrawParams, "draw params").unwrap();
+        let legacy_raster_params =
+            material_binding(abi, MaterialBindingKind::RasterParams, "raster params").unwrap();
+        assert!(
+            abi.binding(MaterialBindingKind::VisibleInstanceStream)
+                .is_none()
+        );
+        let instances =
+            material_binding(abi, MaterialBindingKind::InstanceStream, "InstanceStream").unwrap();
+        let geometry =
+            material_binding(abi, MaterialBindingKind::GeometryStream, "GeometryStream").unwrap();
+        assert_eq!(draw_params.kind, MaterialBindingKind::DrawParams);
+        assert_eq!(draw_params.root_parameter_index, 0);
+        assert_eq!(legacy_raster_params.root_parameter_index, 0);
+        assert_eq!(instances.root_parameter_index, 1);
+        assert_eq!(geometry.root_parameter_index, 2);
+        validate_contiguous_material_root_bindings(abi).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardware_raster_submit_kind_follows_material_abi() {
+        let direct = MaterialKernelAbi::direct_instance_color("quad_vs_direct", "quad_fs");
+        assert_eq!(
+            hardware_raster_submit_kind(&direct),
+            HardwareRasterSubmitKind::DirectIndexedInstanced
+        );
+        let culled = MaterialKernelAbi::compute_culled_instance_color("quad_vs", "quad_fs");
+        assert_eq!(
+            hardware_raster_submit_kind(&culled),
+            HardwareRasterSubmitKind::IndirectIndexedInstanced
+        );
+    }
+
+    #[test]
+    fn hardware_raster_stock_plan_syncs_material_to_draw_policy() {
+        let mut plan = HardwareRasterPlan::stock();
+        assert_eq!(plan.draw_policy, DrawPolicyPlan::DrawAll);
+        assert_eq!(plan.material.vertex_entrypoint, "quad_vs_direct");
+        assert_eq!(
+            plan.material.kind,
+            MaterialKernelPlanKind::DirectInstanceColor
+        );
+
+        plan.draw_policy = DrawPolicyPlan::ComputeCulled;
+        plan.sync_stock_material_to_draw_policy();
+        assert_eq!(plan.material.vertex_entrypoint, "quad_vs");
+        assert_eq!(
+            plan.material.kind,
+            MaterialKernelPlanKind::ComputeCulledInstanceColor
+        );
+    }
+
+    #[test]
+    fn hardware_raster_plan_exposes_neutral_draw_contract() {
+        let mut plan = DrawExecutionPlan::stock();
+        plan.draw_policy = DrawPolicyPlan::ComputeCulled;
+        plan.cull_order = DrawCullOrder::StableDense;
+        plan.visibility = DrawVisibilityMode::ProjectedSize;
+        plan.min_projected_millipixels = 850;
+        plan.sync_stock_material_to_draw_policy();
+
+        let _geometry: &GeometryStreamPlan = plan.geometry_stream();
+        let _instances: &InstanceStreamPlan = plan.instance_stream();
+        let _target: &TargetPlan = plan.target();
+        let _material: &MaterialKernelPlan = plan.material();
+        let _policy: DrawPolicyPlan = plan.draw_policy();
+        let _cull_order: DrawCullOrder = plan.cull_order;
+        let _visibility: DrawVisibilityMode = plan.visibility;
+
+        assert_eq!(plan.draw_name(), "main");
+        assert_eq!(plan.backend(), DrawBackend::HardwareRaster);
+        assert_eq!(plan.backend().label(), "hardware-raster");
+        assert_eq!(plan.geometry_stream().name, "quad");
+        assert_eq!(plan.instance_stream().name, "instances");
+        assert_eq!(plan.target().name, "window");
+        assert_eq!(plan.material().name, "hardware-raster");
+        assert_eq!(plan.draw_policy(), DrawPolicyPlan::ComputeCulled);
+        assert_eq!(plan.depth(), DrawDepthMode::Auto);
+        assert!(plan.uses_depth());
+        assert_eq!(plan.draw_policy().label(), "compute-culled");
+        assert_eq!(plan.policy(), DrawPolicy::ComputeCulled);
+        assert_eq!(plan.cull_order(), DrawCullOrder::StableDense);
+        assert_eq!(plan.cull_order().label(), "stable-dense");
+        assert_eq!(plan.visibility(), DrawVisibilityMode::ProjectedSize);
+        assert_eq!(plan.visibility().label(), "projected-size");
+        assert_eq!(plan.min_projected_pixels(), 0.85);
+        assert_eq!(
+            plan.policy_config(),
+            DrawPolicyConfig::compute_culled_with_visibility(
+                RuntimeRasterCullOrder::StableDense,
+                RuntimeRasterVisibilityMode::ProjectedSize
+            )
+            .with_min_projected_millipixels(850)
+        );
+
+        let contract = plan.contract();
+        let _contract: DrawExecutionContract = contract.clone();
+        assert_eq!(contract.draw_name, "main");
+        assert_eq!(contract.geometry_stream, "quad");
+        assert_eq!(contract.instance_stream, "instances");
+        assert_eq!(contract.instance_layout, StressInstanceLayout::AoSoA32);
+        assert_eq!(contract.material, "hardware-raster");
+        assert_eq!(contract.target, "window");
+        assert_eq!(contract.target_width, DEFAULT_WIDTH);
+        assert_eq!(contract.target_height, DEFAULT_HEIGHT);
+        assert_eq!(
+            contract.target_dimensions(),
+            (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        );
+        assert_eq!(contract.policy(), DrawPolicy::ComputeCulled);
+        assert_eq!(contract.policy_label(), "compute-culled");
+        assert_eq!(contract.depth_label(), "auto");
+        assert!(contract.uses_depth());
+        assert_eq!(contract.cull_order_label(), "stable-dense");
+        assert_eq!(contract.visibility_label(), "projected-size");
+        assert_eq!(contract.min_projected_pixels(), 0.85);
+        assert_eq!(contract.instance_layout_label(), "aosoa32");
+        assert_eq!(contract.backend, DrawBackend::HardwareRaster);
+        assert_eq!(contract.backend_label(), "hardware-raster");
+        assert_eq!(contract.policy_config, plan.policy_config());
+    }
+
+    #[test]
+    fn draw_depth_auto_keeps_culled_stable_and_draw_all_fast() {
+        assert!(!DrawDepthMode::Auto.uses_depth(DrawPolicyPlan::DrawAll));
+        assert!(DrawDepthMode::Auto.uses_depth(DrawPolicyPlan::ComputeCulled));
+        assert!(DrawDepthMode::On.uses_depth(DrawPolicyPlan::DrawAll));
+        assert!(!DrawDepthMode::Off.uses_depth(DrawPolicyPlan::ComputeCulled));
+        assert_eq!(
+            "auto".parse::<DrawDepthMode>().unwrap(),
+            DrawDepthMode::Auto
+        );
+        assert_eq!("on".parse::<DrawDepthMode>().unwrap(), DrawDepthMode::On);
+        assert_eq!("off".parse::<DrawDepthMode>().unwrap(), DrawDepthMode::Off);
+        let err = "maybe".parse::<DrawDepthMode>().unwrap_err().to_string();
+        assert!(err.contains("expected auto, on, or off"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardware_raster_uses_shader_model_5_1_for_register_spaces() {
+        assert_eq!(D3D12_RASTER_VS_TARGET, b"vs_5_1\0");
+        assert_eq!(D3D12_RASTER_PS_TARGET, b"ps_5_1\0");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardware_raster_material_bindings_drive_hlsl_contract() {
+        let mut abi = MaterialKernelAbi::compute_culled_instance_color("quad_vs", "quad_fs");
+        abi.bindings[0].shader_register = 4;
+        abi.bindings[0].register_space = 2;
+        abi.bindings[1].shader_register = 7;
+        abi.bindings[1].register_space = 3;
+        abi.bindings[2].shader_register = 8;
+        abi.bindings[2].register_space = 3;
+        abi.bindings[3].shader_register = 9;
+        abi.bindings[3].register_space = 4;
+
+        let bindings = graphics_bindings_for_material(&abi).unwrap();
+        assert_eq!(bindings.raster_params, neo_lang::HlslRegister::new(4, 2));
+        assert_eq!(
+            bindings.visible_instances,
+            neo_lang::HlslRegister::new(7, 3)
+        );
+        assert_eq!(bindings.instances, neo_lang::HlslRegister::new(8, 3));
+        assert_eq!(bindings.geometry, neo_lang::HlslRegister::new(9, 4));
+
+        let source = include_str!("../../stress-quads/hardware_raster.neo");
+        let shaders = neo_lang::lower_graphics_to_hlsl_with_bindings(source, bindings).unwrap();
+        assert!(
+            shaders
+                .vertex_source
+                .contains("RasterParams : register(b4, space2)")
+        );
+        assert!(
+            shaders
+                .vertex_source
+                .contains("neo_visible_instances : register(t7, space3)")
+        );
+        assert!(
+            shaders
+                .vertex_source
+                .contains("neo_instances : register(t8, space3)")
+        );
+        assert!(
+            shaders
+                .vertex_source
+                .contains("neo_geometry : register(t9, space4)")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardware_raster_material_entrypoints_drive_hlsl_selection() {
+        let abi = MaterialKernelAbi::compute_culled_instance_color("material_vs", "material_fs");
+        let source = r#"
+kernel fn raster_cull_init(global u8* args, global u8* camera) {
+    ((unsigned int*)args)[0] = 6u;
+}
+kernel fn raster_cull(global u8* args, global u8* visible, global u8* instances, global u8* camera, u32 instance_count, u32 frame) {
+    let cam: u8* = camera;
+    ((unsigned int*)visible)[0] = 0u;
+    ((unsigned int*)args)[0] = 6u;
+}
+vertex fn fallback_vs() {
+    set_position(vec4f(0.0f, 0.0f, 0.0f, 1.0f));
+    set_color(vec4f(1.0f, 0.0f, 0.0f, 1.0f));
+}
+fragment fn fallback_fs() {
+    return input_color();
+}
+vertex fn material_vs() {
+    let id: u32 = visible_instance_id(instance_id());
+    let p: vec3f = neo_instance_position3f(id);
+    let corner: vec3f = neo_geometry_position3f(vertex_id());
+    set_position(vec4f(p.x + corner.x, p.y + corner.y, p.z + corner.z, 1.0f));
+    set_color(vec4f(0.0f, 1.0f, 0.0f, 1.0f));
+}
+fragment fn material_fs() {
+    return input_color();
+}
+"#;
+        validate_raster_stress_abi_with_material(source, &abi).unwrap();
+        let shaders = neo_lang::lower_graphics_to_hlsl_for_entries_with_bindings(
+            source,
+            &abi.vertex_entrypoint,
+            &abi.fragment_entrypoint,
+            graphics_bindings_for_material(&abi).unwrap(),
+        )
+        .unwrap();
+        assert!(shaders.vertex_source.contains("material_vs("));
+        assert!(!shaders.vertex_source.contains("fallback_vs("));
+        assert!(shaders.fragment_source.contains("material_fs("));
+        assert!(!shaders.fragment_source.contains("fallback_fs("));
+    }
+
+    #[test]
+    fn hardware_raster_plan_accepts_stock_executor_contract_with_custom_material() {
+        let plan = HardwareRasterPlan {
+            draw_name: "main".to_string(),
+            geometry_stream: HardwareRasterGeometryStreamPlan::stock_quad(),
+            instance_stream: HardwareRasterInstanceStreamPlan::stock_instances(
+                InstanceGrid::new(16, 16, 4),
+                StressInstanceLayout::AoSoA64,
+            ),
+            target: HardwareRasterTargetPlan::window(1280, 720),
+            material: HardwareRasterMaterialPlan::compute_culled_instance_color(
+                "lit-quads",
+                "lit_quad_vs",
+                "lit_quad_fs",
+            ),
+            draw_policy: HardwareRasterDrawPolicy::ComputeCulled,
+            depth: DrawDepthMode::Auto,
+            cull_order: HardwareRasterCullOrder::AtomicCompact,
+            visibility: HardwareRasterVisibilityMode::Frustum,
+            min_projected_millipixels: DEFAULT_MIN_PROJECTED_MILLIPIXELS,
+        };
+
+        plan.validate_executor_contract().unwrap();
+        assert_eq!(plan.geometry_stream.index_count(), 6);
+        assert_eq!(plan.geometry_stream.indices_u16, vec![0, 1, 2, 2, 1, 3]);
+        assert_eq!(plan.instance_stream.grid.count(), Some(1024));
+        assert_eq!(plan.instance_stream.layout, StressInstanceLayout::AoSoA64);
+        assert_eq!(plan.target.width, 1280);
+        assert_eq!(plan.target.height, 720);
+        let material = plan.material_kernel();
+        assert_eq!(material.label(), "lit-quads");
+        assert_eq!(material.vertex_entrypoint(), "lit_quad_vs");
+        assert_eq!(material.fragment_entrypoint(), "lit_quad_fs");
+    }
+
+    #[test]
+    fn hardware_raster_plan_rejects_unsupported_geometry_and_invalid_resources() {
+        let mut plan = HardwareRasterPlan::stock();
+        plan.geometry_stream.indices_u16.clear();
+        let err = plan.validate_executor_contract().unwrap_err().to_string();
+        assert!(err.contains("GeometryStream `quad` with no indices"));
+
+        let mut plan = HardwareRasterPlan::stock();
+        plan.instance_stream.grid = InstanceGrid::new(4, 0, 4);
+        let err = plan.validate_executor_contract().unwrap_err().to_string();
+        assert!(err.contains("--instance-grid dimensions"));
+
+        let mut plan = HardwareRasterPlan::stock();
+        plan.target.width = 0;
+        let err = plan.validate_executor_contract().unwrap_err().to_string();
+        assert!(err.contains("Target `window` with zero size"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardware_raster_material_bindings_reject_mismatched_root_contract() {
+        let mut abi = MaterialKernelAbi::compute_culled_instance_color("quad_vs", "quad_fs");
+        abi.bindings[1].root_parameter_index = 2;
+        let err = validate_contiguous_material_root_bindings(&abi)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("root parameter 1"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raster_root_constants_pack_camera_contract() {
+        let camera = CameraParams {
+            origin: [1.0, 2.0, 3.0, 0.0],
+            right: [4.0, 5.0, 6.0, 0.0],
+            up: [7.0, 8.0, 9.0, 0.0],
+            forward: [10.0, 11.0, 12.0, 0.0],
+            grid: [13, 14, 15, 0],
+            view: [16.0, 17.0, 18.0, 0.0],
+            config: [19, 20, 21, 22],
+        };
+        let constants = raster_root_constants(
+            InstanceGrid { x: 2, y: 3, z: 4 },
+            PhysicalSize::new(640, 360),
+            camera,
+            &HardwareRasterGeometryStreamPlan::indexed_u16(
+                "test",
+                vec![0; 64],
+                16,
+                12,
+                vec![0, 1, 2],
+            ),
+            99,
+        );
+        assert_eq!(constants.len(), RASTER_ROOT_CONSTANT_DWORDS as usize);
+        assert_eq!(&constants[0..8], &[2, 3, 4, 99, 640, 360, 16, 12]);
+        assert_eq!(constants[8], 1.0f32.to_bits());
+        assert_eq!(constants[12], 4.0f32.to_bits());
+        assert_eq!(constants[16], 7.0f32.to_bits());
+        assert_eq!(constants[20], 10.0f32.to_bits());
+        assert_eq!(constants[24], 16.0f32.to_bits());
+        assert_eq!(constants[26], 18.0f32.to_bits());
+    }
+
+    #[test]
+    fn hardware_raster_abi_rejects_missing_cull_init_kernel() {
+        let source = r#"
+kernel fn raster_cull(global u8* args, global u8* visible, global u8* instances, global u8* camera, u32 instance_count, u32 frame) {
+    let cam: u8* = camera;
+    ((unsigned int*)visible)[0] = 0u;
+    ((unsigned int*)args)[0] = 6u;
+}
+vertex fn quad_vs() {
+    let id: u32 = visible_instance_id(instance_id());
+    let p: vec3f = neo_instance_position3f(id);
+    set_position(vec4f(p.x, p.y, p.z, 1.0f));
+    set_color(vec4f(1.0f, 1.0f, 1.0f, 1.0f));
+}
+fragment fn quad_fs() {
+    return input_color();
+}
+"#;
+        let err = validate_raster_stress_abi(source).unwrap_err().to_string();
+        assert!(err.contains("raster_cull_init"));
+    }
+
+    #[test]
+    fn hardware_raster_abi_rejects_cull_stage_without_camera() {
+        let source = r#"
+kernel fn raster_cull_init(global u8* args, global u8* camera) {
+    ((unsigned int*)args)[0] = 6u;
+}
+kernel fn raster_cull(global u8* args, global u8* visible, global u8* instances, u32 instance_count, u32 frame) {
+    ((unsigned int*)visible)[0] = 0u;
+    ((unsigned int*)args)[0] = 6u;
+}
+vertex fn quad_vs() {
+    let id: u32 = visible_instance_id(instance_id());
+    let p: vec3f = neo_instance_position3f(id);
+    set_position(vec4f(p.x, p.y, p.z, 1.0f));
+    set_color(vec4f(1.0f, 1.0f, 1.0f, 1.0f));
+}
+fragment fn quad_fs() {
+    return input_color();
+}
+"#;
+        let err = validate_raster_stress_abi(source).unwrap_err().to_string();
+        assert!(err.contains("camera"));
+    }
+
+    #[test]
+    fn hardware_raster_abi_rejects_vertex_stage_without_instance_stream() {
+        let source = r#"
+kernel fn raster_cull_init(global u8* args, global u8* camera) {
+    ((unsigned int*)args)[0] = 6u;
+}
+kernel fn raster_cull(global u8* args, global u8* visible, global u8* instances, global u8* camera, u32 instance_count, u32 frame) {
+    let cam: u8* = camera;
+    ((unsigned int*)visible)[0] = 0u;
+    ((unsigned int*)args)[0] = 6u;
+}
+vertex fn quad_vs() {
+    set_position(vec4f(0.0f, 0.0f, 0.0f, 1.0f));
+    set_color(vec4f(1.0f, 1.0f, 1.0f, 1.0f));
+}
+fragment fn quad_fs() {
+    return input_color();
+}
+"#;
+        let err = validate_raster_stress_abi(source).unwrap_err().to_string();
+        assert!(err.contains("compute-culled InstanceStream"));
+    }
+
+    #[test]
+    fn hardware_raster_abi_rejects_cull_stage_without_visible_stream() {
+        let source = r#"
+kernel fn raster_cull_init(global u8* args, global u8* camera) {
+    ((unsigned int*)args)[0] = 6u;
+}
+kernel fn raster_cull(global u8* args, global u8* visible, global u8* instances, global u8* camera, u32 instance_count, u32 frame) {
+    let cam: u8* = camera;
+    ((unsigned int*)args)[0] = 6u;
+}
+vertex fn quad_vs() {
+    let id: u32 = visible_instance_id(instance_id());
+    let p: vec3f = neo_instance_position3f(id);
+    set_position(vec4f(p.x, p.y, p.z, 1.0f));
+    set_color(vec4f(1.0f, 1.0f, 1.0f, 1.0f));
+}
+fragment fn quad_fs() {
+    return input_color();
+}
+"#;
+        let err = validate_raster_stress_abi(source).unwrap_err().to_string();
+        assert!(err.contains("visible InstanceStream"));
+    }
+
+    #[test]
+    fn hardware_raster_abi_ignores_commented_contract_tokens() {
+        let source = r#"
+kernel fn raster_cull_init(global u8* args, global u8* camera) {
+    ((unsigned int*)args)[0] = 6u;
+}
+kernel fn raster_cull(global u8* args, global u8* visible, global u8* instances, global u8* camera, u32 instance_count, u32 frame) {
+    let cam: u8* = camera;
+    // ((unsigned int*)visible)[0] = 0u;
+    ((unsigned int*)args)[0] = 6u;
+}
+vertex fn quad_vs() {
+    // let id: u32 = visible_instance_id(instance_id());
+    let id: u32 = instance_id();
+    let p: vec3f = neo_instance_position3f(id);
+    set_position(vec4f(p.x, p.y, p.z, 1.0f));
+    set_color(vec4f(1.0f, 1.0f, 1.0f, 1.0f));
+}
+fragment fn quad_fs() {
+    return input_color();
+}
+"#;
+        let err = validate_raster_stress_abi(source).unwrap_err().to_string();
+        assert!(
+            err.contains("visible InstanceStream") || err.contains("compute-culled InstanceStream")
+        );
+    }
+
+    #[test]
+    fn hardware_raster_abi_ignores_disabled_false_blocks() {
+        let source = r#"
+kernel fn raster_cull_init(global u8* args, global u8* camera) {
+    ((unsigned int*)args)[0] = 6u;
+}
+kernel fn raster_cull(global u8* args, global u8* visible, global u8* instances, global u8* camera, u32 instance_count, u32 frame) {
+    let cam: u8* = camera;
+    if (false) {
+        ((unsigned int*)visible)[0] = 0u;
+    }
+    ((unsigned int*)args)[0] = 6u;
+}
+vertex fn quad_vs() {
+    if (false) {
+        let dead_id: u32 = visible_instance_id(instance_id());
+        set_position(vec4f(0.0f, 0.0f, 0.0f, 1.0f));
+    }
+    let id: u32 = instance_id();
+    let p: vec3f = neo_instance_position3f(id);
+    set_position(vec4f(p.x, p.y, p.z, 1.0f));
+    set_color(vec4f(1.0f, 1.0f, 1.0f, 1.0f));
+}
+fragment fn quad_fs() {
+    return input_color();
+}
+"#;
+        let err = validate_raster_stress_abi(source).unwrap_err().to_string();
+        assert!(
+            err.contains("visible InstanceStream") || err.contains("compute-culled InstanceStream")
+        );
+    }
+
+    #[test]
+    fn hardware_raster_abi_rejects_vertex_stage_without_position_output() {
+        let source = r#"
+kernel fn raster_cull_init(global u8* args, global u8* camera) {
+    ((unsigned int*)args)[0] = 6u;
+}
+kernel fn raster_cull(global u8* args, global u8* visible, global u8* instances, global u8* camera, u32 instance_count, u32 frame) {
+    let cam: u8* = camera;
+    ((unsigned int*)visible)[0] = 0u;
+    ((unsigned int*)args)[0] = 6u;
+}
+vertex fn quad_vs() {
+    let id: u32 = visible_instance_id(instance_id());
+    let p: vec3f = neo_instance_position3f(id);
+    let corner: vec3f = neo_geometry_position3f(vertex_id());
+    let q: vec3f = vec3f(p.x + corner.x, p.y + corner.y, p.z + corner.z);
+    set_color(vec4f(p.x, p.y, p.z, 1.0f));
+}
+fragment fn quad_fs() {
+    return input_color();
+}
+"#;
+        let err = validate_raster_stress_abi(source).unwrap_err().to_string();
+        assert!(err.contains("clip-space position"));
+    }
+
+    #[test]
+    fn hardware_raster_abi_rejects_fragment_stage_without_interpolated_color() {
+        let source = r#"
+kernel fn raster_cull_init(global u8* args, global u8* camera) {
+    ((unsigned int*)args)[0] = 6u;
+}
+kernel fn raster_cull(global u8* args, global u8* visible, global u8* instances, global u8* camera, u32 instance_count, u32 frame) {
+    let cam: u8* = camera;
+    ((unsigned int*)visible)[0] = 0u;
+    ((unsigned int*)args)[0] = 6u;
+}
+vertex fn quad_vs() {
+    let id: u32 = visible_instance_id(instance_id());
+    let p: vec3f = neo_instance_position3f(id);
+    let corner: vec3f = neo_geometry_position3f(vertex_id());
+    set_position(vec4f(p.x + corner.x, p.y + corner.y, p.z + corner.z, 1.0f));
+    set_color(vec4f(1.0f, 1.0f, 1.0f, 1.0f));
+}
+fragment fn quad_fs() {
+    return vec4f(1.0f, 0.0f, 0.0f, 1.0f);
+}
+"#;
+        let err = validate_raster_stress_abi(source).unwrap_err().to_string();
+        assert!(err.contains("input_color"));
+    }
+
+    #[test]
     fn reload_state_keeps_last_good_after_failure() {
         let mut reload = ReloadState::new(7);
         assert!(!reload.try_replace::<&str>(Err("compile failed")));
@@ -5512,6 +9017,111 @@ mod tests {
     }
 
     #[test]
+    fn live_options_accept_draw_stress_mode() {
+        let options = LiveOptions::parse(
+            [
+                "examples/stress-quads/hardware_raster.neo",
+                "--mode",
+                "draw-stress",
+                "--presenter",
+                "d3d12-interop",
+                "--instance-grid",
+                "256x256x128",
+                "--draw-policy",
+                "compute-culled",
+                "--draw-depth",
+                "off",
+                "--cull-order",
+                "atomic-compact",
+                "--visibility",
+                "projected-size",
+                "--min-projected-pixels",
+                "1.25",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(options.mode, RunMode::DrawStress);
+        assert_eq!(options.mode.to_string(), "draw-stress");
+        assert_eq!(options.presenter, PresenterKind::D3d12Interop);
+        assert_eq!(options.instance_grid.count(), Some(8_388_608));
+        assert_eq!(
+            options.raster_plan.draw_policy,
+            HardwareRasterDrawPolicy::ComputeCulled
+        );
+        assert_eq!(options.raster_plan.depth, DrawDepthMode::Off);
+        assert!(!options.raster_plan.uses_depth());
+        assert_eq!(
+            options.raster_plan.cull_order,
+            HardwareRasterCullOrder::AtomicCompact
+        );
+        assert_eq!(
+            options.raster_plan.visibility,
+            HardwareRasterVisibilityMode::ProjectedSize
+        );
+        assert_eq!(options.raster_plan.min_projected_millipixels, 1250);
+        assert_eq!(
+            raster_stress_source_path(Path::new("examples/live-window/live.neo")),
+            PathBuf::from("examples/stress-quads/hardware_raster.neo")
+        );
+    }
+
+    #[test]
+    fn live_options_accept_legacy_raster_stress_and_draw_policy_aliases() {
+        let options = LiveOptions::parse(
+            [
+                "--mode",
+                "raster-stress",
+                "--raster-draw-policy",
+                "compute-culled",
+                "--raster-depth",
+                "on",
+                "--raster-cull-order",
+                "stable-dense",
+                "--raster-visibility",
+                "projected-size",
+                "--raster-min-projected-pixels",
+                "0.85",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+
+        assert_eq!(options.mode, RunMode::DrawStress);
+        assert_eq!(
+            options.raster_plan.draw_policy,
+            HardwareRasterDrawPolicy::ComputeCulled
+        );
+        assert_eq!(options.raster_plan.depth, DrawDepthMode::On);
+        assert!(options.raster_plan.uses_depth());
+        assert_eq!(
+            options.raster_plan.cull_order,
+            HardwareRasterCullOrder::StableDense
+        );
+        assert_eq!(
+            options.raster_plan.visibility,
+            HardwareRasterVisibilityMode::ProjectedSize
+        );
+        assert_eq!(options.raster_plan.min_projected_millipixels, 850);
+    }
+
+    #[test]
+    fn live_options_reject_invalid_min_projected_pixels() {
+        for value in ["-1", "NaN", "inf"] {
+            let err = LiveOptions::parse(
+                ["--min-projected-pixels", value]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("--min-projected-pixels must be finite and non-negative"));
+        }
+    }
+
+    #[test]
     fn instance_debug_view_accepts_expected_values() {
         assert_eq!(
             "off".parse::<InstanceDebugView>().unwrap(),
@@ -5543,6 +9153,10 @@ mod tests {
             "aosoa64".parse::<StressInstanceLayout>().unwrap(),
             StressInstanceLayout::AoSoA64
         );
+        assert_eq!(StressInstanceLayout::AoSoA32.label(), "aosoa32");
+        assert_eq!(StressInstanceLayout::AoSoA32.to_string(), "aosoa32");
+        assert_eq!(StressInstanceLayout::AoSoA64.label(), "aosoa64");
+        assert_eq!(StressInstanceLayout::AoSoA64.to_string(), "aosoa64");
         assert_eq!(StressInstanceLayout::AoSoA64.group_size(), 64);
         let err = "soa"
             .parse::<StressInstanceLayout>()
@@ -5564,6 +9178,165 @@ mod tests {
         );
         let err = "maybe".parse::<RenderPolicy>().unwrap_err().to_string();
         assert!(err.contains("expected auto, force-render, or pause-when-empty"));
+    }
+
+    #[test]
+    fn hardware_cull_order_accepts_expected_values() {
+        assert_eq!(
+            "atomic-compact".parse::<HardwareRasterCullOrder>().unwrap(),
+            HardwareRasterCullOrder::AtomicCompact
+        );
+        assert_eq!(
+            HardwareRasterCullOrder::AtomicCompact.label(),
+            "atomic-compact"
+        );
+        assert_eq!(
+            "atomic".parse::<HardwareRasterCullOrder>().unwrap(),
+            HardwareRasterCullOrder::AtomicCompact
+        );
+        assert_eq!(
+            "stable-dense".parse::<HardwareRasterCullOrder>().unwrap(),
+            HardwareRasterCullOrder::StableDense
+        );
+        assert_eq!(HardwareRasterCullOrder::StableDense.label(), "stable-dense");
+        assert_eq!(
+            "stable".parse::<HardwareRasterCullOrder>().unwrap(),
+            HardwareRasterCullOrder::StableDense
+        );
+        let err = "random"
+            .parse::<HardwareRasterCullOrder>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected atomic-compact or stable-dense"));
+    }
+
+    #[test]
+    fn hardware_draw_visibility_accepts_expected_values() {
+        assert_eq!(
+            "frustum".parse::<HardwareRasterVisibilityMode>().unwrap(),
+            HardwareRasterVisibilityMode::Frustum
+        );
+        assert_eq!(HardwareRasterVisibilityMode::Frustum.label(), "frustum");
+        assert_eq!(
+            "projected-size"
+                .parse::<HardwareRasterVisibilityMode>()
+                .unwrap(),
+            HardwareRasterVisibilityMode::ProjectedSize
+        );
+        assert_eq!(
+            HardwareRasterVisibilityMode::ProjectedSize.label(),
+            "projected-size"
+        );
+        assert_eq!(
+            "pixel-size"
+                .parse::<HardwareRasterVisibilityMode>()
+                .unwrap(),
+            HardwareRasterVisibilityMode::ProjectedSize
+        );
+        let err = "portal"
+            .parse::<HardwareRasterVisibilityMode>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected frustum or projected-size"));
+    }
+
+    #[test]
+    fn hardware_draw_policy_accepts_expected_values() {
+        assert_eq!(
+            "draw-all".parse::<HardwareRasterDrawPolicy>().unwrap(),
+            HardwareRasterDrawPolicy::DrawAll
+        );
+        assert_eq!(HardwareRasterDrawPolicy::DrawAll.label(), "draw-all");
+        assert_eq!(
+            "all".parse::<HardwareRasterDrawPolicy>().unwrap(),
+            HardwareRasterDrawPolicy::DrawAll
+        );
+        assert_eq!(
+            "compute-culled"
+                .parse::<HardwareRasterDrawPolicy>()
+                .unwrap(),
+            HardwareRasterDrawPolicy::ComputeCulled
+        );
+        assert_eq!(
+            HardwareRasterDrawPolicy::ComputeCulled.label(),
+            "compute-culled"
+        );
+        assert_eq!(
+            "culled".parse::<HardwareRasterDrawPolicy>().unwrap(),
+            HardwareRasterDrawPolicy::ComputeCulled
+        );
+        let err = "indirect"
+            .parse::<HardwareRasterDrawPolicy>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected draw-all or compute-culled"));
+    }
+
+    #[test]
+    fn hardware_raster_visible_instances_log_is_honest_for_policy() {
+        let grid = InstanceGrid {
+            x: 256,
+            y: 256,
+            z: 128,
+        };
+        assert_eq!(
+            hardware_raster_visible_instances_for_log(HardwareRasterDrawPolicy::DrawAll, grid),
+            Some(8_388_608)
+        );
+        assert_eq!(
+            hardware_raster_visible_instances_for_log(
+                HardwareRasterDrawPolicy::ComputeCulled,
+                grid
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn throughput_log_uses_neutral_draw_policy_markers() {
+        let markers = draw_policy_log_markers(DrawPolicyLogFields {
+            draw_policy: Some(HardwareRasterDrawPolicy::ComputeCulled),
+            draw_depth: Some(DrawDepthMode::Auto),
+            uses_depth: Some(true),
+            cull_order: Some(HardwareRasterCullOrder::StableDense),
+            draw_visibility: Some(HardwareRasterVisibilityMode::ProjectedSize),
+            min_projected_millipixels: Some(850),
+            visible_instances: None,
+            indirect_draws: Some(1),
+        });
+
+        assert!(markers.contains("draw_policy compute-culled"));
+        assert!(markers.contains("draw_depth auto"));
+        assert!(markers.contains("depth on"));
+        assert!(markers.contains("cull_order stable-dense"));
+        assert!(markers.contains("draw_visibility projected-size"));
+        assert!(markers.contains("min_projected_px 0.850"));
+        assert!(markers.contains("indirect_draws 1"));
+        assert!(!markers.contains("raster_draw_policy"));
+        assert!(!markers.contains("raster_cull_order"));
+        assert!(!markers.contains("raster_visibility"));
+        assert!(!markers.contains("raster_min_projected"));
+    }
+
+    #[test]
+    fn draw_all_static_stream_helpers_pack_identity_and_indirect_args() {
+        let visible = draw_all_identity_visible_bytes(4).unwrap();
+        assert_eq!(
+            visible,
+            [
+                0u32.to_le_bytes(),
+                1u32.to_le_bytes(),
+                2u32.to_le_bytes(),
+                3u32.to_le_bytes(),
+            ]
+            .concat()
+        );
+        let command = draw_all_indirect_command(12, 4);
+        assert_eq!(command.index_count_per_instance, 12);
+        assert_eq!(command.instance_count, 4);
+        assert_eq!(command.start_index_location, 0);
+        assert_eq!(command.base_vertex_location, 0);
+        assert_eq!(command.start_instance_location, 0);
     }
 
     #[test]

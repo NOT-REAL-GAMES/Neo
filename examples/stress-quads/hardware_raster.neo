@@ -1,0 +1,142 @@
+kernel fn raster_cull_init(global u8* args, global u8* camera) {
+    let index_count: u32 = ((unsigned int*)camera)[26];
+    ((unsigned int*)args)[0] = (index_count == 0u) ? 6u : index_count;
+    ((unsigned int*)args)[1] = 0u;
+    ((unsigned int*)args)[2] = 0u;
+    ((int*)args)[3] = 0;
+    ((unsigned int*)args)[4] = 0u;
+}
+
+kernel fn raster_cull(global u8* args, global u8* visible, global u8* instances, global u8* camera, u32 instance_count, u32 frame) {
+    let id: u32 = block_id().x * block_dim().x + thread_id().x;
+    let local_id: u32 = thread_id().x;
+    shared u32 block_flags[256];
+    shared u32 block_prefix[256];
+    shared u32 block_base[1];
+    shared u32 block_visible_count[1];
+
+    struct NeoStressCamera {
+        float4 origin;
+        float4 right;
+        float4 up;
+        float4 forward;
+        uint4 grid;
+        float4 view;
+        uint4 config;
+    };
+
+    let visible_flag: u32 = 0u;
+    if (id < instance_count) {
+        let cam: NeoStressCamera* = (NeoStressCamera*)camera;
+        let p: vec3f = neo_instance_position3f(instances, id);
+        let rel_x: f32 = p.x - cam->origin.x;
+        let rel_y: f32 = p.y - cam->origin.y;
+        let rel_z: f32 = p.z - cam->origin.z;
+        let camera_x: f32 = rel_x * cam->right.x + rel_y * cam->right.y + rel_z * cam->right.z;
+        let camera_y: f32 = rel_x * cam->up.x + rel_y * cam->up.y + rel_z * cam->up.z;
+        let camera_z: f32 = rel_x * cam->forward.x + rel_y * cam->forward.y + rel_z * cam->forward.z;
+        let slack: f32 = cam->view.z * 2.0f;
+        let max_x: f32 = camera_z * cam->view.x + slack;
+        let max_y: f32 = camera_z * cam->view.y + slack;
+        if (camera_z > 0.05f && fabsf(camera_x) <= max_x && fabsf(camera_y) <= max_y) {
+            visible_flag = 1u;
+            let visibility_mode: u32 = ((unsigned int*)camera)[24];
+            if (visibility_mode == 1u) {
+                let s: vec2f = neo_instance_scale2f(instances, id);
+                let projected_x: f32 = (s.x * 2.0f) / (camera_z * fmaxf(cam->view.x, 0.001f));
+                let projected_y: f32 = (s.y * 2.0f) / (camera_z * fmaxf(cam->view.y, 0.001f));
+                let min_projected: f32 = cam->view.w;
+                if (fmaxf(projected_x, projected_y) < min_projected) {
+                    visible_flag = 0u;
+                }
+            }
+        }
+    }
+
+    let cull_order: u32 = ((unsigned int*)camera)[27];
+    if (cull_order == 0u) {
+        if (visible_flag != 0u) {
+            let out_id: u32 = atomicAdd(&((unsigned int*)args)[1], 1u);
+            ((unsigned int*)visible)[out_id] = id;
+        }
+    } else {
+        block_flags[local_id] = visible_flag;
+        block_prefix[local_id] = visible_flag;
+        block_barrier();
+
+        for (unsigned int offset = 1u; offset < block_dim().x; offset <<= 1u) {
+            let add: u32 = 0u;
+            if (local_id >= offset) {
+                add = block_prefix[local_id - offset];
+            }
+            block_barrier();
+            block_prefix[local_id] += add;
+            block_barrier();
+        }
+
+        if (local_id == block_dim().x - 1u) {
+            block_visible_count[0] = block_prefix[local_id];
+            block_base[0] = atomicAdd(&((unsigned int*)args)[1], block_visible_count[0]);
+        }
+        block_barrier();
+
+        if (visible_flag != 0u) {
+            let local_out: u32 = block_prefix[local_id] - 1u;
+            ((unsigned int*)visible)[block_base[0] + local_out] = id;
+        }
+    }
+}
+
+vertex fn quad_vs() {
+    let source_id: u32 = visible_instance_id(instance_id());
+    let p: vec3f = neo_stress_instance_position3f(source_id);
+    let s: vec2f = neo_stress_instance_scale2f(source_id);
+    let packed_color: u32 = neo_stress_instance_color4u8(source_id);
+    let corner: vec3f = neo_geometry_position3f(vertex_id());
+    let corner_x: f32 = corner.x;
+    let corner_y: f32 = corner.y;
+    let rel: vec3f = p - raster_camera_origin();
+    let camera_x: f32 = dot(rel, raster_camera_right());
+    let camera_y: f32 = dot(rel, raster_camera_up());
+    let camera_z: f32 = dot(rel, raster_camera_forward());
+    let clip_x: f32 = (camera_x + corner_x * s.x) / (max(camera_z, 0.05f) * raster_camera_tan_x());
+    let clip_y: f32 = (camera_y + corner_y * s.y) / (max(camera_z, 0.05f) * raster_camera_tan_y());
+    let tie_hash: u32 = (source_id * 1664525u + 1013904223u) & 1023u;
+    let depth_bias: f32 = as_f32(tie_hash) * 0.0000000005f;
+    let depth: f32 = min(camera_z / (camera_z + 512.0f) + depth_bias, 0.999999f);
+    if (camera_z <= 0.05f) {
+        set_position(vec4f(2.5f, 2.5f, 1.0f, 1.0f));
+    } else {
+        set_position(vec4f(clip_x, clip_y, depth, 1.0f));
+    }
+    set_color(unpack_bgra8(packed_color));
+}
+
+vertex fn quad_vs_direct() {
+    let source_id: u32 = instance_id();
+    let p: vec3f = neo_stress_instance_position3f(source_id);
+    let s: vec2f = neo_stress_instance_scale2f(source_id);
+    let packed_color: u32 = neo_stress_instance_color4u8(source_id);
+    let corner: vec3f = neo_geometry_position3f(vertex_id());
+    let corner_x: f32 = corner.x;
+    let corner_y: f32 = corner.y;
+    let rel: vec3f = p - raster_camera_origin();
+    let camera_x: f32 = dot(rel, raster_camera_right());
+    let camera_y: f32 = dot(rel, raster_camera_up());
+    let camera_z: f32 = dot(rel, raster_camera_forward());
+    let clip_x: f32 = (camera_x + corner_x * s.x) / (max(camera_z, 0.05f) * raster_camera_tan_x());
+    let clip_y: f32 = (camera_y + corner_y * s.y) / (max(camera_z, 0.05f) * raster_camera_tan_y());
+    let tie_hash: u32 = (source_id * 1664525u + 1013904223u) & 1023u;
+    let depth_bias: f32 = as_f32(tie_hash) * 0.0000000005f;
+    let depth: f32 = min(camera_z / (camera_z + 512.0f) + depth_bias, 0.999999f);
+    if (camera_z <= 0.05f) {
+        set_position(vec4f(2.5f, 2.5f, 1.0f, 1.0f));
+    } else {
+        set_position(vec4f(clip_x, clip_y, depth, 1.0f));
+    }
+    set_color(unpack_bgra8(packed_color));
+}
+
+fragment fn quad_fs() {
+    return input_color();
+}
