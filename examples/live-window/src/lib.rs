@@ -14,18 +14,18 @@ use std::{
 use anyhow::{Context as _, Result, anyhow, bail};
 use neo_lang::{AddressSpace, TypeName};
 use neo_runtime::{
-    Context as NeoContext, CudaFence, CudaGraph, DataLayout, DeviceBuffer, DrawBackend,
+    Context as NeoContext, CudaFence, CudaGraph, DataLayout, DeviceBuffer, DeviceInfo, DrawBackend,
     DrawDepthMode as RuntimeDrawDepthMode, DrawExecution, DrawIndexedIndirectCommand, DrawPolicy,
     DrawPolicyConfig, GeometryStream, IndexFormat, IndirectDrawBuffer, InstanceAttribute,
     InstanceBuffer, InstanceBufferDesc, InstanceFormat, InstanceLayout, InstanceSemantic,
     InstanceStream, Kernel, LaunchDims, MaterialBindingKind, MaterialFragmentRequirement,
-    MaterialKernel, MaterialKernelAbi, MaterialStream, MaterialVertexRequirement, MeshBuffer,
-    MeshBufferDesc, NeoD3d12InteropDevice, PrimitiveTopology,
-    RasterCullOrder as RuntimeRasterCullOrder, RasterVisibilityMode as RuntimeRasterVisibilityMode,
-    ReadablePinnedHostBuffer, SharedFrameRing, SharedGpuBuffer, SharedInstanceStream,
-    SparseTextureAtlas, SparseTextureDesc, SparseTextureFeedbackSummary, Stream as CudaStream,
-    Target, VertexAttribute, VertexFormat, VertexLayout, VertexSemantic, VisibilityGrid,
-    VisibilityGridDesc, VisibleInstanceStream,
+    MaterialKernel, MaterialKernelAbi, MaterialStream, MaterialStreamFormat,
+    MaterialVertexRequirement, MeshBuffer, MeshBufferDesc, NeoD3d12InteropDevice,
+    PrimitiveTopology, RasterCullOrder as RuntimeRasterCullOrder,
+    RasterVisibilityMode as RuntimeRasterVisibilityMode, ReadablePinnedHostBuffer, SharedFrameRing,
+    SharedGpuBuffer, SharedInstanceStream, SparseTextureAtlas, SparseTextureDesc,
+    SparseTextureFeedbackSummary, Stream as CudaStream, Target, VertexAttribute, VertexFormat,
+    VertexLayout, VertexSemantic, VisibilityGrid, VisibilityGridDesc, VisibleInstanceStream,
 };
 use notify::{Event as NotifyEvent, RecursiveMode, Watcher as _};
 use winit::{
@@ -717,20 +717,29 @@ fn run(mut options: LiveOptions) -> Result<()> {
         .source_path
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", options.source_path.display()))?;
+    let event_loop = EventLoop::new()?;
+    let window = create_window(&event_loop, &options.title, options.width, options.height)?;
+    let neo = NeoContext::new_default_device()?;
+    let device_info = neo.device_info()?;
+    let gpu_preset = options.gpu_preset.resolve(&device_info);
+    let stress_block = options
+        .stress_block
+        .unwrap_or_else(|| gpu_preset.default_stress_block());
+    let sparse_texture_quality = options.sparse_texture_quality.resolve(gpu_preset);
     let instance_source_path = if options.mode == RunMode::InstanceStress {
         options.instance_stress_variant.source_path(
             &source_path,
             options.instance_layout,
             options.instance_materials,
+            options.instance_debug_view,
+            options.sparse_feedback,
+            gpu_preset,
         )
     } else if options.mode == RunMode::DrawStress {
         raster_stress_source_path(&source_path)
     } else {
         source_path.clone()
     };
-    let event_loop = EventLoop::new()?;
-    let window = create_window(&event_loop, &options.title, options.width, options.height)?;
-    let neo = NeoContext::new_default_device()?;
     let mut interop_device = None;
     let presenter_kind = if options.presenter == PresenterKind::D3d12Interop {
         match NeoD3d12InteropDevice::new(&neo) {
@@ -821,11 +830,14 @@ fn run(mut options: LiveOptions) -> Result<()> {
                 interop_device
                     .as_ref()
                     .filter(|_| options.mode == RunMode::DrawStress),
-                options.instance_grid,
-                options.present_ring,
-                options.instance_layout,
-                options.instance_materials,
-                options.sparse_feedback,
+                InstanceStressAssetOptions {
+                    grid: options.instance_grid,
+                    present_ring: options.present_ring,
+                    instance_layout: options.instance_layout,
+                    instance_materials: options.instance_materials,
+                    sparse_feedback: options.sparse_feedback,
+                    sparse_texture_quality,
+                },
             )?)
         } else {
             None
@@ -990,6 +1002,7 @@ fn run(mut options: LiveOptions) -> Result<()> {
                                     present_limiter: &mut interop_present_limiter,
                                     max_inflight,
                                     present_ring: options.present_ring,
+                                    stress_block,
                                 })
                             }
                             _ => Err(anyhow!(
@@ -1026,6 +1039,15 @@ fn run(mut options: LiveOptions) -> Result<()> {
                                 sparse_feedback_summary: instance_assets
                                     .as_ref()
                                     .and_then(|assets| assets.sparse_feedback_summary),
+                                gpu_preset: Some(gpu_preset),
+                                gpu_sm: Some(device_info.sm_label()),
+                                stress_block: Some(stress_block),
+                                sparse_texture_quality: Some(sparse_texture_quality),
+                                kernel_specialization: Some(reload.active.specialization),
+                                material_format: instance_assets
+                                    .as_ref()
+                                    .and_then(|assets| assets.materials.as_ref())
+                                    .map(|materials| materials.format()),
                                 renderer: None,
                                 draw_policy: None,
                                 draw_depth: None,
@@ -1140,6 +1162,12 @@ fn run(mut options: LiveOptions) -> Result<()> {
                                 instance_materials: None,
                                 sparse_feedback: None,
                                 sparse_feedback_summary: None,
+                                gpu_preset: None,
+                                gpu_sm: None,
+                                stress_block: None,
+                                sparse_texture_quality: None,
+                                kernel_specialization: None,
+                                material_format: None,
                                 renderer: Some(options.raster_plan.backend()),
                                 draw_policy: Some(options.raster_plan.draw_policy),
                                 draw_depth: Some(options.raster_plan.depth),
@@ -1228,6 +1256,12 @@ fn run(mut options: LiveOptions) -> Result<()> {
                                 instance_materials: None,
                                 sparse_feedback: None,
                                 sparse_feedback_summary: None,
+                                gpu_preset: None,
+                                gpu_sm: None,
+                                stress_block: None,
+                                sparse_texture_quality: None,
+                                kernel_specialization: None,
+                                material_format: None,
                                 renderer: None,
                                 draw_policy: None,
                                 draw_depth: None,
@@ -1326,6 +1360,12 @@ fn run(mut options: LiveOptions) -> Result<()> {
                                 instance_materials: None,
                                 sparse_feedback: None,
                                 sparse_feedback_summary: None,
+                                gpu_preset: None,
+                                gpu_sm: None,
+                                stress_block: None,
+                                sparse_texture_quality: None,
+                                kernel_specialization: None,
+                                material_format: None,
                                 renderer: None,
                                 draw_policy: None,
                                 draw_depth: None,
@@ -1616,6 +1656,9 @@ struct LiveOptions {
     instance_layout: StressInstanceLayout,
     instance_materials: InstanceMaterials,
     sparse_feedback: SparseFeedbackMode,
+    gpu_preset: GpuPreset,
+    stress_block: Option<StressBlock>,
+    sparse_texture_quality: SparseTextureQuality,
     render_policy: RenderPolicy,
     d3d_upload: D3dUploadMode,
     interop_fallback: InteropFallback,
@@ -1645,6 +1688,9 @@ impl LiveOptions {
             instance_layout: StressInstanceLayout::AoSoA32,
             instance_materials: InstanceMaterials::None,
             sparse_feedback: SparseFeedbackMode::Off,
+            gpu_preset: GpuPreset::Auto,
+            stress_block: None,
+            sparse_texture_quality: SparseTextureQuality::Auto,
             render_policy: RenderPolicy::Auto,
             d3d_upload: D3dUploadMode::MappedCopy,
             interop_fallback: InteropFallback::NoInterop,
@@ -1690,6 +1736,14 @@ impl LiveOptions {
                 "--sparse-feedback" => {
                     options.sparse_feedback = parse_next(&mut args, "--sparse-feedback")?
                 }
+                "--gpu-preset" => options.gpu_preset = parse_next(&mut args, "--gpu-preset")?,
+                "--stress-block" => {
+                    options.stress_block = Some(parse_next(&mut args, "--stress-block")?)
+                }
+                "--sparse-texture-quality" => {
+                    options.sparse_texture_quality =
+                        parse_next(&mut args, "--sparse-texture-quality")?
+                }
                 "--draw-policy" | "--raster-draw-policy" => {
                     options.raster_plan.draw_policy = parse_next(&mut args, arg.as_str())?;
                     options.raster_plan.sync_stock_material_to_draw_policy();
@@ -1719,7 +1773,7 @@ impl LiveOptions {
                 "--hot-reload" => options.hot_reload = true,
                 "--no-hot-reload" => options.hot_reload = false,
                 "--help" | "-h" => bail!(
-                    "usage: neo-live-window [path.neo] [--title TEXT] [--width N] [--height N] [--frames N] [--seconds N] [--presenter d3d12-interop|d3d12|d3d11|gdi] [--mode live|kernel-throughput|mesh-demo|instance-stress|draw-stress|raster-stress] [--sample-every N] [--present-target-fps N] [--kernel-target-fps N] [--max-inflight N] [--present-ring N] [--instance-grid XxYxZ] [--instance-stress-variant baseline|fast|culled|tiled|macrocell] [--instance-debug-view off|tile-range|iterations|hit-miss] [--instance-layout aosoa32|aosoa64] [--instance-materials none|sparse-texture] [--sparse-feedback off|sampled|block|missing|atomic] [--draw-policy draw-all|compute-culled] [--draw-depth auto|on|off] [--cull-order atomic-compact|stable-dense] [--visibility frustum|projected-size] [--min-projected-pixels N] [--render-policy auto|force-render|pause-when-empty] [--d3d-upload mapped-copy|update-subresource] [--interop-fallback no-interop|fail] [--hot-reload|--no-hot-reload]"
+                    "usage: neo-live-window [path.neo] [--title TEXT] [--width N] [--height N] [--frames N] [--seconds N] [--presenter d3d12-interop|d3d12|d3d11|gdi] [--mode live|kernel-throughput|mesh-demo|instance-stress|draw-stress|raster-stress] [--sample-every N] [--present-target-fps N] [--kernel-target-fps N] [--max-inflight N] [--present-ring N] [--instance-grid XxYxZ] [--instance-stress-variant baseline|fast|culled|tiled|macrocell] [--instance-debug-view off|tile-range|iterations|hit-miss] [--instance-layout aosoa32|aosoa64] [--instance-materials none|sparse-texture] [--sparse-feedback off|sampled|block|missing|atomic] [--gpu-preset auto|pascal|modern] [--stress-block WxH] [--sparse-texture-quality auto|full|pascal-fast] [--draw-policy draw-all|compute-culled] [--draw-depth auto|on|off] [--cull-order atomic-compact|stable-dense] [--visibility frustum|projected-size] [--min-projected-pixels N] [--render-policy auto|force-render|pause-when-empty] [--d3d-upload mapped-copy|update-subresource] [--interop-fallback no-interop|fail] [--hot-reload|--no-hot-reload]"
                 ),
                 value if value.starts_with('-') => bail!("unknown option `{value}`"),
                 value => options.source_path = PathBuf::from(value),
@@ -2009,6 +2063,9 @@ impl InstanceStressVariant {
         requested: &Path,
         layout: StressInstanceLayout,
         materials: InstanceMaterials,
+        debug_view: InstanceDebugView,
+        sparse_feedback: SparseFeedbackMode,
+        gpu_preset: ResolvedGpuPreset,
     ) -> PathBuf {
         if requested
             .file_name()
@@ -2028,6 +2085,18 @@ impl InstanceStressVariant {
                 }
                 Self::Macrocell => {
                     if materials == InstanceMaterials::SparseTexture {
+                        if gpu_preset == ResolvedGpuPreset::Pascal
+                            && layout == StressInstanceLayout::AoSoA32
+                            && debug_view == InstanceDebugView::Off
+                            && matches!(
+                                sparse_feedback,
+                                SparseFeedbackMode::Off | SparseFeedbackMode::Sampled
+                            )
+                        {
+                            return requested.with_file_name(
+                                "three_d_instances_macrocell_textured_pascal_aosoa32.neo",
+                            );
+                        }
                         return requested
                             .with_file_name("three_d_instances_macrocell_textured.neo");
                     }
@@ -2163,6 +2232,176 @@ impl std::fmt::Display for SparseFeedbackMode {
             Self::Missing => f.write_str("missing"),
             Self::Atomic => f.write_str("atomic"),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuPreset {
+    Auto,
+    Pascal,
+    Modern,
+}
+
+impl GpuPreset {
+    fn resolve(self, device: &DeviceInfo) -> ResolvedGpuPreset {
+        match self {
+            Self::Pascal => ResolvedGpuPreset::Pascal,
+            Self::Modern => ResolvedGpuPreset::Modern,
+            Self::Auto if device.is_pascal_sm61() => ResolvedGpuPreset::Pascal,
+            Self::Auto => ResolvedGpuPreset::Modern,
+        }
+    }
+}
+
+impl std::str::FromStr for GpuPreset {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "pascal" => Ok(Self::Pascal),
+            "modern" => Ok(Self::Modern),
+            _ => bail!("unknown GPU preset `{value}`; expected auto, pascal, or modern"),
+        }
+    }
+}
+
+impl std::fmt::Display for GpuPreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Pascal => f.write_str("pascal"),
+            Self::Modern => f.write_str("modern"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedGpuPreset {
+    Pascal,
+    Modern,
+}
+
+impl ResolvedGpuPreset {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pascal => "pascal",
+            Self::Modern => "modern",
+        }
+    }
+
+    fn default_stress_block(self) -> StressBlock {
+        match self {
+            Self::Pascal => StressBlock {
+                width: 16,
+                height: 8,
+            },
+            Self::Modern => StressBlock {
+                width: 8,
+                height: 8,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for ResolvedGpuPreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StressBlock {
+    width: u32,
+    height: u32,
+}
+
+impl StressBlock {
+    fn tuple(self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+}
+
+impl std::str::FromStr for StressBlock {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let parts: Vec<_> = value.split('x').collect();
+        if parts.len() != 2 {
+            bail!("invalid --stress-block `{value}`; expected WxH");
+        }
+        let width: u32 = parts[0]
+            .parse()
+            .with_context(|| format!("invalid width in --stress-block `{value}`"))?;
+        let height: u32 = parts[1]
+            .parse()
+            .with_context(|| format!("invalid height in --stress-block `{value}`"))?;
+        if width == 0 || height == 0 {
+            bail!("--stress-block dimensions must be greater than zero");
+        }
+        Ok(Self { width, height })
+    }
+}
+
+impl std::fmt::Display for StressBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}x{}", self.width, self.height)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SparseTextureQuality {
+    Auto,
+    Full,
+    PascalFast,
+}
+
+impl SparseTextureQuality {
+    fn resolve(self, preset: ResolvedGpuPreset) -> ResolvedSparseTextureQuality {
+        match self {
+            Self::Full => ResolvedSparseTextureQuality::Full,
+            Self::PascalFast => ResolvedSparseTextureQuality::PascalFast,
+            Self::Auto if preset == ResolvedGpuPreset::Pascal => {
+                ResolvedSparseTextureQuality::PascalFast
+            }
+            Self::Auto => ResolvedSparseTextureQuality::Full,
+        }
+    }
+}
+
+impl std::str::FromStr for SparseTextureQuality {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "full" => Ok(Self::Full),
+            "pascal-fast" => Ok(Self::PascalFast),
+            _ => bail!(
+                "unknown sparse texture quality `{value}`; expected auto, full, or pascal-fast"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedSparseTextureQuality {
+    Full,
+    PascalFast,
+}
+
+impl ResolvedSparseTextureQuality {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::PascalFast => "pascal-fast",
+        }
+    }
+}
+
+impl std::fmt::Display for ResolvedSparseTextureQuality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
     }
 }
 
@@ -2520,6 +2759,7 @@ struct InstanceKernel {
     tiled: bool,
     macrocell: bool,
     textured: bool,
+    specialization: &'static str,
 }
 
 impl InstanceKernel {
@@ -2531,6 +2771,7 @@ impl InstanceKernel {
     ) -> Result<Self> {
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
+        let specialization = instance_kernel_specialization(path);
         match variant {
             InstanceStressVariant::Baseline
             | InstanceStressVariant::Fast
@@ -2576,7 +2817,21 @@ impl InstanceKernel {
             ),
             macrocell: variant == InstanceStressVariant::Macrocell,
             textured: materials == InstanceMaterials::SparseTexture,
+            specialization,
         })
+    }
+}
+
+fn instance_kernel_specialization(path: &Path) -> &'static str {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some("three_d_instances_macrocell_textured_pascal_aosoa32.neo") => {
+            "pascal-textured-macrocell"
+        }
+        Some("three_d_instances_macrocell_textured.neo") => "generic-textured-macrocell",
+        Some("three_d_instances_macrocell_aosoa32.neo") => "macrocell-aosoa32",
+        Some("three_d_instances_tiled_aosoa32.neo") => "tiled-aosoa32",
+        Some("three_d_instances_tiled_aosoa64.neo") => "tiled-aosoa64",
+        _ => "custom",
     }
 }
 
@@ -3415,16 +3670,23 @@ struct InstanceStressAssets {
     tile_cull_buffers: Vec<DeviceBuffer<u8>>,
 }
 
-fn create_instance_stress_assets(
-    neo: &NeoContext,
-    raster_interop: Option<&NeoD3d12InteropDevice>,
+#[derive(Clone, Copy)]
+struct InstanceStressAssetOptions {
     grid: InstanceGrid,
     present_ring: usize,
     instance_layout: StressInstanceLayout,
     instance_materials: InstanceMaterials,
     sparse_feedback: SparseFeedbackMode,
+    sparse_texture_quality: ResolvedSparseTextureQuality,
+}
+
+fn create_instance_stress_assets(
+    neo: &NeoContext,
+    raster_interop: Option<&NeoD3d12InteropDevice>,
+    options: InstanceStressAssetOptions,
 ) -> Result<InstanceStressAssets> {
     let mesh = create_demo_mesh(neo)?;
+    let grid = options.grid;
     let instance_count = grid
         .count()
         .ok_or_else(|| anyhow!("instance grid count overflow"))?;
@@ -3457,9 +3719,9 @@ fn create_instance_stress_assets(
             ],
         },
     };
-    let data_layout = instance_layout.data_layout();
-    let mut visibility_grids = Vec::with_capacity(present_ring);
-    for _ in 0..present_ring {
+    let data_layout = options.instance_layout.data_layout();
+    let mut visibility_grids = Vec::with_capacity(options.present_ring);
+    for _ in 0..options.present_ring {
         visibility_grids.push(
             VisibilityGrid::upload(
                 neo,
@@ -3475,28 +3737,39 @@ fn create_instance_stress_assets(
         data_layout,
     )
     .context("failed to upload instance stress InstanceBuffer")?;
-    let (sparse_texture, materials) = if instance_materials == InstanceMaterials::SparseTexture {
-        let mut atlas =
-            SparseTextureAtlas::new(neo, SparseTextureDesc::rgba8(16 * 128, 16 * 128, 256))
-                .context("failed to allocate sparse texture atlas")?;
-        atlas
-            .set_feedback_enabled(sparse_feedback.records_feedback())
-            .context("failed to configure sparse texture feedback")?;
-        atlas
-            .upload_checker_pages()
-            .context("failed to upload sparse texture checker pages")?;
-        for page in 0..atlas.virtual_page_count() {
+    let (sparse_texture, materials) =
+        if options.instance_materials == InstanceMaterials::SparseTexture {
+            let mut atlas =
+                SparseTextureAtlas::new(neo, SparseTextureDesc::rgba8(16 * 128, 16 * 128, 256))
+                    .context("failed to allocate sparse texture atlas")?;
             atlas
-                .mark_resident(page, page % atlas.desc().physical_pages)
-                .context("failed to mark sparse texture page resident")?;
-        }
-        let material_ids = create_stress_material_ids(grid)?;
-        let material_stream = MaterialStream::upload(neo, &material_ids)
-            .context("failed to upload material ID stream")?;
-        (Some(atlas), Some(material_stream))
-    } else {
-        (None, None)
-    };
+                .set_feedback_enabled(options.sparse_feedback.records_feedback())
+                .context("failed to configure sparse texture feedback")?;
+            atlas
+                .upload_checker_pages()
+                .context("failed to upload sparse texture checker pages")?;
+            for page in 0..atlas.virtual_page_count() {
+                atlas
+                    .mark_resident(page, page % atlas.desc().physical_pages)
+                    .context("failed to mark sparse texture page resident")?;
+            }
+            if atlas.desc().physical_pages >= atlas.virtual_page_count() {
+                atlas
+                    .set_identity_resident_fast_path(true)
+                    .context("failed to enable sparse texture identity fast path")?;
+            }
+            let material_ids = create_stress_material_ids(grid)?;
+            let material_stream =
+                if options.sparse_texture_quality == ResolvedSparseTextureQuality::PascalFast {
+                    MaterialStream::upload_u16(neo, &material_ids)
+                } else {
+                    MaterialStream::upload(neo, &material_ids)
+                }
+                .context("failed to upload material ID stream")?;
+            (Some(atlas), Some(material_stream))
+        } else {
+            (None, None)
+        };
     let raster_instances = if let Some(interop) = raster_interop {
         Some(
             SharedInstanceStream::upload_typed(
@@ -3512,8 +3785,8 @@ fn create_instance_stress_assets(
         None
     };
     let camera_len = std::mem::size_of::<CameraParams>();
-    let mut camera_buffers = Vec::with_capacity(present_ring);
-    for _ in 0..present_ring {
+    let mut camera_buffers = Vec::with_capacity(options.present_ring);
+    for _ in 0..options.present_ring {
         camera_buffers.push(neo.alloc_zeros(camera_len)?);
     }
     Ok(InstanceStressAssets {
@@ -3867,7 +4140,7 @@ impl CameraController {
     }
 
     fn apply_mouse_delta(&mut self, dx: f32, dy: f32) {
-        self.yaw += dx * 0.003;
+        self.yaw -= dx * 0.003;
         self.pitch = (self.pitch - dy * 0.003).clamp(-1.35, 1.35);
     }
 
@@ -4901,6 +5174,7 @@ struct InstanceStressBatch<'a> {
     present_limiter: &'a mut PresentRateLimiter,
     max_inflight: u32,
     present_ring: usize,
+    stress_block: StressBlock,
 }
 
 fn run_instance_stress_batch(input: InstanceStressBatch<'_>) -> Result<ThroughputBatchStats> {
@@ -4924,7 +5198,11 @@ fn run_instance_stress_batch(input: InstanceStressBatch<'_>) -> Result<Throughpu
             resources.slots.len(),
         )?;
     }
-    let raster_block = if input.kernel.tiled { (8, 8) } else { BLOCK };
+    let raster_block = if input.kernel.tiled {
+        input.stress_block.tuple()
+    } else {
+        BLOCK
+    };
     let dims = LaunchDims::for_2d(kernel_width, input.size.height, raster_block);
     let mut stats = ThroughputBatchStats::default();
     let direct_presenter = match input.presenter {
@@ -5494,6 +5772,12 @@ struct ThroughputLogContext<'a> {
     instance_materials: Option<InstanceMaterials>,
     sparse_feedback: Option<SparseFeedbackMode>,
     sparse_feedback_summary: Option<SparseTextureFeedbackSummary>,
+    gpu_preset: Option<ResolvedGpuPreset>,
+    gpu_sm: Option<String>,
+    stress_block: Option<StressBlock>,
+    sparse_texture_quality: Option<ResolvedSparseTextureQuality>,
+    kernel_specialization: Option<&'a str>,
+    material_format: Option<MaterialStreamFormat>,
     renderer: Option<DrawBackend>,
     draw_policy: Option<HardwareRasterDrawPolicy>,
     draw_depth: Option<DrawDepthMode>,
@@ -5709,6 +5993,31 @@ impl ThroughputCounter {
                 )
             })
             .unwrap_or_default();
+        let gpu_preset_marker = context
+            .gpu_preset
+            .map(|preset| format!(" | gpu_preset {preset}"))
+            .unwrap_or_default();
+        let gpu_sm_marker = context
+            .gpu_sm
+            .as_deref()
+            .map(|sm| format!(" | {sm}"))
+            .unwrap_or_default();
+        let stress_block_marker = context
+            .stress_block
+            .map(|block| format!(" | stress_block {block}"))
+            .unwrap_or_default();
+        let sparse_quality_marker = context
+            .sparse_texture_quality
+            .map(|quality| format!(" | sparse_texture_quality {quality}"))
+            .unwrap_or_default();
+        let specialization_marker = context
+            .kernel_specialization
+            .map(|specialization| format!(" | kernel_specialization {specialization}"))
+            .unwrap_or_default();
+        let material_format_marker = context
+            .material_format
+            .map(|format| format!(" | material_format {}", format.label()))
+            .unwrap_or_default();
         let renderer_marker = context
             .renderer
             .map(|renderer| format!(" | renderer {renderer}"))
@@ -5728,7 +6037,7 @@ impl ThroughputCounter {
         let visibility = context.visibility;
         let frame = context.frame;
         println!(
-            "kernel_fps {kernel_fps:>9.1} | sample_fps {sample_fps:>6.1} | present_fps {present_fps:>6.1} | completed {:>10} | frame {frame:>8} | {}x{} | {mb_frame:>5.1} MB/frame | dtoh {dtoh_gbps:>5.1} GB/s {sample_us:>6.1} us | upload {upload_gbps:>5.1} GB/s map_copy {map_copy_us:>6.1} us | gpu_copy {draw_us:>6.1} us | swap {swap_us:>6.1} us | present {present_us:>6.1} us | launch {launch_us:>5.1} us/k | wait {wait_us:>5.1} us/k | presenter {presenter} | kernel_cap {kernel_cap} | render_policy {render_policy} | visibility {visibility} | kernel {reload_state}{interop_marker}{variant_marker}{layout_marker}{debug_marker}{materials_marker}{sparse_feedback_marker}{sparse_feedback_stats_marker}{renderer_marker}{draw_markers}",
+            "kernel_fps {kernel_fps:>9.1} | sample_fps {sample_fps:>6.1} | present_fps {present_fps:>6.1} | completed {:>10} | frame {frame:>8} | {}x{} | {mb_frame:>5.1} MB/frame | dtoh {dtoh_gbps:>5.1} GB/s {sample_us:>6.1} us | upload {upload_gbps:>5.1} GB/s map_copy {map_copy_us:>6.1} us | gpu_copy {draw_us:>6.1} us | swap {swap_us:>6.1} us | present {present_us:>6.1} us | launch {launch_us:>5.1} us/k | wait {wait_us:>5.1} us/k | presenter {presenter} | kernel_cap {kernel_cap} | render_policy {render_policy} | visibility {visibility} | kernel {reload_state}{interop_marker}{variant_marker}{layout_marker}{debug_marker}{materials_marker}{sparse_feedback_marker}{sparse_feedback_stats_marker}{gpu_preset_marker}{gpu_sm_marker}{stress_block_marker}{sparse_quality_marker}{specialization_marker}{material_format_marker}{renderer_marker}{draw_markers}",
             self.total_completed, context.size.width, context.size.height
         );
         self.completed_since_log = 0;
@@ -8666,6 +8975,11 @@ mod tests {
             "../../stress-quads/three_d_instances_macrocell_textured.neo"
         ))
         .unwrap();
+        let pascal_textured = include_str!(
+            "../../stress-quads/three_d_instances_macrocell_textured_pascal_aosoa32.neo"
+        );
+        validate_textured_macrocell_instance_kernel_abi(pascal_textured).unwrap();
+        assert!(pascal_textured.contains("neo_sparse_sample_bgra8_identity_resident_page"));
         assert!(
             !include_str!("../../stress-quads/three_d_instances_tiled.neo")
                 .contains("instance_cull")
@@ -9543,9 +9857,75 @@ fragment fn quad_fs() {
                 &options.source_path,
                 options.instance_layout,
                 options.instance_materials,
+                options.instance_debug_view,
+                options.sparse_feedback,
+                ResolvedGpuPreset::Modern,
             ),
             PathBuf::from("examples/stress-quads/three_d_instances_macrocell_textured.neo")
         );
+    }
+
+    #[test]
+    fn live_options_accept_pascal_tuning_controls() {
+        let options = LiveOptions::parse(
+            [
+                "--gpu-preset",
+                "pascal",
+                "--stress-block",
+                "16x8",
+                "--sparse-texture-quality",
+                "pascal-fast",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+
+        assert_eq!(options.gpu_preset, GpuPreset::Pascal);
+        assert_eq!(
+            options.stress_block,
+            Some(StressBlock {
+                width: 16,
+                height: 8
+            })
+        );
+        assert_eq!(
+            options.sparse_texture_quality,
+            SparseTextureQuality::PascalFast
+        );
+        let device = DeviceInfo {
+            ordinal: 0,
+            name: "GTX 1070 Ti".to_string(),
+            compute_capability: (6, 1),
+        };
+        let preset = GpuPreset::Auto.resolve(&device);
+        assert_eq!(preset, ResolvedGpuPreset::Pascal);
+        assert_eq!(preset.default_stress_block().to_string(), "16x8");
+        assert_eq!(device.sm_label(), "sm_61");
+        assert_eq!(
+            SparseTextureQuality::Auto.resolve(preset),
+            ResolvedSparseTextureQuality::PascalFast
+        );
+    }
+
+    #[test]
+    fn live_options_reject_invalid_pascal_tuning_controls() {
+        let err = LiveOptions::parse(["--gpu-preset", "fermi"].into_iter().map(String::from))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected auto, pascal, or modern"));
+        let err = LiveOptions::parse(["--stress-block", "16"].into_iter().map(String::from))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected WxH"));
+        let err = LiveOptions::parse(
+            ["--sparse-texture-quality", "ultra"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("expected auto, full, or pascal-fast"));
     }
 
     #[test]
@@ -10018,6 +10398,9 @@ fragment fn quad_fs() {
                 requested,
                 StressInstanceLayout::AoSoA32,
                 InstanceMaterials::None,
+                InstanceDebugView::Off,
+                SparseFeedbackMode::Off,
+                ResolvedGpuPreset::Modern,
             ),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_baseline.neo")
         );
@@ -10026,6 +10409,9 @@ fragment fn quad_fs() {
                 requested,
                 StressInstanceLayout::AoSoA32,
                 InstanceMaterials::None,
+                InstanceDebugView::Off,
+                SparseFeedbackMode::Off,
+                ResolvedGpuPreset::Modern,
             ),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_fast.neo")
         );
@@ -10034,6 +10420,9 @@ fragment fn quad_fs() {
                 requested,
                 StressInstanceLayout::AoSoA32,
                 InstanceMaterials::None,
+                InstanceDebugView::Off,
+                SparseFeedbackMode::Off,
+                ResolvedGpuPreset::Modern,
             ),
             requested.to_path_buf()
         );
@@ -10042,6 +10431,9 @@ fragment fn quad_fs() {
                 requested,
                 StressInstanceLayout::AoSoA32,
                 InstanceMaterials::None,
+                InstanceDebugView::Off,
+                SparseFeedbackMode::Off,
+                ResolvedGpuPreset::Modern,
             ),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_tiled_aosoa32.neo")
         );
@@ -10050,6 +10442,9 @@ fragment fn quad_fs() {
                 requested,
                 StressInstanceLayout::AoSoA64,
                 InstanceMaterials::None,
+                InstanceDebugView::Off,
+                SparseFeedbackMode::Off,
+                ResolvedGpuPreset::Modern,
             ),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_tiled_aosoa64.neo")
         );
@@ -10058,6 +10453,9 @@ fragment fn quad_fs() {
                 requested,
                 StressInstanceLayout::AoSoA32,
                 InstanceMaterials::None,
+                InstanceDebugView::Off,
+                SparseFeedbackMode::Off,
+                ResolvedGpuPreset::Modern,
             ),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_macrocell_aosoa32.neo")
         );
@@ -10066,6 +10464,9 @@ fragment fn quad_fs() {
                 requested,
                 StressInstanceLayout::AoSoA64,
                 InstanceMaterials::None,
+                InstanceDebugView::Off,
+                SparseFeedbackMode::Off,
+                ResolvedGpuPreset::Modern,
             ),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_macrocell_aosoa32.neo")
         );
@@ -10074,8 +10475,24 @@ fragment fn quad_fs() {
                 requested,
                 StressInstanceLayout::AoSoA32,
                 InstanceMaterials::SparseTexture,
+                InstanceDebugView::Off,
+                SparseFeedbackMode::Off,
+                ResolvedGpuPreset::Modern,
             ),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_macrocell_textured.neo")
+        );
+        assert_eq!(
+            InstanceStressVariant::Macrocell.source_path(
+                requested,
+                StressInstanceLayout::AoSoA32,
+                InstanceMaterials::SparseTexture,
+                InstanceDebugView::Off,
+                SparseFeedbackMode::Sampled,
+                ResolvedGpuPreset::Pascal,
+            ),
+            PathBuf::from(
+                "D:/Neo/examples/stress-quads/three_d_instances_macrocell_textured_pascal_aosoa32.neo"
+            )
         );
     }
 
@@ -10249,7 +10666,7 @@ fragment fn quad_fs() {
         camera.begin_mouse_look();
         camera.handle_raw_mouse_delta((std::f32::consts::TAU / 0.003) + 100.0, 0.0);
         assert!(camera.raw_mouse_seen_during_capture);
-        assert!(camera.yaw - start_yaw > std::f32::consts::TAU);
+        assert!(start_yaw - camera.yaw > std::f32::consts::TAU);
     }
 
     #[test]
@@ -10258,9 +10675,9 @@ fragment fn quad_fs() {
         let start_yaw = camera.yaw;
         camera.begin_mouse_look();
         camera.handle_raw_mouse_delta(250.0, 0.0);
-        assert!(camera.yaw > start_yaw);
-        camera.handle_raw_mouse_delta(-500.0, 0.0);
         assert!(camera.yaw < start_yaw);
+        camera.handle_raw_mouse_delta(-500.0, 0.0);
+        assert!(camera.yaw > start_yaw);
     }
 
     #[test]

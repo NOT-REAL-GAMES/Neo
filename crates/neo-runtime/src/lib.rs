@@ -71,6 +71,26 @@ pub struct Context {
     stream: Arc<CudaStream>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub ordinal: usize,
+    pub name: String,
+    pub compute_capability: (i32, i32),
+}
+
+impl DeviceInfo {
+    pub fn sm_label(&self) -> String {
+        format!(
+            "sm_{}{}",
+            self.compute_capability.0, self.compute_capability.1
+        )
+    }
+
+    pub fn is_pascal_sm61(&self) -> bool {
+        self.compute_capability == (6, 1)
+    }
+}
+
 impl Context {
     pub fn new_default_device() -> Result<Self, RuntimeError> {
         let inner = CudaContext::new(0)?;
@@ -132,6 +152,14 @@ impl Context {
         Stream {
             inner: self.stream.clone(),
         }
+    }
+
+    pub fn device_info(&self) -> Result<DeviceInfo, RuntimeError> {
+        Ok(DeviceInfo {
+            ordinal: self.inner.ordinal(),
+            name: self.inner.name()?,
+            compute_capability: self.inner.compute_capability()?,
+        })
     }
 
     /// Disables cudarc's automatic multi-stream event tracking for future allocations.
@@ -315,11 +343,15 @@ const SPARSE_TEXTURE_FORMAT_RGBA8_UNORM: u32 = 1;
 const SPARSE_TEXTURE_ENTRY_RESIDENT: u32 = 1 << 31;
 const SPARSE_TEXTURE_ENTRY_PHYSICAL_MASK: u32 = 0x00ff_ffff;
 const SPARSE_TEXTURE_HEADER_FEEDBACK_FLAGS_U32: usize = 18;
+const SPARSE_TEXTURE_HEADER_FLAGS_U32: usize = 19;
 const SPARSE_TEXTURE_FEEDBACK_ENABLED: u32 = 1;
+const SPARSE_TEXTURE_FLAG_IDENTITY_RESIDENT: u32 = 1;
 
 pub const MATERIAL_STREAM_MAGIC: u32 = 0x4d53_584e;
 pub const MATERIAL_STREAM_VERSION: u32 = 1;
 pub const MATERIAL_STREAM_HEADER_U32S: usize = 8;
+const MATERIAL_STREAM_FORMAT_U32: u32 = 0;
+const MATERIAL_STREAM_FORMAT_U16: u32 = 1;
 
 pub const DEFAULT_AOSOA_GROUP_SIZE: u32 = 32;
 const DATA_LAYOUT_AOS: u32 = 0;
@@ -602,6 +634,36 @@ pub struct SparseTextureFeedbackSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaterialStreamDesc {
     pub material_count: u32,
+    pub format: MaterialStreamFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterialStreamFormat {
+    U32,
+    U16,
+}
+
+impl MaterialStreamFormat {
+    fn code(self) -> u32 {
+        match self {
+            Self::U32 => MATERIAL_STREAM_FORMAT_U32,
+            Self::U16 => MATERIAL_STREAM_FORMAT_U16,
+        }
+    }
+
+    fn byte_len(self) -> usize {
+        match self {
+            Self::U32 => 4,
+            Self::U16 => 2,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::U32 => "u32",
+            Self::U16 => "u16",
+        }
+    }
 }
 
 pub struct MaterialStream {
@@ -850,6 +912,16 @@ impl SparseTextureAtlas {
         )
     }
 
+    pub fn set_identity_resident_fast_path(&mut self, enabled: bool) -> Result<(), RuntimeError> {
+        let flags = if enabled {
+            SPARSE_TEXTURE_FLAG_IDENTITY_RESIDENT
+        } else {
+            0
+        };
+        self.buffer
+            .upload_range(SPARSE_TEXTURE_HEADER_FLAGS_U32 * 4, &flags.to_le_bytes())
+    }
+
     pub fn set_feedback_enabled(&mut self, enabled: bool) -> Result<(), RuntimeError> {
         let flags = if enabled {
             SPARSE_TEXTURE_FEEDBACK_ENABLED
@@ -918,9 +990,22 @@ impl SparseTextureAtlas {
 
 impl MaterialStream {
     pub fn upload(ctx: &Context, material_ids: &[u32]) -> Result<Self, RuntimeError> {
+        Self::upload_with_format(ctx, material_ids, MaterialStreamFormat::U32)
+    }
+
+    pub fn upload_u16(ctx: &Context, material_ids: &[u32]) -> Result<Self, RuntimeError> {
+        Self::upload_with_format(ctx, material_ids, MaterialStreamFormat::U16)
+    }
+
+    pub fn upload_with_format(
+        ctx: &Context,
+        material_ids: &[u32],
+        format: MaterialStreamFormat,
+    ) -> Result<Self, RuntimeError> {
         let desc = MaterialStreamDesc {
             material_count: u32::try_from(material_ids.len())
                 .map_err(|_| RuntimeError::HostBufferTooLarge)?,
+            format,
         };
         let blob = pack_material_stream(&desc, material_ids)?;
         let byte_len = blob.len();
@@ -942,6 +1027,10 @@ impl MaterialStream {
 
     pub fn material_count(&self) -> u32 {
         self.desc.material_count
+    }
+
+    pub fn format(&self) -> MaterialStreamFormat {
+        self.desc.format
     }
 
     pub fn byte_len(&self) -> usize {
@@ -1774,7 +1863,7 @@ fn pack_material_stream(
     let data_offset = MATERIAL_STREAM_HEADER_U32S * 4;
     let data_bytes = material_ids
         .len()
-        .checked_mul(4)
+        .checked_mul(desc.format.byte_len())
         .ok_or(RuntimeError::HostBufferTooLarge)?;
     let total_bytes = data_offset
         .checked_add(data_bytes)
@@ -1786,15 +1875,30 @@ fn pack_material_stream(
         MATERIAL_STREAM_HEADER_U32S as u32 * 4,
         desc.material_count,
         data_offset as u32,
-        0,
+        desc.format.code(),
         0,
         0,
     ];
     for (idx, value) in header.into_iter().enumerate() {
         write_u32_le(&mut blob, idx * 4, value);
     }
-    for (idx, value) in material_ids.iter().copied().enumerate() {
-        write_u32_le(&mut blob, data_offset + idx * 4, value);
+    match desc.format {
+        MaterialStreamFormat::U32 => {
+            for (idx, value) in material_ids.iter().copied().enumerate() {
+                write_u32_le(&mut blob, data_offset + idx * 4, value);
+            }
+        }
+        MaterialStreamFormat::U16 => {
+            for (idx, value) in material_ids.iter().copied().enumerate() {
+                let value = u16::try_from(value).map_err(|_| {
+                    RuntimeError::MaterialStream(format!(
+                        "material ID {value} is too large for u16 material stream"
+                    ))
+                })?;
+                let offset = data_offset + idx * 2;
+                blob[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+            }
+        }
     }
     Ok(blob)
 }
@@ -1813,6 +1917,16 @@ fn validate_material_stream(
             "expected {} material IDs, got {}",
             desc.material_count,
             material_ids.len()
+        )));
+    }
+    if desc.format == MaterialStreamFormat::U16
+        && let Some(value) = material_ids
+            .iter()
+            .copied()
+            .find(|value| *value > u16::MAX as u32)
+    {
+        return Err(RuntimeError::MaterialStream(format!(
+            "material ID {value} is too large for u16 material stream"
         )));
     }
     Ok(())
@@ -2232,7 +2346,7 @@ struct NeoSparseTextureHeader {{
     unsigned int feedback_offset;
     unsigned int feedback_count;
     unsigned int feedback_flags;
-    unsigned int reserved0;
+    unsigned int flags;
 }};
 
 struct NeoMaterialStreamHeader {{
@@ -2241,7 +2355,7 @@ struct NeoMaterialStreamHeader {{
     unsigned int header_bytes;
     unsigned int material_count;
     unsigned int material_ids_offset;
-    unsigned int reserved0;
+    unsigned int format;
     unsigned int reserved1;
     unsigned int reserved2;
 }};
@@ -2262,6 +2376,9 @@ __device__ __forceinline__ unsigned int neo_sparse_material_tile(const unsigned 
     const NeoMaterialStreamHeader* header = (const NeoMaterialStreamHeader*)materials;
     if (id >= header->material_count) {{
         return 0u;
+    }}
+    if (header->format == {MATERIAL_STREAM_FORMAT_U16}u) {{
+        return (unsigned int)((const unsigned short*)(materials + header->material_ids_offset))[id];
     }}
     return ((const unsigned int*)(materials + header->material_ids_offset))[id];
 }}
@@ -2336,6 +2453,12 @@ __device__ __forceinline__ const unsigned char* neo_sparse_texture_page_bytes(co
     return texture + header->physical_pages_offset + physical_page * page_bytes;
 }}
 
+__device__ __forceinline__ const unsigned char* neo_sparse_texture_identity_page_bytes(const unsigned char* texture, unsigned int page_id) {{
+    const NeoSparseTextureHeader* header = neo_sparse_texture_header(texture);
+    unsigned int page_bytes = header->page_size * header->page_size * 4u;
+    return texture + header->physical_pages_offset + page_id * page_bytes;
+}}
+
 __device__ __forceinline__ unsigned int neo_sparse_sample_bgra8_entry(const unsigned char* texture, unsigned int entry, float2 uv) {{
     const NeoSparseTextureHeader* header = neo_sparse_texture_header(texture);
     float wrapped_u = uv.x - floorf(uv.x);
@@ -2350,10 +2473,33 @@ __device__ __forceinline__ unsigned int neo_sparse_sample_bgra8_entry(const unsi
     unsigned int texel_x = gutter + sample_x;
     unsigned int texel_y = gutter + sample_y;
     unsigned int offset = (texel_y * header->page_size + texel_x) * 4u;
-    unsigned int r = page[offset + 0u];
-    unsigned int g = page[offset + 1u];
-    unsigned int b = page[offset + 2u];
-    unsigned int a = page[offset + 3u];
+    unsigned int rgba = ((const unsigned int*)(page + offset))[0];
+    unsigned int r = rgba & 255u;
+    unsigned int g = (rgba >> 8u) & 255u;
+    unsigned int b = (rgba >> 16u) & 255u;
+    unsigned int a = (rgba >> 24u) & 255u;
+    return b | (g << 8u) | (r << 16u) | (a << 24u);
+}}
+
+__device__ __forceinline__ unsigned int neo_sparse_sample_bgra8_identity_resident_page(const unsigned char* texture, unsigned int page_id, float2 uv) {{
+    const NeoSparseTextureHeader* header = neo_sparse_texture_header(texture);
+    float wrapped_u = uv.x - floorf(uv.x);
+    float wrapped_v = uv.y - floorf(uv.y);
+    const unsigned char* page = neo_sparse_texture_identity_page_bytes(texture, page_id);
+    unsigned int gutter = header->gutter;
+    unsigned int usable = header->page_size > gutter * 2u ? header->page_size - gutter * 2u : header->page_size;
+    unsigned int sample_x = (unsigned int)(wrapped_u * (float)usable);
+    unsigned int sample_y = (unsigned int)(wrapped_v * (float)usable);
+    if (sample_x >= usable) sample_x = usable - 1u;
+    if (sample_y >= usable) sample_y = usable - 1u;
+    unsigned int texel_x = gutter + sample_x;
+    unsigned int texel_y = gutter + sample_y;
+    unsigned int offset = (texel_y * header->page_size + texel_x) * 4u;
+    unsigned int rgba = ((const unsigned int*)(page + offset))[0];
+    unsigned int r = rgba & 255u;
+    unsigned int g = (rgba >> 8u) & 255u;
+    unsigned int b = (rgba >> 16u) & 255u;
+    unsigned int a = (rgba >> 24u) & 255u;
     return b | (g << 8u) | (r << 16u) | (a << 24u);
 }}
 
@@ -2367,6 +2513,10 @@ __device__ __forceinline__ unsigned int neo_sparse_sample_bgra8_page(const unsig
 
 __device__ __forceinline__ unsigned int neo_sparse_sample_bgra8(const unsigned char* texture, unsigned int material_id, float2 uv) {{
     unsigned int page_id = neo_sparse_texture_page_id(texture, material_id);
+    const NeoSparseTextureHeader* header = neo_sparse_texture_header(texture);
+    if ((header->flags & {SPARSE_TEXTURE_FLAG_IDENTITY_RESIDENT}u) != 0u && page_id < header->physical_page_count) {{
+        return neo_sparse_sample_bgra8_identity_resident_page(texture, page_id, uv);
+    }}
     return neo_sparse_sample_bgra8_page(texture, page_id, uv);
 }}
 
@@ -5884,7 +6034,10 @@ mod tests {
 
     #[test]
     fn material_stream_packing_is_stable() {
-        let desc = MaterialStreamDesc { material_count: 3 };
+        let desc = MaterialStreamDesc {
+            material_count: 3,
+            format: MaterialStreamFormat::U32,
+        };
         let blob = MaterialStream::pack(&desc, &[7, 9, 11]).unwrap();
         assert_eq!(read_u32_le(&blob, 0), MATERIAL_STREAM_MAGIC);
         assert_eq!(read_u32_le(&blob, 4), MATERIAL_STREAM_VERSION);
@@ -5893,15 +6046,41 @@ mod tests {
             MATERIAL_STREAM_HEADER_U32S as u32 * 4
         );
         assert_eq!(read_u32_le(&blob, 12), 3);
+        assert_eq!(read_u32_le(&blob, 20), MATERIAL_STREAM_FORMAT_U32);
         let data = MATERIAL_STREAM_HEADER_U32S * 4;
         assert_eq!(read_u32_le(&blob, data), 7);
         assert_eq!(read_u32_le(&blob, data + 4), 9);
         assert_eq!(read_u32_le(&blob, data + 8), 11);
+
+        let u16_desc = MaterialStreamDesc {
+            material_count: 3,
+            format: MaterialStreamFormat::U16,
+        };
+        let u16_blob = MaterialStream::pack(&u16_desc, &[7, 9, 11]).unwrap();
+        assert_eq!(read_u32_le(&u16_blob, 20), MATERIAL_STREAM_FORMAT_U16);
+        assert_eq!(
+            u16::from_le_bytes(u16_blob[data..data + 2].try_into().unwrap()),
+            7
+        );
+        assert_eq!(
+            u16::from_le_bytes(u16_blob[data + 2..data + 4].try_into().unwrap()),
+            9
+        );
+        assert!(MaterialStream::pack(&u16_desc, &[u32::from(u16::MAX) + 1, 0, 0]).is_err());
         let err = MaterialStream::pack(&desc, &[1, 2])
             .unwrap_err()
             .to_string();
         assert!(err.contains("expected 3 material IDs"));
-        assert!(MaterialStream::pack(&MaterialStreamDesc { material_count: 0 }, &[]).is_err());
+        assert!(
+            MaterialStream::pack(
+                &MaterialStreamDesc {
+                    material_count: 0,
+                    format: MaterialStreamFormat::U32,
+                },
+                &[],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5977,6 +6156,8 @@ mod tests {
         assert!(prelude.contains("neo_sparse_record_feedback_missing"));
         assert!(prelude.contains("neo_sparse_sample_rgba8"));
         assert!(prelude.contains("neo_sparse_sample_bgra8"));
+        assert!(prelude.contains("neo_sparse_texture_identity_page_bytes"));
+        assert!(prelude.contains("neo_sparse_sample_bgra8_identity_resident_page"));
         assert!(prelude.contains("neo_sparse_sample_bgra8_feedback"));
         assert!(prelude.contains("neo_sparse_sample_bgra8_feedback_mode"));
     }
