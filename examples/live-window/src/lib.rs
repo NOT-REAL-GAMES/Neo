@@ -19,12 +19,13 @@ use neo_runtime::{
     DrawPolicyConfig, GeometryStream, IndexFormat, IndirectDrawBuffer, InstanceAttribute,
     InstanceBuffer, InstanceBufferDesc, InstanceFormat, InstanceLayout, InstanceSemantic,
     InstanceStream, Kernel, LaunchDims, MaterialBindingKind, MaterialFragmentRequirement,
-    MaterialKernel, MaterialKernelAbi, MaterialVertexRequirement, MeshBuffer, MeshBufferDesc,
-    NeoD3d12InteropDevice, PrimitiveTopology, RasterCullOrder as RuntimeRasterCullOrder,
-    RasterVisibilityMode as RuntimeRasterVisibilityMode, ReadablePinnedHostBuffer, SharedFrameRing,
-    SharedGpuBuffer, SharedInstanceStream, Stream as CudaStream, Target, VertexAttribute,
-    VertexFormat, VertexLayout, VertexSemantic, VisibilityGrid, VisibilityGridDesc,
-    VisibleInstanceStream,
+    MaterialKernel, MaterialKernelAbi, MaterialStream, MaterialVertexRequirement, MeshBuffer,
+    MeshBufferDesc, NeoD3d12InteropDevice, PrimitiveTopology,
+    RasterCullOrder as RuntimeRasterCullOrder, RasterVisibilityMode as RuntimeRasterVisibilityMode,
+    ReadablePinnedHostBuffer, SharedFrameRing, SharedGpuBuffer, SharedInstanceStream,
+    SparseTextureAtlas, SparseTextureDesc, SparseTextureFeedbackSummary, Stream as CudaStream,
+    Target, VertexAttribute, VertexFormat, VertexLayout, VertexSemantic, VisibilityGrid,
+    VisibilityGridDesc, VisibleInstanceStream,
 };
 use notify::{Event as NotifyEvent, RecursiveMode, Watcher as _};
 use winit::{
@@ -717,9 +718,11 @@ fn run(mut options: LiveOptions) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", options.source_path.display()))?;
     let instance_source_path = if options.mode == RunMode::InstanceStress {
-        options
-            .instance_stress_variant
-            .source_path(&source_path, options.instance_layout)
+        options.instance_stress_variant.source_path(
+            &source_path,
+            options.instance_layout,
+            options.instance_materials,
+        )
     } else if options.mode == RunMode::DrawStress {
         raster_stress_source_path(&source_path)
     } else {
@@ -792,6 +795,7 @@ fn run(mut options: LiveOptions) -> Result<()> {
             &neo,
             &instance_source_path,
             options.instance_stress_variant,
+            options.instance_materials,
         )?))
     } else {
         None
@@ -820,6 +824,8 @@ fn run(mut options: LiveOptions) -> Result<()> {
                 options.instance_grid,
                 options.present_ring,
                 options.instance_layout,
+                options.instance_materials,
+                options.sparse_feedback,
             )?)
         } else {
             None
@@ -878,6 +884,7 @@ fn run(mut options: LiveOptions) -> Result<()> {
                             &neo,
                             &instance_source_path,
                             options.instance_stress_variant,
+                            options.instance_materials,
                             reload_rx,
                             instance_reload
                                 .as_mut()
@@ -937,8 +944,8 @@ fn run(mut options: LiveOptions) -> Result<()> {
                     camera_params.config = [
                         options.instance_debug_view.code(),
                         options.instance_layout.group_size(),
-                        0,
-                        0,
+                        options.sparse_feedback.code(),
+                        options.sparse_feedback.sample_rate(),
                     ];
                     let visibility = instance_render_visibility(
                         options.render_policy,
@@ -993,6 +1000,16 @@ fn run(mut options: LiveOptions) -> Result<()> {
                     match result {
                         Ok(batch) => {
                             throughput.record(batch);
+                            if throughput.is_log_due()
+                                && let Some(assets) = instance_assets.as_mut()
+                                && let Err(err) = update_sparse_feedback_summary(
+                                    &neo,
+                                    assets,
+                                    options.sparse_feedback,
+                                )
+                            {
+                                eprintln!("sparse feedback error: {err:#}");
+                            }
                             throughput.log_if_due(ThroughputLogContext {
                                 size,
                                 frame,
@@ -1004,6 +1021,11 @@ fn run(mut options: LiveOptions) -> Result<()> {
                                     .as_ref()
                                     .map(|assets| assets.instances.layout_label()),
                                 instance_debug_view: Some(options.instance_debug_view),
+                                instance_materials: Some(options.instance_materials),
+                                sparse_feedback: Some(options.sparse_feedback),
+                                sparse_feedback_summary: instance_assets
+                                    .as_ref()
+                                    .and_then(|assets| assets.sparse_feedback_summary),
                                 renderer: None,
                                 draw_policy: None,
                                 draw_depth: None,
@@ -1115,6 +1137,9 @@ fn run(mut options: LiveOptions) -> Result<()> {
                                     options.raster_plan.instance_stream.layout.to_string(),
                                 ),
                                 instance_debug_view: None,
+                                instance_materials: None,
+                                sparse_feedback: None,
+                                sparse_feedback_summary: None,
                                 renderer: Some(options.raster_plan.backend()),
                                 draw_policy: Some(options.raster_plan.draw_policy),
                                 draw_depth: Some(options.raster_plan.depth),
@@ -1200,6 +1225,9 @@ fn run(mut options: LiveOptions) -> Result<()> {
                                 instance_variant: None,
                                 instance_layout: None,
                                 instance_debug_view: None,
+                                instance_materials: None,
+                                sparse_feedback: None,
+                                sparse_feedback_summary: None,
                                 renderer: None,
                                 draw_policy: None,
                                 draw_depth: None,
@@ -1295,6 +1323,9 @@ fn run(mut options: LiveOptions) -> Result<()> {
                                 instance_variant: None,
                                 instance_layout: None,
                                 instance_debug_view: None,
+                                instance_materials: None,
+                                sparse_feedback: None,
+                                sparse_feedback_summary: None,
                                 renderer: None,
                                 draw_policy: None,
                                 draw_depth: None,
@@ -1583,6 +1614,8 @@ struct LiveOptions {
     instance_stress_variant: InstanceStressVariant,
     instance_debug_view: InstanceDebugView,
     instance_layout: StressInstanceLayout,
+    instance_materials: InstanceMaterials,
+    sparse_feedback: SparseFeedbackMode,
     render_policy: RenderPolicy,
     d3d_upload: D3dUploadMode,
     interop_fallback: InteropFallback,
@@ -1610,6 +1643,8 @@ impl LiveOptions {
             instance_stress_variant: InstanceStressVariant::Tiled,
             instance_debug_view: InstanceDebugView::Off,
             instance_layout: StressInstanceLayout::AoSoA32,
+            instance_materials: InstanceMaterials::None,
+            sparse_feedback: SparseFeedbackMode::Off,
             render_policy: RenderPolicy::Auto,
             d3d_upload: D3dUploadMode::MappedCopy,
             interop_fallback: InteropFallback::NoInterop,
@@ -1649,6 +1684,12 @@ impl LiveOptions {
                 "--instance-layout" => {
                     options.instance_layout = parse_next(&mut args, "--instance-layout")?
                 }
+                "--instance-materials" => {
+                    options.instance_materials = parse_next(&mut args, "--instance-materials")?
+                }
+                "--sparse-feedback" => {
+                    options.sparse_feedback = parse_next(&mut args, "--sparse-feedback")?
+                }
                 "--draw-policy" | "--raster-draw-policy" => {
                     options.raster_plan.draw_policy = parse_next(&mut args, arg.as_str())?;
                     options.raster_plan.sync_stock_material_to_draw_policy();
@@ -1678,7 +1719,7 @@ impl LiveOptions {
                 "--hot-reload" => options.hot_reload = true,
                 "--no-hot-reload" => options.hot_reload = false,
                 "--help" | "-h" => bail!(
-                    "usage: neo-live-window [path.neo] [--title TEXT] [--width N] [--height N] [--frames N] [--seconds N] [--presenter d3d12-interop|d3d12|d3d11|gdi] [--mode live|kernel-throughput|mesh-demo|instance-stress|draw-stress|raster-stress] [--sample-every N] [--present-target-fps N] [--kernel-target-fps N] [--max-inflight N] [--present-ring N] [--instance-grid XxYxZ] [--instance-stress-variant baseline|fast|culled|tiled|macrocell] [--instance-debug-view off|tile-range|iterations|hit-miss] [--instance-layout aosoa32|aosoa64] [--draw-policy draw-all|compute-culled] [--draw-depth auto|on|off] [--cull-order atomic-compact|stable-dense] [--visibility frustum|projected-size] [--min-projected-pixels N] [--render-policy auto|force-render|pause-when-empty] [--d3d-upload mapped-copy|update-subresource] [--interop-fallback no-interop|fail] [--hot-reload|--no-hot-reload]"
+                    "usage: neo-live-window [path.neo] [--title TEXT] [--width N] [--height N] [--frames N] [--seconds N] [--presenter d3d12-interop|d3d12|d3d11|gdi] [--mode live|kernel-throughput|mesh-demo|instance-stress|draw-stress|raster-stress] [--sample-every N] [--present-target-fps N] [--kernel-target-fps N] [--max-inflight N] [--present-ring N] [--instance-grid XxYxZ] [--instance-stress-variant baseline|fast|culled|tiled|macrocell] [--instance-debug-view off|tile-range|iterations|hit-miss] [--instance-layout aosoa32|aosoa64] [--instance-materials none|sparse-texture] [--sparse-feedback off|sampled|block|missing|atomic] [--draw-policy draw-all|compute-culled] [--draw-depth auto|on|off] [--cull-order atomic-compact|stable-dense] [--visibility frustum|projected-size] [--min-projected-pixels N] [--render-policy auto|force-render|pause-when-empty] [--d3d-upload mapped-copy|update-subresource] [--interop-fallback no-interop|fail] [--hot-reload|--no-hot-reload]"
                 ),
                 value if value.starts_with('-') => bail!("unknown option `{value}`"),
                 value => options.source_path = PathBuf::from(value),
@@ -1738,6 +1779,18 @@ impl LiveOptions {
             bail!(
                 "--instance-stress-variant macrocell currently requires --instance-layout aosoa32"
             );
+        }
+        if self.instance_materials == InstanceMaterials::SparseTexture
+            && self.instance_stress_variant != InstanceStressVariant::Macrocell
+        {
+            bail!(
+                "--instance-materials sparse-texture currently requires --instance-stress-variant macrocell"
+            );
+        }
+        if self.sparse_feedback.records_feedback()
+            && self.instance_materials != InstanceMaterials::SparseTexture
+        {
+            bail!("--sparse-feedback requires --instance-materials sparse-texture");
         }
         Ok(())
     }
@@ -1951,7 +2004,12 @@ enum InstanceStressVariant {
 }
 
 impl InstanceStressVariant {
-    fn source_path(self, requested: &Path, layout: StressInstanceLayout) -> PathBuf {
+    fn source_path(
+        self,
+        requested: &Path,
+        layout: StressInstanceLayout,
+        materials: InstanceMaterials,
+    ) -> PathBuf {
         if requested
             .file_name()
             .is_some_and(|name| name == "three_d_instances.neo")
@@ -1969,6 +2027,10 @@ impl InstanceStressVariant {
                     });
                 }
                 Self::Macrocell => {
+                    if materials == InstanceMaterials::SparseTexture {
+                        return requested
+                            .with_file_name("three_d_instances_macrocell_textured.neo");
+                    }
                     return requested.with_file_name("three_d_instances_macrocell_aosoa32.neo");
                 }
             }
@@ -2012,6 +2074,96 @@ enum InstanceDebugView {
     TileRange,
     Iterations,
     HitMiss,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstanceMaterials {
+    None,
+    SparseTexture,
+}
+
+impl std::str::FromStr for InstanceMaterials {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "none" => Ok(Self::None),
+            "sparse-texture" => Ok(Self::SparseTexture),
+            _ => bail!("unknown instance materials `{value}`; expected none or sparse-texture"),
+        }
+    }
+}
+
+impl std::fmt::Display for InstanceMaterials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("none"),
+            Self::SparseTexture => f.write_str("sparse-texture"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SparseFeedbackMode {
+    Off,
+    Sampled,
+    Block,
+    Missing,
+    Atomic,
+}
+
+impl SparseFeedbackMode {
+    fn records_feedback(self) -> bool {
+        self != Self::Off
+    }
+
+    fn code(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Sampled => 1,
+            Self::Block => 2,
+            Self::Missing => 3,
+            Self::Atomic => 4,
+        }
+    }
+
+    fn sample_rate(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Sampled => 16,
+            Self::Block => 64,
+            Self::Missing | Self::Atomic => 1,
+        }
+    }
+}
+
+impl std::str::FromStr for SparseFeedbackMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "off" => Ok(Self::Off),
+            "on" | "sampled" => Ok(Self::Sampled),
+            "block" => Ok(Self::Block),
+            "missing" => Ok(Self::Missing),
+            "atomic" => Ok(Self::Atomic),
+            _ => bail!(
+                "unknown sparse feedback mode `{value}`; expected off, sampled, block, missing, or atomic"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for SparseFeedbackMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => f.write_str("off"),
+            Self::Sampled => f.write_str("sampled"),
+            Self::Block => f.write_str("block"),
+            Self::Missing => f.write_str("missing"),
+            Self::Atomic => f.write_str("atomic"),
+        }
+    }
 }
 
 impl InstanceDebugView {
@@ -2367,10 +2519,16 @@ struct InstanceKernel {
     visibility_prepare: Option<Kernel>,
     tiled: bool,
     macrocell: bool,
+    textured: bool,
 }
 
 impl InstanceKernel {
-    fn compile(ctx: &NeoContext, path: &Path, variant: InstanceStressVariant) -> Result<Self> {
+    fn compile(
+        ctx: &NeoContext,
+        path: &Path,
+        variant: InstanceStressVariant,
+        materials: InstanceMaterials,
+    ) -> Result<Self> {
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         match variant {
@@ -2380,7 +2538,13 @@ impl InstanceKernel {
                 validate_instance_kernel_abi(&source)?;
             }
             InstanceStressVariant::Culled => validate_culled_instance_kernel_abi(&source)?,
-            InstanceStressVariant::Macrocell => validate_macrocell_instance_kernel_abi(&source)?,
+            InstanceStressVariant::Macrocell => {
+                if materials == InstanceMaterials::SparseTexture {
+                    validate_textured_macrocell_instance_kernel_abi(&source)?;
+                } else {
+                    validate_macrocell_instance_kernel_abi(&source)?;
+                }
+            }
         }
         let entrypoints = match variant {
             InstanceStressVariant::Baseline
@@ -2411,6 +2575,7 @@ impl InstanceKernel {
                 InstanceStressVariant::Tiled | InstanceStressVariant::Macrocell
             ),
             macrocell: variant == InstanceStressVariant::Macrocell,
+            textured: materials == InstanceMaterials::SparseTexture,
         })
     }
 }
@@ -2899,6 +3064,49 @@ fn validate_macrocell_instance_kernel_abi(source: &str) -> Result<()> {
     )
 }
 
+fn validate_textured_macrocell_instance_kernel_abi(source: &str) -> Result<()> {
+    let program = neo_lang::parse(source)?;
+    validate_kernel_signature(
+        &program,
+        "instance_visibility_prepare",
+        &[
+            (
+                "visibility",
+                Some(AddressSpace::Global),
+                TypeName::U8,
+                1usize,
+            ),
+            ("camera", Some(AddressSpace::Global), TypeName::U8, 1),
+        ],
+        "textured macrocell visibility prepare kernel",
+        "global u8* visibility, global u8* camera",
+    )?;
+    validate_kernel_signature(
+        &program,
+        "instance_raster",
+        &[
+            ("pixels", Some(AddressSpace::Global), TypeName::U8, 1usize),
+            ("width", None, TypeName::U32, 0),
+            ("height", None, TypeName::U32, 0),
+            ("mesh", Some(AddressSpace::Global), TypeName::U8, 1),
+            ("instances", Some(AddressSpace::Global), TypeName::U8, 1),
+            ("visibility", Some(AddressSpace::Global), TypeName::U8, 1),
+            ("camera", Some(AddressSpace::Global), TypeName::U8, 1),
+            (
+                "sparse_texture",
+                Some(AddressSpace::Global),
+                TypeName::U8,
+                1,
+            ),
+            ("materials", Some(AddressSpace::Global), TypeName::U8, 1),
+            ("time", None, TypeName::F32, 0),
+            ("frame", None, TypeName::U32, 0),
+        ],
+        "textured macrocell instance stress kernel",
+        "global u8* pixels, u32 width, u32 height, global u8* mesh, global u8* instances, global u8* visibility, global u8* camera, global u8* sparse_texture, global u8* materials, f32 time, u32 frame",
+    )
+}
+
 fn validate_kernel_signature(
     program: &neo_lang::Program,
     name: &str,
@@ -3032,6 +3240,7 @@ fn handle_instance_reload_events(
     ctx: &NeoContext,
     source_path: &Path,
     variant: InstanceStressVariant,
+    materials: InstanceMaterials,
     rx: &Receiver<notify::Result<NotifyEvent>>,
     reload: &mut ReloadState<InstanceKernel>,
 ) -> Result<()> {
@@ -3044,7 +3253,12 @@ fn handle_instance_reload_events(
     }
 
     if should_reload {
-        let replaced = reload.try_replace(InstanceKernel::compile(ctx, source_path, variant));
+        let replaced = reload.try_replace(InstanceKernel::compile(
+            ctx,
+            source_path,
+            variant,
+            materials,
+        ));
         if replaced {
             println!("hot reload: compiled {}", source_path.display());
         } else if let Some(err) = &reload.last_error {
@@ -3191,6 +3405,9 @@ struct InstanceStressAssets {
     mesh: MeshBuffer,
     instances: InstanceBuffer,
     visibility_grids: Vec<VisibilityGrid>,
+    sparse_texture: Option<SparseTextureAtlas>,
+    materials: Option<MaterialStream>,
+    sparse_feedback_summary: Option<SparseTextureFeedbackSummary>,
     raster_instances: Option<SharedInstanceStream>,
     camera_buffers: Vec<DeviceBuffer<u8>>,
     tile_cull_width: u32,
@@ -3204,6 +3421,8 @@ fn create_instance_stress_assets(
     grid: InstanceGrid,
     present_ring: usize,
     instance_layout: StressInstanceLayout,
+    instance_materials: InstanceMaterials,
+    sparse_feedback: SparseFeedbackMode,
 ) -> Result<InstanceStressAssets> {
     let mesh = create_demo_mesh(neo)?;
     let instance_count = grid
@@ -3256,6 +3475,28 @@ fn create_instance_stress_assets(
         data_layout,
     )
     .context("failed to upload instance stress InstanceBuffer")?;
+    let (sparse_texture, materials) = if instance_materials == InstanceMaterials::SparseTexture {
+        let mut atlas =
+            SparseTextureAtlas::new(neo, SparseTextureDesc::rgba8(16 * 128, 16 * 128, 256))
+                .context("failed to allocate sparse texture atlas")?;
+        atlas
+            .set_feedback_enabled(sparse_feedback.records_feedback())
+            .context("failed to configure sparse texture feedback")?;
+        atlas
+            .upload_checker_pages()
+            .context("failed to upload sparse texture checker pages")?;
+        for page in 0..atlas.virtual_page_count() {
+            atlas
+                .mark_resident(page, page % atlas.desc().physical_pages)
+                .context("failed to mark sparse texture page resident")?;
+        }
+        let material_ids = create_stress_material_ids(grid)?;
+        let material_stream = MaterialStream::upload(neo, &material_ids)
+            .context("failed to upload material ID stream")?;
+        (Some(atlas), Some(material_stream))
+    } else {
+        (None, None)
+    };
     let raster_instances = if let Some(interop) = raster_interop {
         Some(
             SharedInstanceStream::upload_typed(
@@ -3279,6 +3520,9 @@ fn create_instance_stress_assets(
         mesh,
         instances: instance_buffer,
         visibility_grids,
+        sparse_texture,
+        materials,
+        sparse_feedback_summary: None,
         raster_instances,
         camera_buffers,
         tile_cull_width: 0,
@@ -3369,6 +3613,49 @@ fn create_stress_instances(grid: InstanceGrid) -> Result<Vec<StressInstance>> {
         }
     }
     Ok(instances)
+}
+
+fn create_stress_material_ids(grid: InstanceGrid) -> Result<Vec<u32>> {
+    let count = grid
+        .count()
+        .ok_or_else(|| anyhow!("instance grid count overflow"))? as usize;
+    let mut ids = Vec::with_capacity(count);
+    for z in 0..grid.z {
+        for y in 0..grid.y {
+            for x in 0..grid.x {
+                let tile_x = (x / 8) & 15;
+                let tile_y = (y / 8) & 15;
+                let tile_z = (z / 4) & 15;
+                ids.push((tile_y * 16 + tile_x) ^ tile_z);
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn update_sparse_feedback_summary(
+    neo: &NeoContext,
+    assets: &mut InstanceStressAssets,
+    mode: SparseFeedbackMode,
+) -> Result<()> {
+    if mode == SparseFeedbackMode::Off {
+        assets.sparse_feedback_summary = None;
+        return Ok(());
+    }
+    let Some(atlas) = assets.sparse_texture.as_mut() else {
+        assets.sparse_feedback_summary = None;
+        return Ok(());
+    };
+    neo.synchronize()
+        .context("failed to synchronize before reading sparse texture feedback")?;
+    let summary = atlas
+        .feedback_summary()
+        .context("failed to read sparse texture feedback")?;
+    atlas
+        .clear_feedback()
+        .context("failed to clear sparse texture feedback")?;
+    assets.sparse_feedback_summary = Some(summary);
+    Ok(())
 }
 
 fn quat_from_euler(pitch: f32, yaw: f32, roll: f32) -> [f32; 4] {
@@ -4739,6 +5026,23 @@ fn run_instance_stress_batch(input: InstanceStressBatch<'_>) -> Result<Throughpu
                             .context("missing macrocell visibility grid for interop slot")?,
                     )
                     .arg_buffer(&input.assets.camera_buffers[index]);
+                if input.kernel.textured {
+                    launch
+                        .arg_sparse_texture(
+                            input
+                                .assets
+                                .sparse_texture
+                                .as_ref()
+                                .context("missing sparse texture atlas for textured kernel")?,
+                        )
+                        .arg_materials(
+                            input
+                                .assets
+                                .materials
+                                .as_ref()
+                                .context("missing material stream for textured kernel")?,
+                        );
+                }
             } else {
                 launch
                     .arg_device_ptr(&pixel_arg)
@@ -5187,6 +5491,9 @@ struct ThroughputLogContext<'a> {
     instance_variant: Option<InstanceStressVariant>,
     instance_layout: Option<String>,
     instance_debug_view: Option<InstanceDebugView>,
+    instance_materials: Option<InstanceMaterials>,
+    sparse_feedback: Option<SparseFeedbackMode>,
+    sparse_feedback_summary: Option<SparseTextureFeedbackSummary>,
     renderer: Option<DrawBackend>,
     draw_policy: Option<HardwareRasterDrawPolicy>,
     draw_depth: Option<DrawDepthMode>,
@@ -5293,6 +5600,10 @@ impl ThroughputCounter {
         self.swap_present_accum += batch.swap_present;
     }
 
+    fn is_log_due(&self) -> bool {
+        self.last_log.elapsed() >= Duration::from_secs(1)
+    }
+
     fn log_if_due(&mut self, context: ThroughputLogContext<'_>) {
         let elapsed = self.last_log.elapsed();
         if elapsed < Duration::from_secs(1) {
@@ -5362,6 +5673,42 @@ impl ThroughputCounter {
             .instance_debug_view
             .map(|view| format!(" | instance_debug {view}"))
             .unwrap_or_default();
+        let materials_marker = context
+            .instance_materials
+            .map(|materials| format!(" | materials {materials}"))
+            .unwrap_or_default();
+        let sparse_feedback_marker = context
+            .sparse_feedback
+            .map(|mode| {
+                if matches!(
+                    mode,
+                    SparseFeedbackMode::Sampled | SparseFeedbackMode::Block
+                ) {
+                    format!(
+                        " | sparse_feedback {mode} | feedback_sample_rate {}",
+                        mode.sample_rate()
+                    )
+                } else {
+                    format!(" | sparse_feedback {mode}")
+                }
+            })
+            .unwrap_or_default();
+        let sparse_feedback_stats_marker = context
+            .sparse_feedback_summary
+            .map(|summary| {
+                let hottest = summary
+                    .hottest_page
+                    .map(|page| page.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                format!(
+                    " | feedback_pages {} | feedback_requests {} | feedback_hot_page {} | feedback_hot_count {}",
+                    summary.active_pages,
+                    summary.total_requests,
+                    hottest,
+                    summary.hottest_requests
+                )
+            })
+            .unwrap_or_default();
         let renderer_marker = context
             .renderer
             .map(|renderer| format!(" | renderer {renderer}"))
@@ -5381,7 +5728,7 @@ impl ThroughputCounter {
         let visibility = context.visibility;
         let frame = context.frame;
         println!(
-            "kernel_fps {kernel_fps:>9.1} | sample_fps {sample_fps:>6.1} | present_fps {present_fps:>6.1} | completed {:>10} | frame {frame:>8} | {}x{} | {mb_frame:>5.1} MB/frame | dtoh {dtoh_gbps:>5.1} GB/s {sample_us:>6.1} us | upload {upload_gbps:>5.1} GB/s map_copy {map_copy_us:>6.1} us | gpu_copy {draw_us:>6.1} us | swap {swap_us:>6.1} us | present {present_us:>6.1} us | launch {launch_us:>5.1} us/k | wait {wait_us:>5.1} us/k | presenter {presenter} | kernel_cap {kernel_cap} | render_policy {render_policy} | visibility {visibility} | kernel {reload_state}{interop_marker}{variant_marker}{layout_marker}{debug_marker}{renderer_marker}{draw_markers}",
+            "kernel_fps {kernel_fps:>9.1} | sample_fps {sample_fps:>6.1} | present_fps {present_fps:>6.1} | completed {:>10} | frame {frame:>8} | {}x{} | {mb_frame:>5.1} MB/frame | dtoh {dtoh_gbps:>5.1} GB/s {sample_us:>6.1} us | upload {upload_gbps:>5.1} GB/s map_copy {map_copy_us:>6.1} us | gpu_copy {draw_us:>6.1} us | swap {swap_us:>6.1} us | present {present_us:>6.1} us | launch {launch_us:>5.1} us/k | wait {wait_us:>5.1} us/k | presenter {presenter} | kernel_cap {kernel_cap} | render_policy {render_policy} | visibility {visibility} | kernel {reload_state}{interop_marker}{variant_marker}{layout_marker}{debug_marker}{materials_marker}{sparse_feedback_marker}{sparse_feedback_stats_marker}{renderer_marker}{draw_markers}",
             self.total_completed, context.size.width, context.size.height
         );
         self.completed_since_log = 0;
@@ -8275,6 +8622,17 @@ mod tests {
     }
 
     #[test]
+    fn textured_macrocell_instance_kernel_abi_accepts_sparse_materials() {
+        let source = "kernel fn instance_visibility_prepare(global u8* visibility, global u8* camera) {} kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* mesh, global u8* instances, global u8* visibility, global u8* camera, global u8* sparse_texture, global u8* materials, f32 time, u32 frame) {}";
+        validate_textured_macrocell_instance_kernel_abi(source).unwrap();
+        let missing_materials = "kernel fn instance_visibility_prepare(global u8* visibility, global u8* camera) {} kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* mesh, global u8* instances, global u8* visibility, global u8* camera, global u8* sparse_texture, f32 time, u32 frame) {}";
+        let err = validate_textured_macrocell_instance_kernel_abi(missing_materials)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must have 11 params"));
+    }
+
+    #[test]
     fn instance_stress_kernel_keeps_expected_abi() {
         validate_culled_instance_kernel_abi(include_str!(
             "../../stress-quads/three_d_instances.neo"
@@ -8302,6 +8660,10 @@ mod tests {
         .unwrap();
         validate_macrocell_instance_kernel_abi(include_str!(
             "../../stress-quads/three_d_instances_macrocell_aosoa32.neo"
+        ))
+        .unwrap();
+        validate_textured_macrocell_instance_kernel_abi(include_str!(
+            "../../stress-quads/three_d_instances_macrocell_textured.neo"
         ))
         .unwrap();
         assert!(
@@ -9154,6 +9516,72 @@ fragment fn quad_fs() {
     }
 
     #[test]
+    fn live_options_accept_sparse_texture_materials_for_macrocell() {
+        let options = LiveOptions::parse(
+            [
+                "examples/stress-quads/three_d_instances.neo",
+                "--mode",
+                "instance-stress",
+                "--instance-stress-variant",
+                "macrocell",
+                "--instance-layout",
+                "aosoa32",
+                "--instance-materials",
+                "sparse-texture",
+                "--sparse-feedback",
+                "sampled",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+
+        assert_eq!(options.instance_materials, InstanceMaterials::SparseTexture);
+        assert_eq!(options.sparse_feedback, SparseFeedbackMode::Sampled);
+        assert_eq!(
+            options.instance_stress_variant.source_path(
+                &options.source_path,
+                options.instance_layout,
+                options.instance_materials,
+            ),
+            PathBuf::from("examples/stress-quads/three_d_instances_macrocell_textured.neo")
+        );
+    }
+
+    #[test]
+    fn live_options_reject_sparse_texture_materials_without_macrocell() {
+        let err = LiveOptions::parse(
+            [
+                "--mode",
+                "instance-stress",
+                "--instance-stress-variant",
+                "tiled",
+                "--instance-materials",
+                "sparse-texture",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("sparse-texture currently requires --instance-stress-variant macrocell")
+        );
+    }
+
+    #[test]
+    fn live_options_reject_sparse_feedback_without_sparse_materials() {
+        let err = LiveOptions::parse(
+            ["--sparse-feedback", "sampled"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--sparse-feedback requires --instance-materials sparse-texture"));
+    }
+
+    #[test]
     fn live_options_accept_draw_stress_mode() {
         let options = LiveOptions::parse(
             [
@@ -9278,6 +9706,63 @@ fragment fn quad_fs() {
         );
         let err = "cost".parse::<InstanceDebugView>().unwrap_err().to_string();
         assert!(err.contains("expected off, tile-range, iterations, or hit-miss"));
+    }
+
+    #[test]
+    fn instance_materials_accept_expected_values() {
+        assert_eq!(
+            "none".parse::<InstanceMaterials>().unwrap(),
+            InstanceMaterials::None
+        );
+        assert_eq!(
+            "sparse-texture".parse::<InstanceMaterials>().unwrap(),
+            InstanceMaterials::SparseTexture
+        );
+        assert_eq!(
+            InstanceMaterials::SparseTexture.to_string(),
+            "sparse-texture"
+        );
+        let err = "atlas"
+            .parse::<InstanceMaterials>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected none or sparse-texture"));
+    }
+
+    #[test]
+    fn sparse_feedback_accepts_expected_values() {
+        assert_eq!(
+            "off".parse::<SparseFeedbackMode>().unwrap(),
+            SparseFeedbackMode::Off
+        );
+        assert_eq!(
+            "on".parse::<SparseFeedbackMode>().unwrap(),
+            SparseFeedbackMode::Sampled
+        );
+        assert_eq!(
+            "sampled".parse::<SparseFeedbackMode>().unwrap(),
+            SparseFeedbackMode::Sampled
+        );
+        assert_eq!(
+            "block".parse::<SparseFeedbackMode>().unwrap(),
+            SparseFeedbackMode::Block
+        );
+        assert_eq!(
+            "missing".parse::<SparseFeedbackMode>().unwrap(),
+            SparseFeedbackMode::Missing
+        );
+        assert_eq!(
+            "atomic".parse::<SparseFeedbackMode>().unwrap(),
+            SparseFeedbackMode::Atomic
+        );
+        assert_eq!(SparseFeedbackMode::Sampled.to_string(), "sampled");
+        assert_eq!(SparseFeedbackMode::Sampled.code(), 1);
+        assert_eq!(SparseFeedbackMode::Sampled.sample_rate(), 16);
+        let err = "auto"
+            .parse::<SparseFeedbackMode>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected off, sampled, block, missing, or atomic"));
     }
 
     #[test]
@@ -9529,32 +10014,68 @@ fragment fn quad_fs() {
     fn instance_stress_variant_resolves_stock_sources() {
         let requested = Path::new("D:/Neo/examples/stress-quads/three_d_instances.neo");
         assert_eq!(
-            InstanceStressVariant::Baseline.source_path(requested, StressInstanceLayout::AoSoA32),
+            InstanceStressVariant::Baseline.source_path(
+                requested,
+                StressInstanceLayout::AoSoA32,
+                InstanceMaterials::None,
+            ),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_baseline.neo")
         );
         assert_eq!(
-            InstanceStressVariant::Fast.source_path(requested, StressInstanceLayout::AoSoA32),
+            InstanceStressVariant::Fast.source_path(
+                requested,
+                StressInstanceLayout::AoSoA32,
+                InstanceMaterials::None,
+            ),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_fast.neo")
         );
         assert_eq!(
-            InstanceStressVariant::Culled.source_path(requested, StressInstanceLayout::AoSoA32),
+            InstanceStressVariant::Culled.source_path(
+                requested,
+                StressInstanceLayout::AoSoA32,
+                InstanceMaterials::None,
+            ),
             requested.to_path_buf()
         );
         assert_eq!(
-            InstanceStressVariant::Tiled.source_path(requested, StressInstanceLayout::AoSoA32),
+            InstanceStressVariant::Tiled.source_path(
+                requested,
+                StressInstanceLayout::AoSoA32,
+                InstanceMaterials::None,
+            ),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_tiled_aosoa32.neo")
         );
         assert_eq!(
-            InstanceStressVariant::Tiled.source_path(requested, StressInstanceLayout::AoSoA64),
+            InstanceStressVariant::Tiled.source_path(
+                requested,
+                StressInstanceLayout::AoSoA64,
+                InstanceMaterials::None,
+            ),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_tiled_aosoa64.neo")
         );
         assert_eq!(
-            InstanceStressVariant::Macrocell.source_path(requested, StressInstanceLayout::AoSoA32),
+            InstanceStressVariant::Macrocell.source_path(
+                requested,
+                StressInstanceLayout::AoSoA32,
+                InstanceMaterials::None,
+            ),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_macrocell_aosoa32.neo")
         );
         assert_eq!(
-            InstanceStressVariant::Macrocell.source_path(requested, StressInstanceLayout::AoSoA64),
+            InstanceStressVariant::Macrocell.source_path(
+                requested,
+                StressInstanceLayout::AoSoA64,
+                InstanceMaterials::None,
+            ),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_macrocell_aosoa32.neo")
+        );
+        assert_eq!(
+            InstanceStressVariant::Macrocell.source_path(
+                requested,
+                StressInstanceLayout::AoSoA32,
+                InstanceMaterials::SparseTexture,
+            ),
+            PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_macrocell_textured.neo")
         );
     }
 

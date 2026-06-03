@@ -171,6 +171,119 @@ pub struct InstanceStreamConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseTextureConfig {
+    pub name: String,
+    pub virtual_width: u32,
+    pub virtual_height: u32,
+    pub page_size: u32,
+    pub physical_pages: u32,
+    pub checker_pages: bool,
+    pub feedback: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterialStreamConfig {
+    pub name: String,
+    pub ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseTextureBuilder {
+    virtual_width: u32,
+    virtual_height: u32,
+    page_size: u32,
+    physical_pages: u32,
+    checker_pages: bool,
+    feedback: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterialStreamBuilder {
+    ids: Vec<u32>,
+}
+
+impl Default for SparseTextureBuilder {
+    fn default() -> Self {
+        Self {
+            virtual_width: 2048,
+            virtual_height: 2048,
+            page_size: 128,
+            physical_pages: 256,
+            checker_pages: false,
+            feedback: false,
+        }
+    }
+}
+
+impl SparseTextureBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn virtual_size(mut self, width: u32, height: u32) -> Self {
+        self.virtual_width = width;
+        self.virtual_height = height;
+        self
+    }
+
+    pub fn page_size(mut self, page_size: u32) -> Self {
+        self.page_size = page_size;
+        self
+    }
+
+    pub fn checker_pages(mut self) -> Self {
+        self.checker_pages = true;
+        self
+    }
+
+    pub fn feedback(mut self, enabled: bool) -> Self {
+        self.feedback = enabled;
+        self
+    }
+
+    pub fn page_rgba(self, _page: u32, _rgba: Vec<u8>) -> Self {
+        self
+    }
+
+    fn config(self, name: String) -> SparseTextureConfig {
+        SparseTextureConfig {
+            name,
+            virtual_width: self.virtual_width,
+            virtual_height: self.virtual_height,
+            page_size: self.page_size,
+            physical_pages: self.physical_pages,
+            checker_pages: self.checker_pages,
+            feedback: self.feedback,
+        }
+    }
+}
+
+impl MaterialStreamBuilder {
+    pub fn per_instance_ids(ids: impl Into<Vec<u32>>) -> Self {
+        Self { ids: ids.into() }
+    }
+
+    pub fn procedural_grid_tiles(grid: InstanceGrid) -> Self {
+        let mut ids = Vec::with_capacity(grid.count().unwrap_or(0) as usize);
+        for z in 0..grid.z {
+            for y in 0..grid.y {
+                for x in 0..grid.x {
+                    ids.push(((y / 8) * 16 + (x / 8)) ^ (z / 4));
+                }
+            }
+        }
+        Self { ids }
+    }
+
+    fn config(self, name: String) -> MaterialStreamConfig {
+        MaterialStreamConfig {
+            name,
+            ids: self.ids,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterialSpec {
     pub name: String,
     pub vertex_entrypoint: String,
@@ -1590,12 +1703,14 @@ fn runtime_material_kernel(material: &MaterialSpec) -> RuntimeMaterialKernel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstanceStressVariant {
     Tiled,
+    Macrocell,
 }
 
 impl InstanceStressVariant {
     fn live_window_name(self) -> &'static str {
         match self {
             Self::Tiled => "tiled",
+            Self::Macrocell => "macrocell",
         }
     }
 }
@@ -1722,6 +1837,8 @@ pub struct NeoApp {
     kernels: BTreeMap<String, KernelSpec>,
     geometry_streams: BTreeMap<String, GeometryStreamConfig>,
     instance_streams: BTreeMap<String, InstanceStreamConfig>,
+    sparse_textures: BTreeMap<String, SparseTextureConfig>,
+    material_streams: BTreeMap<String, MaterialStreamConfig>,
     materials: BTreeMap<String, MaterialSpec>,
     targets: BTreeMap<String, TargetConfig>,
     compute_culls: BTreeMap<String, ComputeCullSpec>,
@@ -1735,6 +1852,8 @@ pub struct NeoAppParts {
     pub geometry_streams: BTreeMap<String, GeometryStreamConfig>,
     pub meshes: BTreeMap<String, MeshSpec>,
     pub instance_streams: BTreeMap<String, InstanceStreamConfig>,
+    pub sparse_textures: BTreeMap<String, SparseTextureConfig>,
+    pub material_streams: BTreeMap<String, MaterialStreamConfig>,
     pub materials: BTreeMap<String, MaterialSpec>,
     pub targets: BTreeMap<String, TargetConfig>,
     pub compute_culls: BTreeMap<String, ComputeCullSpec>,
@@ -1773,6 +1892,8 @@ impl NeoApp {
             kernels: BTreeMap::new(),
             geometry_streams: BTreeMap::new(),
             instance_streams: BTreeMap::new(),
+            sparse_textures: BTreeMap::new(),
+            material_streams: BTreeMap::new(),
             materials: BTreeMap::new(),
             targets: BTreeMap::new(),
             compute_culls: BTreeMap::new(),
@@ -1876,6 +1997,28 @@ impl NeoApp {
 
     pub fn instance_stream_config(mut self, config: InstanceStreamConfig) -> Self {
         self.instance_streams.insert(config.name.clone(), config);
+        self
+    }
+
+    pub fn sparse_texture(
+        mut self,
+        name: impl Into<String>,
+        builder: SparseTextureBuilder,
+    ) -> Self {
+        let name = name.into();
+        self.sparse_textures
+            .insert(name.clone(), builder.config(name));
+        self
+    }
+
+    pub fn material_stream(
+        mut self,
+        name: impl Into<String>,
+        builder: MaterialStreamBuilder,
+    ) -> Self {
+        let name = name.into();
+        self.material_streams
+            .insert(name.clone(), builder.config(name));
         self
     }
 
@@ -2666,7 +2809,11 @@ impl NeoApp {
                 visibility: draw.visibility,
                 min_projected_millipixels: draw.min_projected_millipixels,
             },
-            variant: InstanceStressVariant::Tiled,
+            variant: if self.sparse_textures.is_empty() && self.material_streams.is_empty() {
+                InstanceStressVariant::Tiled
+            } else {
+                InstanceStressVariant::Macrocell
+            },
         })
     }
 
@@ -2746,6 +2893,8 @@ impl NeoApp {
             geometry_streams: self.geometry_streams.clone(),
             meshes: self.geometry_streams,
             instance_streams: self.instance_streams,
+            sparse_textures: self.sparse_textures,
+            material_streams: self.material_streams,
             materials: self.materials,
             targets: self.targets,
             compute_culls: self.compute_culls,
@@ -2936,6 +3085,18 @@ impl NeoApp {
             args.push(plan.variant.live_window_name().to_string());
             args.push("--instance-debug-view".to_string());
             args.push("off".to_string());
+            if !self.sparse_textures.is_empty() || !self.material_streams.is_empty() {
+                args.push("--instance-materials".to_string());
+                args.push("sparse-texture".to_string());
+            }
+            if self
+                .sparse_textures
+                .values()
+                .any(|texture| texture.feedback)
+            {
+                args.push("--sparse-feedback".to_string());
+                args.push("sampled".to_string());
+            }
         }
         args.push(if self.config.hot_reload {
             "--hot-reload".to_string()
@@ -3239,6 +3400,62 @@ mod tests {
         assert_eq!(desc.index_count, 6);
         assert_eq!(desc.index_format, IndexFormat::U16);
         assert_eq!(desc.vertex_layout, friendly_vertex_layout());
+    }
+
+    #[test]
+    fn sparse_texture_and_material_builders_export_friendly_configs() {
+        let grid = InstanceGrid::new(16, 16, 8);
+        let app = NeoApp::new()
+            .sparse_texture(
+                "atlas",
+                SparseTextureBuilder::new()
+                    .virtual_size(4096, 2048)
+                    .page_size(128)
+                    .checker_pages()
+                    .feedback(true),
+            )
+            .material_stream(
+                "materials",
+                MaterialStreamBuilder::procedural_grid_tiles(grid),
+            )
+            .geometry_stream("quad", MeshBuilder::quad().colored())
+            .instance_stream("instances", grid)
+            .cuda_tiled_material_kernel(
+                "material",
+                "instance_raster",
+                "examples/stress-quads/three_d_instances.neo",
+            )
+            .draw_cuda_tiled(
+                "main",
+                "quad",
+                "instances",
+                "material",
+                TargetSpec::window(),
+            );
+        let args = app.live_window_args();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--instance-stress-variant", "macrocell"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--instance-materials", "sparse-texture"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--sparse-feedback", "sampled"])
+        );
+        let parts = app.into_parts();
+        let atlas = parts.sparse_textures.get("atlas").unwrap();
+        assert_eq!(atlas.virtual_width, 4096);
+        assert_eq!(atlas.virtual_height, 2048);
+        assert_eq!(atlas.page_size, 128);
+        assert_eq!(atlas.physical_pages, 256);
+        assert!(atlas.checker_pages);
+        assert!(atlas.feedback);
+        let materials = parts.material_streams.get("materials").unwrap();
+        assert_eq!(materials.ids.len(), grid.count().unwrap() as usize);
+        assert_eq!(materials.ids[0], 0);
     }
 
     #[test]

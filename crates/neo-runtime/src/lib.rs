@@ -45,6 +45,10 @@ pub enum RuntimeError {
     Instance(String),
     #[error("visibility grid error: {0}")]
     VisibilityGrid(String),
+    #[error("sparse texture error: {0}")]
+    SparseTexture(String),
+    #[error("material stream error: {0}")]
+    MaterialStream(String),
     #[cfg(windows)]
     #[error("D3D12 interop error: {0}")]
     D3d12Interop(String),
@@ -295,6 +299,22 @@ pub const VISIBILITY_GRID_HEADER_U32S: usize = 8;
 pub const VISIBILITY_GRID_RECORD_U32S: usize = 6;
 pub const DEFAULT_MACROCELL_SIZE: u32 = 8;
 
+pub const SPARSE_TEXTURE_MAGIC: u32 = 0x5354_584e;
+pub const SPARSE_TEXTURE_VERSION: u32 = 1;
+pub const SPARSE_TEXTURE_HEADER_U32S: usize = 20;
+pub const SPARSE_TEXTURE_PAGE_TABLE_ENTRY_U32S: usize = 1;
+pub const DEFAULT_SPARSE_TEXTURE_PAGE_SIZE: u32 = 128;
+pub const DEFAULT_SPARSE_TEXTURE_GUTTER: u32 = 1;
+const SPARSE_TEXTURE_FORMAT_RGBA8_UNORM: u32 = 1;
+const SPARSE_TEXTURE_ENTRY_RESIDENT: u32 = 1 << 31;
+const SPARSE_TEXTURE_ENTRY_PHYSICAL_MASK: u32 = 0x00ff_ffff;
+const SPARSE_TEXTURE_HEADER_FEEDBACK_FLAGS_U32: usize = 18;
+const SPARSE_TEXTURE_FEEDBACK_ENABLED: u32 = 1;
+
+pub const MATERIAL_STREAM_MAGIC: u32 = 0x4d53_584e;
+pub const MATERIAL_STREAM_VERSION: u32 = 1;
+pub const MATERIAL_STREAM_HEADER_U32S: usize = 8;
+
 pub const DEFAULT_AOSOA_GROUP_SIZE: u32 = 32;
 const DATA_LAYOUT_AOS: u32 = 0;
 const DATA_LAYOUT_SOA: u32 = 1;
@@ -514,6 +534,76 @@ pub struct VisibilityGrid {
 
 pub type AccelerationGrid = VisibilityGrid;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparseTextureFormat {
+    Rgba8Unorm,
+}
+
+impl SparseTextureFormat {
+    fn code(self) -> u32 {
+        match self {
+            Self::Rgba8Unorm => SPARSE_TEXTURE_FORMAT_RGBA8_UNORM,
+        }
+    }
+
+    fn bytes_per_pixel(self) -> u32 {
+        match self {
+            Self::Rgba8Unorm => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SparseTextureDesc {
+    pub virtual_width: u32,
+    pub virtual_height: u32,
+    pub page_size: u32,
+    pub mip_count: u32,
+    pub format: SparseTextureFormat,
+    pub physical_pages: u32,
+    pub gutter: u32,
+}
+
+impl SparseTextureDesc {
+    pub fn rgba8(virtual_width: u32, virtual_height: u32, physical_pages: u32) -> Self {
+        Self {
+            virtual_width,
+            virtual_height,
+            page_size: DEFAULT_SPARSE_TEXTURE_PAGE_SIZE,
+            mip_count: 1,
+            format: SparseTextureFormat::Rgba8Unorm,
+            physical_pages,
+            gutter: DEFAULT_SPARSE_TEXTURE_GUTTER,
+        }
+    }
+}
+
+pub struct SparseTextureAtlas {
+    buffer: DeviceBuffer<u8>,
+    desc: SparseTextureDesc,
+    page_dims: [u32; 2],
+    byte_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SparseTextureFeedbackSummary {
+    pub active_pages: u32,
+    pub total_requests: u64,
+    pub hottest_page: Option<u32>,
+    pub hottest_requests: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaterialStreamDesc {
+    pub material_count: u32,
+}
+
+pub struct MaterialStream {
+    buffer: DeviceBuffer<u8>,
+    desc: MaterialStreamDesc,
+    byte_len: usize,
+}
+
 impl StructuredBuffer {
     pub fn upload_aos(
         ctx: &Context,
@@ -694,6 +784,166 @@ impl VisibilityGrid {
 
     pub fn is_empty(&self) -> bool {
         self.byte_len == 0
+    }
+}
+
+impl SparseTextureAtlas {
+    pub fn new(ctx: &Context, desc: SparseTextureDesc) -> Result<Self, RuntimeError> {
+        let blob = pack_sparse_texture(&desc)?;
+        let page_dims = sparse_texture_page_dims(&desc)?;
+        let byte_len = blob.len();
+        let buffer = DeviceBuffer::upload(ctx, &blob)?;
+        Ok(Self {
+            buffer,
+            desc,
+            page_dims,
+            byte_len,
+        })
+    }
+
+    pub fn pack(desc: &SparseTextureDesc) -> Result<Vec<u8>, RuntimeError> {
+        pack_sparse_texture(desc)
+    }
+
+    pub fn upload_page(&mut self, page_index: u32, rgba: &[u8]) -> Result<(), RuntimeError> {
+        let offset = sparse_texture_physical_page_offset(&self.desc, page_index)?;
+        self.validate_page_bytes(rgba)?;
+        self.buffer.upload_range(offset, rgba)
+    }
+
+    pub fn upload_checker_pages(&mut self) -> Result<(), RuntimeError> {
+        let page_bytes = sparse_texture_page_bytes(&self.desc)?;
+        for page in 0..self.desc.physical_pages {
+            let mut rgba = vec![0u8; page_bytes];
+            fill_sparse_checker_page(&self.desc, page, &mut rgba)?;
+            self.upload_page(page, &rgba)?;
+        }
+        Ok(())
+    }
+
+    pub fn mark_resident(
+        &mut self,
+        virtual_page: u32,
+        physical_page: u32,
+    ) -> Result<(), RuntimeError> {
+        validate_sparse_virtual_page(&self.desc, virtual_page)?;
+        validate_sparse_physical_page(&self.desc, physical_page)?;
+        let entry =
+            SPARSE_TEXTURE_ENTRY_RESIDENT | (physical_page & SPARSE_TEXTURE_ENTRY_PHYSICAL_MASK);
+        self.buffer.upload_range(
+            sparse_texture_page_table_offset(virtual_page)?,
+            &entry.to_le_bytes(),
+        )
+    }
+
+    pub fn mark_missing(&mut self, virtual_page: u32) -> Result<(), RuntimeError> {
+        validate_sparse_virtual_page(&self.desc, virtual_page)?;
+        self.buffer.upload_range(
+            sparse_texture_page_table_offset(virtual_page)?,
+            &0u32.to_le_bytes(),
+        )
+    }
+
+    pub fn set_feedback_enabled(&mut self, enabled: bool) -> Result<(), RuntimeError> {
+        let flags = if enabled {
+            SPARSE_TEXTURE_FEEDBACK_ENABLED
+        } else {
+            0
+        };
+        self.buffer.upload_range(
+            SPARSE_TEXTURE_HEADER_FEEDBACK_FLAGS_U32 * 4,
+            &flags.to_le_bytes(),
+        )
+    }
+
+    pub fn clear_feedback(&mut self) -> Result<(), RuntimeError> {
+        let len = sparse_texture_feedback_byte_len(&self.desc)?;
+        let zeros = vec![0u8; len];
+        self.buffer
+            .upload_range(sparse_texture_feedback_offset(&self.desc)?, &zeros)
+    }
+
+    pub fn download_feedback(&self) -> Result<Vec<u32>, RuntimeError> {
+        let len = sparse_texture_feedback_byte_len(&self.desc)?;
+        let mut bytes = vec![0u8; len];
+        self.buffer
+            .download_range(sparse_texture_feedback_offset(&self.desc)?, &mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("feedback chunk is u32")))
+            .collect())
+    }
+
+    pub fn feedback_summary(&self) -> Result<SparseTextureFeedbackSummary, RuntimeError> {
+        summarize_sparse_texture_feedback(&self.download_feedback()?)
+    }
+
+    pub fn desc(&self) -> SparseTextureDesc {
+        self.desc
+    }
+
+    pub fn page_dims(&self) -> [u32; 2] {
+        self.page_dims
+    }
+
+    pub fn virtual_page_count(&self) -> u32 {
+        self.page_dims[0] * self.page_dims[1]
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    pub fn device_ptr_arg(&self) -> CudaDevicePtrArg {
+        self.buffer.device_ptr_arg()
+    }
+
+    fn validate_page_bytes(&self, rgba: &[u8]) -> Result<(), RuntimeError> {
+        let expected = sparse_texture_page_bytes(&self.desc)?;
+        if rgba.len() != expected {
+            return Err(RuntimeError::SparseTexture(format!(
+                "expected {expected} bytes for one sparse texture page, got {}",
+                rgba.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl MaterialStream {
+    pub fn upload(ctx: &Context, material_ids: &[u32]) -> Result<Self, RuntimeError> {
+        let desc = MaterialStreamDesc {
+            material_count: u32::try_from(material_ids.len())
+                .map_err(|_| RuntimeError::HostBufferTooLarge)?,
+        };
+        let blob = pack_material_stream(&desc, material_ids)?;
+        let byte_len = blob.len();
+        let buffer = DeviceBuffer::upload(ctx, &blob)?;
+        Ok(Self {
+            buffer,
+            desc,
+            byte_len,
+        })
+    }
+
+    pub fn pack(desc: &MaterialStreamDesc, material_ids: &[u32]) -> Result<Vec<u8>, RuntimeError> {
+        pack_material_stream(desc, material_ids)
+    }
+
+    pub fn desc(&self) -> MaterialStreamDesc {
+        self.desc
+    }
+
+    pub fn material_count(&self) -> u32 {
+        self.desc.material_count
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    pub fn device_ptr_arg(&self) -> CudaDevicePtrArg {
+        self.buffer.device_ptr_arg()
     }
 }
 
@@ -1237,6 +1487,331 @@ fn validate_visibility_grid_desc(desc: &VisibilityGridDesc) -> Result<(), Runtim
     Ok(())
 }
 
+fn sparse_texture_page_dims(desc: &SparseTextureDesc) -> Result<[u32; 2], RuntimeError> {
+    validate_sparse_texture_desc(desc)?;
+    Ok([
+        desc.virtual_width.div_ceil(desc.page_size),
+        desc.virtual_height.div_ceil(desc.page_size),
+    ])
+}
+
+fn sparse_texture_virtual_page_count(desc: &SparseTextureDesc) -> Result<u32, RuntimeError> {
+    let dims = sparse_texture_page_dims(desc)?;
+    dims[0]
+        .checked_mul(dims[1])
+        .ok_or(RuntimeError::HostBufferTooLarge)
+}
+
+fn sparse_texture_page_bytes(desc: &SparseTextureDesc) -> Result<usize, RuntimeError> {
+    desc.page_size
+        .checked_mul(desc.page_size)
+        .and_then(|pixels| pixels.checked_mul(desc.format.bytes_per_pixel()))
+        .map(|bytes| bytes as usize)
+        .ok_or(RuntimeError::HostBufferTooLarge)
+}
+
+fn sparse_texture_page_table_offset(virtual_page: u32) -> Result<usize, RuntimeError> {
+    let page_offset = usize::try_from(virtual_page)
+        .ok()
+        .and_then(|page| page.checked_mul(SPARSE_TEXTURE_PAGE_TABLE_ENTRY_U32S * 4))
+        .ok_or(RuntimeError::HostBufferTooLarge)?;
+    SPARSE_TEXTURE_HEADER_U32S
+        .checked_mul(4)
+        .and_then(|offset| offset.checked_add(page_offset))
+        .ok_or(RuntimeError::HostBufferTooLarge)
+}
+
+fn sparse_texture_pages_offset(desc: &SparseTextureDesc) -> Result<usize, RuntimeError> {
+    let page_table_bytes = usize::try_from(sparse_texture_virtual_page_count(desc)?)
+        .ok()
+        .and_then(|pages| pages.checked_mul(SPARSE_TEXTURE_PAGE_TABLE_ENTRY_U32S * 4))
+        .ok_or(RuntimeError::HostBufferTooLarge)?;
+    Ok(align_usize(
+        SPARSE_TEXTURE_HEADER_U32S * 4 + page_table_bytes,
+        16,
+    ))
+}
+
+fn sparse_texture_fallback_page_offset(desc: &SparseTextureDesc) -> Result<usize, RuntimeError> {
+    let pages_offset = sparse_texture_pages_offset(desc)?;
+    let page_bytes = sparse_texture_page_bytes(desc)?;
+    let physical_bytes = usize::try_from(desc.physical_pages)
+        .ok()
+        .and_then(|pages| pages.checked_mul(page_bytes))
+        .ok_or(RuntimeError::HostBufferTooLarge)?;
+    pages_offset
+        .checked_add(physical_bytes)
+        .ok_or(RuntimeError::HostBufferTooLarge)
+}
+
+fn sparse_texture_feedback_offset(desc: &SparseTextureDesc) -> Result<usize, RuntimeError> {
+    let fallback_offset = sparse_texture_fallback_page_offset(desc)?;
+    let page_bytes = sparse_texture_page_bytes(desc)?;
+    fallback_offset
+        .checked_add(page_bytes)
+        .map(|offset| align_usize(offset, 16))
+        .ok_or(RuntimeError::HostBufferTooLarge)
+}
+
+fn sparse_texture_feedback_byte_len(desc: &SparseTextureDesc) -> Result<usize, RuntimeError> {
+    usize::try_from(sparse_texture_virtual_page_count(desc)?)
+        .ok()
+        .and_then(|pages| pages.checked_mul(4))
+        .ok_or(RuntimeError::HostBufferTooLarge)
+}
+
+fn sparse_texture_physical_page_offset(
+    desc: &SparseTextureDesc,
+    page_index: u32,
+) -> Result<usize, RuntimeError> {
+    validate_sparse_physical_page(desc, page_index)?;
+    let page_bytes = sparse_texture_page_bytes(desc)?;
+    let page_offset = usize::try_from(page_index)
+        .ok()
+        .and_then(|page| page.checked_mul(page_bytes))
+        .ok_or(RuntimeError::HostBufferTooLarge)?;
+    sparse_texture_pages_offset(desc)?
+        .checked_add(page_offset)
+        .ok_or(RuntimeError::HostBufferTooLarge)
+}
+
+fn pack_sparse_texture(desc: &SparseTextureDesc) -> Result<Vec<u8>, RuntimeError> {
+    validate_sparse_texture_desc(desc)?;
+    let page_dims = sparse_texture_page_dims(desc)?;
+    let virtual_pages = sparse_texture_virtual_page_count(desc)?;
+    let pages_offset = sparse_texture_pages_offset(desc)?;
+    let fallback_offset = sparse_texture_fallback_page_offset(desc)?;
+    let feedback_offset = sparse_texture_feedback_offset(desc)?;
+    let page_bytes = sparse_texture_page_bytes(desc)?;
+    let feedback_bytes = sparse_texture_feedback_byte_len(desc)?;
+    let total_bytes = feedback_offset
+        .checked_add(feedback_bytes)
+        .ok_or(RuntimeError::HostBufferTooLarge)?;
+    let mut blob = vec![0u8; total_bytes];
+    let header = [
+        SPARSE_TEXTURE_MAGIC,
+        SPARSE_TEXTURE_VERSION,
+        SPARSE_TEXTURE_HEADER_U32S as u32 * 4,
+        desc.virtual_width,
+        desc.virtual_height,
+        desc.page_size,
+        page_dims[0],
+        page_dims[1],
+        desc.mip_count,
+        desc.format.code(),
+        virtual_pages,
+        desc.physical_pages,
+        SPARSE_TEXTURE_HEADER_U32S as u32 * 4,
+        pages_offset as u32,
+        fallback_offset as u32,
+        desc.gutter,
+        feedback_offset as u32,
+        virtual_pages,
+        0,
+        0,
+    ];
+    for (idx, value) in header.into_iter().enumerate() {
+        write_u32_le(&mut blob, idx * 4, value);
+    }
+    fill_sparse_fallback_page(
+        desc,
+        &mut blob[fallback_offset..fallback_offset + page_bytes],
+    )?;
+    Ok(blob)
+}
+
+fn validate_sparse_texture_desc(desc: &SparseTextureDesc) -> Result<(), RuntimeError> {
+    if desc.virtual_width == 0 || desc.virtual_height == 0 {
+        return Err(RuntimeError::SparseTexture(
+            "sparse texture dimensions must be greater than zero".to_string(),
+        ));
+    }
+    if desc.page_size == 0 {
+        return Err(RuntimeError::SparseTexture(
+            "sparse texture page size must be greater than zero".to_string(),
+        ));
+    }
+    if desc.mip_count != 1 {
+        return Err(RuntimeError::SparseTexture(
+            "v1 sparse textures support exactly one mip level".to_string(),
+        ));
+    }
+    if desc.physical_pages == 0 {
+        return Err(RuntimeError::SparseTexture(
+            "sparse texture physical page count must be greater than zero".to_string(),
+        ));
+    }
+    if desc.gutter >= desc.page_size / 2 {
+        return Err(RuntimeError::SparseTexture(
+            "sparse texture gutter must leave drawable page texels".to_string(),
+        ));
+    }
+    let _ = sparse_texture_page_bytes(desc)?;
+    Ok(())
+}
+
+fn validate_sparse_virtual_page(
+    desc: &SparseTextureDesc,
+    virtual_page: u32,
+) -> Result<(), RuntimeError> {
+    let pages = sparse_texture_virtual_page_count(desc)?;
+    if virtual_page >= pages {
+        return Err(RuntimeError::SparseTexture(format!(
+            "virtual sparse page {virtual_page} is out of range for {pages} pages"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_sparse_physical_page(
+    desc: &SparseTextureDesc,
+    physical_page: u32,
+) -> Result<(), RuntimeError> {
+    validate_sparse_texture_desc(desc)?;
+    if physical_page >= desc.physical_pages {
+        return Err(RuntimeError::SparseTexture(format!(
+            "physical sparse page {physical_page} is out of range for {} pages",
+            desc.physical_pages
+        )));
+    }
+    Ok(())
+}
+
+fn fill_sparse_checker_page(
+    desc: &SparseTextureDesc,
+    page_index: u32,
+    dst: &mut [u8],
+) -> Result<(), RuntimeError> {
+    let expected = sparse_texture_page_bytes(desc)?;
+    if dst.len() != expected {
+        return Err(RuntimeError::SparseTexture(format!(
+            "expected {expected} checker page bytes, got {}",
+            dst.len()
+        )));
+    }
+    let size = desc.page_size as usize;
+    for y in 0..size {
+        for x in 0..size {
+            let tile = ((x / 16) ^ (y / 16) ^ page_index as usize) & 1;
+            let base = (y * size + x) * 4;
+            let hue = page_index.wrapping_mul(73);
+            dst[base] = if tile == 0 {
+                hue as u8
+            } else {
+                255u8.wrapping_sub(hue as u8)
+            };
+            dst[base + 1] = if tile == 0 {
+                255u8.wrapping_sub((hue >> 1) as u8)
+            } else {
+                (hue >> 1) as u8
+            };
+            dst[base + 2] = if tile == 0 { (hue >> 2) as u8 } else { 255 };
+            dst[base + 3] = 255;
+        }
+    }
+    Ok(())
+}
+
+fn fill_sparse_fallback_page(desc: &SparseTextureDesc, dst: &mut [u8]) -> Result<(), RuntimeError> {
+    let expected = sparse_texture_page_bytes(desc)?;
+    if dst.len() != expected {
+        return Err(RuntimeError::SparseTexture(format!(
+            "expected {expected} fallback page bytes, got {}",
+            dst.len()
+        )));
+    }
+    let size = desc.page_size as usize;
+    for y in 0..size {
+        for x in 0..size {
+            let checker = ((x / 8) ^ (y / 8)) & 1;
+            let base = (y * size + x) * 4;
+            dst[base] = if checker == 0 { 255 } else { 0 };
+            dst[base + 1] = 0;
+            dst[base + 2] = if checker == 0 { 255 } else { 0 };
+            dst[base + 3] = 255;
+        }
+    }
+    Ok(())
+}
+
+fn summarize_sparse_texture_feedback(
+    counters: &[u32],
+) -> Result<SparseTextureFeedbackSummary, RuntimeError> {
+    let mut active_pages = 0u32;
+    let mut total_requests = 0u64;
+    let mut hottest_page = None;
+    let mut hottest_requests = 0u32;
+    for (page, requests) in counters.iter().copied().enumerate() {
+        if requests != 0 {
+            active_pages = active_pages.saturating_add(1);
+            total_requests = total_requests.saturating_add(u64::from(requests));
+            if requests > hottest_requests {
+                hottest_requests = requests;
+                hottest_page =
+                    Some(u32::try_from(page).map_err(|_| RuntimeError::HostBufferTooLarge)?);
+            }
+        }
+    }
+    Ok(SparseTextureFeedbackSummary {
+        active_pages,
+        total_requests,
+        hottest_page,
+        hottest_requests,
+    })
+}
+
+fn pack_material_stream(
+    desc: &MaterialStreamDesc,
+    material_ids: &[u32],
+) -> Result<Vec<u8>, RuntimeError> {
+    validate_material_stream(desc, material_ids)?;
+    let data_offset = MATERIAL_STREAM_HEADER_U32S * 4;
+    let data_bytes = material_ids
+        .len()
+        .checked_mul(4)
+        .ok_or(RuntimeError::HostBufferTooLarge)?;
+    let total_bytes = data_offset
+        .checked_add(data_bytes)
+        .ok_or(RuntimeError::HostBufferTooLarge)?;
+    let mut blob = vec![0u8; total_bytes];
+    let header = [
+        MATERIAL_STREAM_MAGIC,
+        MATERIAL_STREAM_VERSION,
+        MATERIAL_STREAM_HEADER_U32S as u32 * 4,
+        desc.material_count,
+        data_offset as u32,
+        0,
+        0,
+        0,
+    ];
+    for (idx, value) in header.into_iter().enumerate() {
+        write_u32_le(&mut blob, idx * 4, value);
+    }
+    for (idx, value) in material_ids.iter().copied().enumerate() {
+        write_u32_le(&mut blob, data_offset + idx * 4, value);
+    }
+    Ok(blob)
+}
+
+fn validate_material_stream(
+    desc: &MaterialStreamDesc,
+    material_ids: &[u32],
+) -> Result<(), RuntimeError> {
+    if desc.material_count == 0 {
+        return Err(RuntimeError::MaterialStream(
+            "material stream count must be greater than zero".to_string(),
+        ));
+    }
+    if material_ids.len() != desc.material_count as usize {
+        return Err(RuntimeError::MaterialStream(format!(
+            "expected {} material IDs, got {}",
+            desc.material_count,
+            material_ids.len()
+        )));
+    }
+    Ok(())
+}
+
 fn align_usize(value: usize, alignment: usize) -> usize {
     value.div_ceil(alignment) * alignment
 }
@@ -1629,6 +2204,211 @@ __device__ __forceinline__ unsigned int neo_instance_color4u8_attr(const unsigne
 
 __device__ __forceinline__ unsigned int neo_instance_color4u8(const unsigned char* instances, unsigned int instance_id) {{
     return neo_instance_color4u8_attr(instances, neo_instance_color_attr(instances), instance_id);
+}}
+
+struct NeoSparseTextureHeader {{
+    unsigned int magic;
+    unsigned int version;
+    unsigned int header_bytes;
+    unsigned int virtual_width;
+    unsigned int virtual_height;
+    unsigned int page_size;
+    unsigned int page_count_x;
+    unsigned int page_count_y;
+    unsigned int mip_count;
+    unsigned int format;
+    unsigned int virtual_page_count;
+    unsigned int physical_page_count;
+    unsigned int page_table_offset;
+    unsigned int physical_pages_offset;
+    unsigned int fallback_page_offset;
+    unsigned int gutter;
+    unsigned int feedback_offset;
+    unsigned int feedback_count;
+    unsigned int feedback_flags;
+    unsigned int reserved0;
+}};
+
+struct NeoMaterialStreamHeader {{
+    unsigned int magic;
+    unsigned int version;
+    unsigned int header_bytes;
+    unsigned int material_count;
+    unsigned int material_ids_offset;
+    unsigned int reserved0;
+    unsigned int reserved1;
+    unsigned int reserved2;
+}};
+
+__device__ __forceinline__ const NeoSparseTextureHeader* neo_sparse_texture_header(const unsigned char* texture) {{
+    return (const NeoSparseTextureHeader*)texture;
+}}
+
+__device__ __forceinline__ unsigned int neo_sparse_texture_width(const unsigned char* texture) {{
+    return neo_sparse_texture_header(texture)->virtual_width;
+}}
+
+__device__ __forceinline__ unsigned int neo_sparse_texture_height(const unsigned char* texture) {{
+    return neo_sparse_texture_header(texture)->virtual_height;
+}}
+
+__device__ __forceinline__ unsigned int neo_sparse_material_tile(const unsigned char* materials, unsigned int id) {{
+    const NeoMaterialStreamHeader* header = (const NeoMaterialStreamHeader*)materials;
+    if (id >= header->material_count) {{
+        return 0u;
+    }}
+    return ((const unsigned int*)(materials + header->material_ids_offset))[id];
+}}
+
+__device__ __forceinline__ unsigned int neo_sparse_texture_page_entry(const unsigned char* texture, unsigned int page_id) {{
+    const NeoSparseTextureHeader* header = neo_sparse_texture_header(texture);
+    if (page_id >= header->virtual_page_count) {{
+        return 0u;
+    }}
+    return ((const unsigned int*)(texture + header->page_table_offset))[page_id];
+}}
+
+__device__ __forceinline__ unsigned int neo_sparse_texture_page_id(const unsigned char* texture, unsigned int material_id) {{
+    const NeoSparseTextureHeader* header = neo_sparse_texture_header(texture);
+    unsigned int virtual_page_count = header->virtual_page_count == 0u ? 1u : header->virtual_page_count;
+    return material_id % virtual_page_count;
+}}
+
+__device__ __forceinline__ unsigned int neo_sparse_page_id(const unsigned char* texture, unsigned int material_id) {{
+    return neo_sparse_texture_page_id(texture, material_id);
+}}
+
+__device__ __forceinline__ unsigned int neo_sparse_page_resident(const unsigned char* texture, unsigned int page_id) {{
+    const NeoSparseTextureHeader* header = neo_sparse_texture_header(texture);
+    unsigned int entry = neo_sparse_texture_page_entry(texture, page_id);
+    unsigned int physical_page = entry & {SPARSE_TEXTURE_ENTRY_PHYSICAL_MASK}u;
+    return ((entry & {SPARSE_TEXTURE_ENTRY_RESIDENT}u) != 0u && physical_page < header->physical_page_count) ? 1u : 0u;
+}}
+
+__device__ __forceinline__ void neo_sparse_texture_record_feedback(const unsigned char* texture, unsigned int page_id) {{
+    const NeoSparseTextureHeader* header = neo_sparse_texture_header(texture);
+    if ((header->feedback_flags & {SPARSE_TEXTURE_FEEDBACK_ENABLED}u) == 0u || page_id >= header->feedback_count || header->feedback_offset == 0u) {{
+        return;
+    }}
+    unsigned int* feedback = (unsigned int*)(texture + header->feedback_offset);
+    atomicAdd(feedback + page_id, 1u);
+}}
+
+__device__ __forceinline__ unsigned int neo_sparse_feedback_hash(unsigned int page_id, unsigned int x, unsigned int y, unsigned int frame) {{
+    unsigned int h = page_id * 2654435761u ^ x * 2246822519u ^ y * 3266489917u ^ frame * 668265263u;
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    h *= 3266489917u;
+    h ^= h >> 16u;
+    return h;
+}}
+
+__device__ __forceinline__ void neo_sparse_record_feedback_sampled(const unsigned char* texture, unsigned int page_id, unsigned int x, unsigned int y, unsigned int frame, unsigned int sample_rate) {{
+    unsigned int rate = sample_rate == 0u ? 16u : sample_rate;
+    if (rate <= 1u || (neo_sparse_feedback_hash(page_id, x, y, frame) % rate) == 0u) {{
+        neo_sparse_texture_record_feedback(texture, page_id);
+    }}
+}}
+
+__device__ __forceinline__ void neo_sparse_record_feedback_missing(const unsigned char* texture, unsigned int page_id) {{
+    if (neo_sparse_page_resident(texture, page_id) == 0u) {{
+        neo_sparse_texture_record_feedback(texture, page_id);
+    }}
+}}
+
+__device__ __forceinline__ const unsigned char* neo_sparse_texture_page_bytes(const unsigned char* texture, unsigned int entry) {{
+    const NeoSparseTextureHeader* header = neo_sparse_texture_header(texture);
+    unsigned int page_bytes = header->page_size * header->page_size * 4u;
+    if ((entry & {SPARSE_TEXTURE_ENTRY_RESIDENT}u) == 0u) {{
+        return texture + header->fallback_page_offset;
+    }}
+    unsigned int physical_page = entry & {SPARSE_TEXTURE_ENTRY_PHYSICAL_MASK}u;
+    if (physical_page >= header->physical_page_count) {{
+        return texture + header->fallback_page_offset;
+    }}
+    return texture + header->physical_pages_offset + physical_page * page_bytes;
+}}
+
+__device__ __forceinline__ unsigned int neo_sparse_sample_bgra8_entry(const unsigned char* texture, unsigned int entry, float2 uv) {{
+    const NeoSparseTextureHeader* header = neo_sparse_texture_header(texture);
+    float wrapped_u = uv.x - floorf(uv.x);
+    float wrapped_v = uv.y - floorf(uv.y);
+    const unsigned char* page = neo_sparse_texture_page_bytes(texture, entry);
+    unsigned int gutter = header->gutter;
+    unsigned int usable = header->page_size > gutter * 2u ? header->page_size - gutter * 2u : header->page_size;
+    unsigned int sample_x = (unsigned int)(wrapped_u * (float)usable);
+    unsigned int sample_y = (unsigned int)(wrapped_v * (float)usable);
+    if (sample_x >= usable) sample_x = usable - 1u;
+    if (sample_y >= usable) sample_y = usable - 1u;
+    unsigned int texel_x = gutter + sample_x;
+    unsigned int texel_y = gutter + sample_y;
+    unsigned int offset = (texel_y * header->page_size + texel_x) * 4u;
+    unsigned int r = page[offset + 0u];
+    unsigned int g = page[offset + 1u];
+    unsigned int b = page[offset + 2u];
+    unsigned int a = page[offset + 3u];
+    return b | (g << 8u) | (r << 16u) | (a << 24u);
+}}
+
+__device__ __forceinline__ unsigned int neo_sparse_sample_bgra8_page(const unsigned char* texture, unsigned int page_id, float2 uv) {{
+    const NeoSparseTextureHeader* header = neo_sparse_texture_header(texture);
+    unsigned int page_x = page_id % header->page_count_x;
+    unsigned int page_y = page_id / header->page_count_x;
+    unsigned int entry = neo_sparse_texture_page_entry(texture, page_y * header->page_count_x + page_x);
+    return neo_sparse_sample_bgra8_entry(texture, entry, uv);
+}}
+
+__device__ __forceinline__ unsigned int neo_sparse_sample_bgra8(const unsigned char* texture, unsigned int material_id, float2 uv) {{
+    unsigned int page_id = neo_sparse_texture_page_id(texture, material_id);
+    return neo_sparse_sample_bgra8_page(texture, page_id, uv);
+}}
+
+__device__ __forceinline__ unsigned int neo_sparse_sample_bgra8_feedback(const unsigned char* texture, unsigned int material_id, float2 uv) {{
+    unsigned int page_id = neo_sparse_texture_page_id(texture, material_id);
+    neo_sparse_texture_record_feedback(texture, page_id);
+    return neo_sparse_sample_bgra8_page(texture, page_id, uv);
+}}
+
+__device__ __forceinline__ unsigned int neo_sparse_sample_bgra8_feedback_mode(const unsigned char* texture, unsigned int material_id, float2 uv, unsigned int x, unsigned int y, unsigned int frame, unsigned int feedback_mode, unsigned int sample_rate) {{
+    unsigned int page_id = neo_sparse_texture_page_id(texture, material_id);
+    if (feedback_mode == 1u) {{
+        neo_sparse_record_feedback_sampled(texture, page_id, x, y, frame, sample_rate == 0u ? 16u : sample_rate);
+    }} else if (feedback_mode == 2u) {{
+        neo_sparse_record_feedback_sampled(texture, page_id, x, y, frame, sample_rate < 64u ? 64u : sample_rate);
+    }} else if (feedback_mode == 3u) {{
+        neo_sparse_record_feedback_missing(texture, page_id);
+    }} else if (feedback_mode == 4u) {{
+        neo_sparse_texture_record_feedback(texture, page_id);
+    }}
+    return neo_sparse_sample_bgra8_page(texture, page_id, uv);
+}}
+
+__device__ __forceinline__ float4 neo_sparse_sample_rgba8(const unsigned char* texture, unsigned int material_id, float2 uv) {{
+    unsigned int bgra = neo_sparse_sample_bgra8(texture, material_id, uv);
+    return make_float4(
+        (float)((bgra >> 16u) & 255u) / 255.0f,
+        (float)((bgra >> 8u) & 255u) / 255.0f,
+        (float)(bgra & 255u) / 255.0f,
+        (float)((bgra >> 24u) & 255u) / 255.0f);
+}}
+
+__device__ __forceinline__ float4 neo_sparse_sample_rgba8_feedback(const unsigned char* texture, unsigned int material_id, float2 uv) {{
+    unsigned int bgra = neo_sparse_sample_bgra8_feedback(texture, material_id, uv);
+    return make_float4(
+        (float)((bgra >> 16u) & 255u) / 255.0f,
+        (float)((bgra >> 8u) & 255u) / 255.0f,
+        (float)(bgra & 255u) / 255.0f,
+        (float)((bgra >> 24u) & 255u) / 255.0f);
+}}
+
+__device__ __forceinline__ float4 neo_sparse_sample_rgba8_feedback_mode(const unsigned char* texture, unsigned int material_id, float2 uv, unsigned int x, unsigned int y, unsigned int frame, unsigned int feedback_mode, unsigned int sample_rate) {{
+    unsigned int bgra = neo_sparse_sample_bgra8_feedback_mode(texture, material_id, uv, x, y, frame, feedback_mode, sample_rate);
+    return make_float4(
+        (float)((bgra >> 16u) & 255u) / 255.0f,
+        (float)((bgra >> 8u) & 255u) / 255.0f,
+        (float)(bgra & 255u) / 255.0f,
+        (float)((bgra >> 24u) & 255u) / 255.0f);
 }}
 "#
     )
@@ -2226,6 +3006,45 @@ where
         Ok(())
     }
 
+    pub fn download_range(&self, byte_offset: usize, dst: &mut [u8]) -> Result<(), RuntimeError> {
+        self.download_range_on_stream(
+            &Stream {
+                inner: self.inner.stream().clone(),
+            },
+            byte_offset,
+            dst,
+        )
+    }
+
+    pub fn download_range_on_stream(
+        &self,
+        stream: &Stream,
+        byte_offset: usize,
+        dst: &mut [u8],
+    ) -> Result<(), RuntimeError> {
+        use cudarc::driver::DevicePtr as _;
+
+        let end = byte_offset
+            .checked_add(dst.len())
+            .ok_or(RuntimeError::HostBufferTooLarge)?;
+        if end > self.inner.num_bytes() {
+            return Err(RuntimeError::HostBufferTooLarge);
+        }
+        let (src, _record_read) = self.inner.device_ptr(&stream.inner);
+        unsafe {
+            sys::cuMemcpyDtoHAsync_v2(
+                dst.as_mut_ptr().cast(),
+                src + byte_offset as u64,
+                dst.len(),
+                stream.inner.cu_stream(),
+            )
+            .result()
+            .map_err(RuntimeError::Driver)?;
+        }
+        stream.synchronize()?;
+        Ok(())
+    }
+
     pub fn download_into_pinned(&self, dst: &mut PinnedHostBuffer<T>) -> Result<(), RuntimeError> {
         self.inner
             .stream()
@@ -2297,6 +3116,44 @@ where
             sys::cuMemcpyHtoDAsync_v2(dst, src.as_ptr().cast(), byte_len, stream.inner.cu_stream())
                 .result()
                 .map_err(RuntimeError::Driver)?;
+        }
+        Ok(())
+    }
+
+    pub fn upload_range(&mut self, byte_offset: usize, bytes: &[u8]) -> Result<(), RuntimeError> {
+        self.upload_range_on_stream(
+            &Stream {
+                inner: self.inner.stream().clone(),
+            },
+            byte_offset,
+            bytes,
+        )
+    }
+
+    pub fn upload_range_on_stream(
+        &mut self,
+        stream: &Stream,
+        byte_offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), RuntimeError> {
+        use cudarc::driver::DevicePtrMut as _;
+
+        let end = byte_offset
+            .checked_add(bytes.len())
+            .ok_or(RuntimeError::HostBufferTooLarge)?;
+        if end > self.inner.num_bytes() {
+            return Err(RuntimeError::HostBufferTooLarge);
+        }
+        let (dst, _record_write) = self.inner.device_ptr_mut(&stream.inner);
+        unsafe {
+            sys::cuMemcpyHtoDAsync_v2(
+                dst + byte_offset as u64,
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                stream.inner.cu_stream(),
+            )
+            .result()
+            .map_err(RuntimeError::Driver)?;
         }
         Ok(())
     }
@@ -2385,6 +3242,14 @@ impl<'a> KernelLaunch<'a> {
     }
 
     pub fn arg_visibility_grid(&mut self, value: &'a VisibilityGrid) -> &mut Self {
+        self.arg_buffer(&value.buffer)
+    }
+
+    pub fn arg_sparse_texture(&mut self, value: &'a SparseTextureAtlas) -> &mut Self {
+        self.arg_buffer(&value.buffer)
+    }
+
+    pub fn arg_materials(&mut self, value: &'a MaterialStream) -> &mut Self {
         self.arg_buffer(&value.buffer)
     }
 
@@ -4777,6 +5642,137 @@ mod tests {
     }
 
     #[test]
+    fn sparse_texture_header_and_missing_fallback_are_stable() {
+        let desc = SparseTextureDesc {
+            virtual_width: 256,
+            virtual_height: 128,
+            page_size: 64,
+            mip_count: 1,
+            format: SparseTextureFormat::Rgba8Unorm,
+            physical_pages: 3,
+            gutter: 1,
+        };
+        let blob = SparseTextureAtlas::pack(&desc).unwrap();
+        let pages_offset = sparse_texture_pages_offset(&desc).unwrap();
+        let fallback_offset = sparse_texture_fallback_page_offset(&desc).unwrap();
+
+        assert_eq!(read_u32_le(&blob, 0), SPARSE_TEXTURE_MAGIC);
+        assert_eq!(read_u32_le(&blob, 4), SPARSE_TEXTURE_VERSION);
+        assert_eq!(read_u32_le(&blob, 12), 256);
+        assert_eq!(read_u32_le(&blob, 16), 128);
+        assert_eq!(read_u32_le(&blob, 20), 64);
+        assert_eq!(read_u32_le(&blob, 24), 4);
+        assert_eq!(read_u32_le(&blob, 28), 2);
+        assert_eq!(read_u32_le(&blob, 40), 8);
+        assert_eq!(read_u32_le(&blob, 44), 3);
+        assert_eq!(
+            read_u32_le(&blob, 48),
+            SPARSE_TEXTURE_HEADER_U32S as u32 * 4
+        );
+        assert_eq!(read_u32_le(&blob, 52), pages_offset as u32);
+        assert_eq!(read_u32_le(&blob, 56), fallback_offset as u32);
+        assert_eq!(
+            read_u32_le(&blob, 64),
+            sparse_texture_feedback_offset(&desc).unwrap() as u32
+        );
+        assert_eq!(read_u32_le(&blob, 68), 8);
+        assert_eq!(read_u32_le(&blob, 72), 0);
+        assert_eq!(
+            read_u32_le(&blob, sparse_texture_page_table_offset(0).unwrap()),
+            0
+        );
+        assert_eq!(
+            blob[fallback_offset..fallback_offset + 4],
+            [255, 0, 255, 255]
+        );
+        assert!(
+            blob[sparse_texture_feedback_offset(&desc).unwrap()..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert_eq!(
+            blob.len(),
+            sparse_texture_feedback_offset(&desc).unwrap()
+                + sparse_texture_feedback_byte_len(&desc).unwrap()
+        );
+    }
+
+    #[test]
+    fn sparse_texture_feedback_summary_reports_hot_pages() {
+        let summary = summarize_sparse_texture_feedback(&[0, 5, 1, 9, 0]).unwrap();
+        assert_eq!(summary.active_pages, 3);
+        assert_eq!(summary.total_requests, 15);
+        assert_eq!(summary.hottest_page, Some(3));
+        assert_eq!(summary.hottest_requests, 9);
+
+        let summary = summarize_sparse_texture_feedback(&[0, 0, 0]).unwrap();
+        assert_eq!(summary.active_pages, 0);
+        assert_eq!(summary.total_requests, 0);
+        assert_eq!(summary.hottest_page, None);
+        assert_eq!(summary.hottest_requests, 0);
+    }
+
+    #[test]
+    fn sparse_texture_validation_rejects_invalid_descs_and_pages() {
+        assert!(SparseTextureAtlas::pack(&SparseTextureDesc::rgba8(0, 128, 1)).is_err());
+        assert!(SparseTextureAtlas::pack(&SparseTextureDesc::rgba8(128, 128, 0)).is_err());
+        let mut desc = SparseTextureDesc::rgba8(128, 128, 1);
+        desc.page_size = 0;
+        assert!(SparseTextureAtlas::pack(&desc).is_err());
+        desc.page_size = 128;
+        desc.gutter = 64;
+        assert!(SparseTextureAtlas::pack(&desc).is_err());
+        desc.gutter = 1;
+        desc.mip_count = 2;
+        assert!(SparseTextureAtlas::pack(&desc).is_err());
+        desc.mip_count = 1;
+        assert!(validate_sparse_virtual_page(&desc, 1).is_err());
+        assert!(validate_sparse_physical_page(&desc, 1).is_err());
+    }
+
+    #[test]
+    fn sparse_checker_pages_are_deterministic() {
+        let desc = SparseTextureDesc {
+            virtual_width: 128,
+            virtual_height: 128,
+            page_size: 8,
+            mip_count: 1,
+            format: SparseTextureFormat::Rgba8Unorm,
+            physical_pages: 2,
+            gutter: 1,
+        };
+        let mut page0 = vec![0u8; sparse_texture_page_bytes(&desc).unwrap()];
+        let mut page1 = page0.clone();
+        fill_sparse_checker_page(&desc, 0, &mut page0).unwrap();
+        fill_sparse_checker_page(&desc, 1, &mut page1).unwrap();
+        assert_ne!(page0, page1);
+        assert_eq!(&page0[0..4], &[0, 255, 0, 255]);
+        assert_eq!(&page1[0..4], &[182, 36, 255, 255]);
+    }
+
+    #[test]
+    fn material_stream_packing_is_stable() {
+        let desc = MaterialStreamDesc { material_count: 3 };
+        let blob = MaterialStream::pack(&desc, &[7, 9, 11]).unwrap();
+        assert_eq!(read_u32_le(&blob, 0), MATERIAL_STREAM_MAGIC);
+        assert_eq!(read_u32_le(&blob, 4), MATERIAL_STREAM_VERSION);
+        assert_eq!(
+            read_u32_le(&blob, 8),
+            MATERIAL_STREAM_HEADER_U32S as u32 * 4
+        );
+        assert_eq!(read_u32_le(&blob, 12), 3);
+        let data = MATERIAL_STREAM_HEADER_U32S * 4;
+        assert_eq!(read_u32_le(&blob, data), 7);
+        assert_eq!(read_u32_le(&blob, data + 4), 9);
+        assert_eq!(read_u32_le(&blob, data + 8), 11);
+        let err = MaterialStream::pack(&desc, &[1, 2])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected 3 material IDs"));
+        assert!(MaterialStream::pack(&MaterialStreamDesc { material_count: 0 }, &[]).is_err());
+    }
+
+    #[test]
     fn instance_rejects_attribute_extending_past_stride() {
         let mut desc = instance_test_desc(1);
         desc.instance_layout.attributes[1].offset = 32;
@@ -4822,6 +5818,24 @@ mod tests {
         assert!(module.cuda_source.contains("neo_instance_stride"));
         assert!(module.cuda_source.contains("neo_instance_bytes_offset"));
         assert!(module.cuda_source.contains("neo_instance_payload"));
+    }
+
+    #[test]
+    fn runtime_cuda_prelude_includes_sparse_texture_helpers() {
+        let prelude = runtime_cuda_prelude();
+        assert!(prelude.contains("NeoSparseTextureHeader"));
+        assert!(prelude.contains("NeoMaterialStreamHeader"));
+        assert!(prelude.contains("neo_sparse_texture_width"));
+        assert!(prelude.contains("neo_sparse_material_tile"));
+        assert!(prelude.contains("neo_sparse_texture_record_feedback"));
+        assert!(prelude.contains("neo_sparse_page_id"));
+        assert!(prelude.contains("neo_sparse_page_resident"));
+        assert!(prelude.contains("neo_sparse_record_feedback_sampled"));
+        assert!(prelude.contains("neo_sparse_record_feedback_missing"));
+        assert!(prelude.contains("neo_sparse_sample_rgba8"));
+        assert!(prelude.contains("neo_sparse_sample_bgra8"));
+        assert!(prelude.contains("neo_sparse_sample_bgra8_feedback"));
+        assert!(prelude.contains("neo_sparse_sample_bgra8_feedback_mode"));
     }
 
     #[test]
