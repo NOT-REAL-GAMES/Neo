@@ -10,3 +10,8 @@ image.workspace = true
 neo-lang.workspace = true
 thiserror.workspace = true
 windows.workspace = true
+
+[features]
+default = ["cuda-13000"]
+cuda-12060 = ["cudarc/cuda-12060"]
+cuda-13000 = ["cudarc/cuda-13000"]

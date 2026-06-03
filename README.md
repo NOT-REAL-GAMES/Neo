@@ -406,12 +406,35 @@ Neo currently targets Windows + NVIDIA first. A working NVIDIA driver is require
 and NVRTC must be discoverable. `neo doctor` checks `PATH`, `CUDA_PATH`, installed
 CUDA Toolkit folders, and common NVIDIA SDK locations.
 
+CUDA 13 is the default developer build:
+
+```powershell
+cargo run -p neo-quad-stress-3d --release
+```
+
+For older NVIDIA systems that are pinned to CUDA 12.6, build Neo with the CUDA
+12.6 feature path:
+
+```powershell
+cargo run --no-default-features --features cuda-12060 -p neo-quad-stress-3d --release -- --draw-backend cuda-tiled
+```
+
+On a first run, confirm the CUDA 12.6 NVRTC DLL is discoverable:
+
+```powershell
+cargo run --no-default-features --features cuda-12060 -p neo-cli -- doctor
+```
+
+The CUDA tiled path is the recommended compatibility test before trying
+hardware raster experiments.
+
 Recommended verification before pushing changes:
 
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --workspace -- -D warnings
 cargo test --workspace
+cargo test --workspace --no-default-features --features cuda-12060
 ```
 
 ## Aspirations

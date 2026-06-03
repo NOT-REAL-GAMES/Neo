@@ -19,12 +19,12 @@ version = "0.1.0"
 [workspace.dependencies]
 anyhow = "1.0.98"
 clap = { version = "4.5.39", features = ["derive"] }
-cudarc = { version = "0.19.7", default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-13000"] }
+cudarc = { version = "0.19.7", default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading"] }
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 neo-lang = { path = "crates/neo-lang" }
-neo-app = { path = "crates/neo-app" }
-neo-live-window = { path = "examples/live-window" }
-neo-runtime = { path = "crates/neo-runtime" }
+neo-app = { path = "crates/neo-app", default-features = false }
+neo-live-window = { path = "examples/live-window", default-features = false }
+neo-runtime = { path = "crates/neo-runtime", default-features = false }
 notify = "9.0.0-rc.4"
 raw-window-handle = "0.6.2"
 thiserror = "2.0.12"

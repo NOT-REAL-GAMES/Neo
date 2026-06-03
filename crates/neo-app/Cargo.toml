@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-neo-live-window.workspace = true
-neo-runtime.workspace = true
+neo-live-window = { workspace = true, default-features = false }
+neo-runtime = { workspace = true, default-features = false }
 
+[features]
+default = ["cuda-13000"]
+cuda-12060 = ["neo-live-window/cuda-12060", "neo-runtime/cuda-12060"]
+cuda-13000 = ["neo-live-window/cuda-13000", "neo-runtime/cuda-13000"]

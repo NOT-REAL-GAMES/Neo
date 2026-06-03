@@ -6,6 +6,12 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(all(feature = "cuda-12060", feature = "cuda-13000"))]
+compile_error!("Enable exactly one Neo CUDA build feature: cuda-12060 or cuda-13000, not both.");
+
+#[cfg(not(any(feature = "cuda-12060", feature = "cuda-13000")))]
+compile_error!("Enable exactly one Neo CUDA build feature: cuda-12060 or cuda-13000.");
+
 use cudarc::{
     driver::{
         CudaContext, CudaFunction, CudaGraph as CudarcCudaGraph, CudaSlice, CudaStream, DeviceRepr,
@@ -2537,37 +2543,95 @@ fn nvrtc_panic_help(payload: Box<dyn Any + Send>, diagnostics: &RuntimeDiagnosti
     format!("{panic_message}\n\n{}", diagnostics.nvrtc_loader_help())
 }
 
+#[cfg(feature = "cuda-12060")]
+fn expected_cuda_build_label() -> &'static str {
+    "CUDA 12.6"
+}
+
+#[cfg(feature = "cuda-13000")]
+fn expected_cuda_build_label() -> &'static str {
+    "CUDA 13"
+}
+
+#[cfg(windows)]
+fn expected_cuda_path_env_keys() -> &'static [&'static str] {
+    #[cfg(feature = "cuda-12060")]
+    {
+        &["CUDA_PATH_V12_6", "CUDA_PATH_V12_60"]
+    }
+    #[cfg(feature = "cuda-13000")]
+    {
+        &["CUDA_PATH_V13_0"]
+    }
+}
+
+#[cfg(windows)]
+fn active_cuda_path_env_prefix() -> &'static str {
+    #[cfg(feature = "cuda-12060")]
+    {
+        "CUDA_PATH_V12_"
+    }
+    #[cfg(feature = "cuda-13000")]
+    {
+        "CUDA_PATH_V13_"
+    }
+}
+
+#[cfg(windows)]
+fn compatible_nvrtc_names() -> &'static [&'static str] {
+    #[cfg(feature = "cuda-12060")]
+    {
+        &[
+            "nvrtc64_120_0.dll",
+            "nvrtc64_120.dll",
+            "nvrtc64_12.dll",
+            "nvrtc64.dll",
+            "nvrtc.dll",
+        ]
+    }
+    #[cfg(feature = "cuda-13000")]
+    {
+        &[
+            "nvrtc64_130_0.dll",
+            "nvrtc64_130.dll",
+            "nvrtc64_13.dll",
+            "nvrtc64.dll",
+            "nvrtc.dll",
+        ]
+    }
+}
+
 #[cfg(windows)]
 fn nvrtc_candidates() -> Vec<PathBuf> {
-    let names = [
-        "nvrtc.dll",
-        "nvrtc64.dll",
-        "nvrtc64_13.dll",
-        "nvrtc64_130.dll",
-        "nvrtc64_130_0.dll",
-        "nvrtc64_12.dll",
-        "nvrtc64_120.dll",
-        "nvrtc64_120_0.dll",
-        "nvrtc64_11.dll",
-        "nvrtc64_112_0.dll",
-    ];
+    let names = compatible_nvrtc_names();
     let mut dirs = Vec::new();
-    let mut versioned_roots = std::env::vars_os()
-        .filter_map(|(key, root)| {
-            key.to_string_lossy()
-                .starts_with("CUDA_PATH_V")
-                .then(|| PathBuf::from(root))
-        })
-        .collect::<Vec<_>>();
-    versioned_roots.sort_by(|left, right| right.cmp(left));
-    for root in versioned_roots {
-        push_cuda_root_bin_dirs(&mut dirs, root);
+
+    for key in expected_cuda_path_env_keys() {
+        if let Some(root) = std::env::var_os(key) {
+            push_cuda_root_bin_dirs(&mut dirs, PathBuf::from(root));
+        }
     }
     for key in ["CUDA_PATH", "CUDA_HOME"] {
         if let Some(root) = std::env::var_os(key) {
             push_cuda_root_bin_dirs(&mut dirs, PathBuf::from(root));
         }
     }
+
+    let mut active_versioned_roots = std::env::vars_os()
+        .filter_map(|(key, root)| {
+            let key = key.to_string_lossy();
+            let is_exact = expected_cuda_path_env_keys()
+                .iter()
+                .any(|expected| key == *expected);
+            (key.starts_with(active_cuda_path_env_prefix()) && !is_exact)
+                .then(|| PathBuf::from(root))
+        })
+        .collect::<Vec<_>>();
+    active_versioned_roots.sort_by(|left, right| right.cmp(left));
+    for root in active_versioned_roots {
+        push_cuda_root_bin_dirs(&mut dirs, root);
+    }
+
     let mut toolkit_dirs = cuda_toolkit_bin_dirs();
     toolkit_dirs.sort_by(|left, right| right.cmp(left));
     for dir in toolkit_dirs {
@@ -2606,10 +2670,18 @@ fn compatible_nvrtc_candidate(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "nvrtc.dll" | "nvrtc64.dll" | "nvrtc64_13.dll" | "nvrtc64_130.dll" | "nvrtc64_130_0.dll"
-    )
+    let path_text = path.to_string_lossy().to_ascii_lowercase();
+    #[cfg(feature = "cuda-12060")]
+    if path_text.contains("\\cuda\\v13") || path_text.contains("/cuda/v13") {
+        return false;
+    }
+    #[cfg(feature = "cuda-13000")]
+    if path_text.contains("\\cuda\\v12") || path_text.contains("/cuda/v12") {
+        return false;
+    }
+    compatible_nvrtc_names()
+        .iter()
+        .any(|compatible| name.eq_ignore_ascii_case(compatible))
 }
 
 #[cfg(not(windows))]
@@ -2637,6 +2709,20 @@ fn nvrtc_candidates() -> Vec<PathBuf> {
     dirs.into_iter()
         .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
         .collect()
+}
+
+fn expected_nvrtc_library_hint() -> String {
+    #[cfg(windows)]
+    {
+        compatible_nvrtc_names().join(", ")
+    }
+    #[cfg(not(windows))]
+    {
+        format!(
+            "an NVRTC shared library compatible with {}",
+            expected_cuda_build_label()
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2689,18 +2775,24 @@ impl RuntimeDiagnostics {
         }
         if !self.nvrtc_found.is_empty() {
             return format!(
-                "NVRTC was found, but not a CUDA 13-compatible NVRTC for this Neo build.\n\n{}",
+                "NVRTC was found, but not an NVRTC compatible with this Neo {} build.\n\n{}",
+                expected_cuda_build_label(),
                 self.nvrtc_loader_help()
             );
         }
-        "NVRTC shared library was not found. Install the NVIDIA CUDA Toolkit or add the directory containing nvrtc64_130_0.dll/nvrtc64_13.dll, nvrtc64_120_0.dll/nvrtc64_12.dll, or the matching NVRTC DLL to PATH.".to_string()
+        format!(
+            "NVRTC shared library was not found. Install the NVIDIA CUDA Toolkit for {} or add the directory containing {} to PATH.",
+            expected_cuda_build_label(),
+            expected_nvrtc_library_hint()
+        )
     }
 
     pub fn nvrtc_loader_help(&self) -> String {
         if let Some(found) = self.nvrtc_compatible.first() {
             return format!(
-                "Neo found NVRTC at {} and tried to register {} with the process DLL loader. If this still fails, launch Neo from a shell where that CUDA bin directory is on PATH, or set CUDA_PATH/CUDA_PATH_V13_0 to the CUDA Toolkit root before starting Neo.",
+                "Neo found NVRTC at {} for this Neo {} build and tried to register {} with the process DLL loader. If this still fails, launch Neo from a shell where that CUDA bin directory is on PATH, or set the matching CUDA_PATH/CUDA_PATH_V* environment variable to the CUDA Toolkit root before starting Neo.",
                 found.display(),
+                expected_cuda_build_label(),
                 found.parent().unwrap_or_else(|| Path::new("")).display()
             );
         }
@@ -2714,13 +2806,18 @@ impl RuntimeDiagnostics {
                 .collect::<Vec<_>>()
                 .join("\n");
             let checked = if checked.is_empty() {
-                "  - no CUDA 13-compatible candidate names were generated".to_string()
+                format!(
+                    "  - no {}-compatible candidate names were generated",
+                    expected_cuda_build_label()
+                )
             } else {
                 checked
             };
             return format!(
-                "Neo found NVRTC at {}, but this build expects CUDA 13-compatible NVRTC names such as nvrtc64_130_0.dll, nvrtc64_13.dll, or nvrtc.dll from the CUDA Toolkit.\nSet CUDA_PATH_V13_0 or CUDA_PATH to your CUDA 13 Toolkit root before starting Neo.\nChecked CUDA 13-compatible candidates:\n{}",
+                "Neo found NVRTC at {}, but this Neo {} build expects compatible NVRTC names such as {} from the matching CUDA Toolkit.\nSet the matching CUDA_PATH_V* or CUDA_PATH to your CUDA Toolkit root before starting Neo.\nChecked compatible candidates:\n{}",
                 found.display(),
+                expected_cuda_build_label(),
+                expected_nvrtc_library_hint(),
                 checked
             );
         }
@@ -2733,10 +2830,14 @@ impl RuntimeDiagnostics {
             .collect::<Vec<_>>()
             .join("\n");
         if checked.is_empty() {
-            "Neo did not generate any CUDA 13-compatible NVRTC candidate paths. Set CUDA_PATH_V13_0 or CUDA_PATH to your CUDA 13 Toolkit root before starting Neo.".to_string()
+            format!(
+                "Neo did not generate any NVRTC candidate paths compatible with this Neo {} build. Set the matching CUDA_PATH_V* or CUDA_PATH to your CUDA Toolkit root before starting Neo.",
+                expected_cuda_build_label()
+            )
         } else {
             format!(
-                "Neo could not find a CUDA 13-compatible NVRTC DLL. Set CUDA_PATH_V13_0 or CUDA_PATH to your CUDA 13 Toolkit root before starting Neo.\nChecked CUDA 13-compatible candidates:\n{checked}"
+                "Neo could not find an NVRTC DLL compatible with this Neo {} build. Set the matching CUDA_PATH_V* or CUDA_PATH to your CUDA Toolkit root before starting Neo.\nChecked compatible candidates:\n{checked}",
+                expected_cuda_build_label()
             )
         }
     }
@@ -5358,6 +5459,37 @@ pub fn run_image_kernel(
 mod tests {
     use super::*;
 
+    fn module_from_neo_source_or_skip(
+        ctx: &Context,
+        source: &str,
+        entrypoints: &[&str],
+        label: &str,
+    ) -> Option<Module> {
+        match Module::from_neo_source(ctx, source, entrypoints) {
+            Ok(module) => Some(module),
+            Err(RuntimeError::Nvrtc(err)) => {
+                eprintln!("skipping {label} without usable NVRTC: {err}");
+                None
+            }
+            Err(err) => panic!("{label} failed unexpectedly: {err}"),
+        }
+    }
+
+    fn module_from_cuda_source_or_skip(
+        ctx: &Context,
+        source: String,
+        label: &str,
+    ) -> Option<Module> {
+        match Module::from_cuda_source(ctx, source) {
+            Ok(module) => Some(module),
+            Err(RuntimeError::Nvrtc(err)) => {
+                eprintln!("skipping {label} without usable NVRTC: {err}");
+                None
+            }
+            Err(err) => panic!("{label} failed unexpectedly: {err}"),
+        }
+    }
+
     fn mesh_test_desc(index_format: IndexFormat, index_count: u32) -> MeshBufferDesc {
         MeshBufferDesc {
             vertex_count: 4,
@@ -5795,7 +5927,11 @@ mod tests {
                 return;
             }
         };
-        let module = Module::from_neo_source(&ctx, source, &["inspect"]).unwrap();
+        let Some(module) =
+            module_from_neo_source_or_skip(&ctx, source, &["inspect"], "mesh prelude compile test")
+        else {
+            return;
+        };
         assert!(module.cuda_source.contains("NeoMeshHeader"));
         assert!(module.cuda_source.contains("neo_mesh_vertex_count"));
     }
@@ -5812,7 +5948,14 @@ mod tests {
                 return;
             }
         };
-        let module = Module::from_neo_source(&ctx, source, &["inspect"]).unwrap();
+        let Some(module) = module_from_neo_source_or_skip(
+            &ctx,
+            source,
+            &["inspect"],
+            "instance prelude compile test",
+        ) else {
+            return;
+        };
         assert!(module.cuda_source.contains("NeoInstanceHeader"));
         assert!(module.cuda_source.contains("neo_instance_count"));
         assert!(module.cuda_source.contains("neo_instance_stride"));
@@ -5868,12 +6011,14 @@ mod tests {
             &[] as &[u16],
         )
         .unwrap();
-        let module = Module::from_neo_source(
+        let Some(module) = module_from_neo_source_or_skip(
             &ctx,
             "kernel fn inspect(global u8* mesh) { let count: u32 = neo_mesh_vertex_count(mesh); }",
             &["inspect"],
-        )
-        .unwrap();
+            "arg_mesh launch test",
+        ) else {
+            return;
+        };
         let kernel = module.kernel("inspect").unwrap();
         let mut launch = kernel.launcher();
         launch.arg_mesh(&mesh);
@@ -5910,12 +6055,14 @@ mod tests {
             &bytes,
         )
         .unwrap();
-        let module = Module::from_neo_source(
+        let Some(module) = module_from_neo_source_or_skip(
             &ctx,
             "kernel fn inspect(global u8* instances) { let count: u32 = neo_instance_count(instances); }",
             &["inspect"],
-        )
-        .unwrap();
+            "arg_instances launch test",
+        ) else {
+            return;
+        };
         let kernel = module.kernel("inspect").unwrap();
         let mut launch = kernel.launcher();
         launch.arg_instances(&instances);
@@ -6834,11 +6981,13 @@ mod tests {
             eprintln!("skipping native CUDA image smoke test without NVRTC");
             return;
         }
-        let module = Module::from_cuda_source(
+        let Some(module) = module_from_cuda_source_or_skip(
             &ctx,
             "extern \"C\" __global__ void noop_kernel() {}".to_string(),
-        )
-        .unwrap();
+            "native CUDA image smoke test",
+        ) else {
+            return;
+        };
         module.kernel("noop_kernel").unwrap();
     }
 
@@ -6857,6 +7006,57 @@ mod tests {
                 PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin"),
             ]
         );
+    }
+
+    #[test]
+    fn diagnostics_mentions_active_cuda_build() {
+        let diagnostics = RuntimeDiagnostics {
+            cuda_driver_available: false,
+            cuda_driver_error: None,
+            nvrtc_candidates: Vec::new(),
+            nvrtc_found: Vec::new(),
+            nvrtc_compatible: Vec::new(),
+            nvrtc_loadable: false,
+        };
+        assert!(
+            diagnostics
+                .nvrtc_help()
+                .contains(expected_cuda_build_label())
+        );
+    }
+
+    #[cfg(all(windows, feature = "cuda-12060"))]
+    #[test]
+    fn cuda_126_nvrtc_names_are_compatible_for_cuda_126_builds() {
+        assert!(compatible_nvrtc_candidate(Path::new(
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin\x64\nvrtc64_120_0.dll"
+        )));
+        assert!(compatible_nvrtc_candidate(Path::new(
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin\x64\nvrtc64_12.dll"
+        )));
+        assert!(!compatible_nvrtc_candidate(Path::new(
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64\nvrtc64_130_0.dll"
+        )));
+        assert!(!compatible_nvrtc_candidate(Path::new(
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64\nvrtc.dll"
+        )));
+    }
+
+    #[cfg(all(windows, feature = "cuda-13000"))]
+    #[test]
+    fn cuda_13_nvrtc_names_are_compatible_for_cuda_13_builds() {
+        assert!(compatible_nvrtc_candidate(Path::new(
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64\nvrtc64_130_0.dll"
+        )));
+        assert!(compatible_nvrtc_candidate(Path::new(
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64\nvrtc64_13.dll"
+        )));
+        assert!(!compatible_nvrtc_candidate(Path::new(
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin\x64\nvrtc64_120_0.dll"
+        )));
+        assert!(!compatible_nvrtc_candidate(Path::new(
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin\x64\nvrtc.dll"
+        )));
     }
 
     #[test]

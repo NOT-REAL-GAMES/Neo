@@ -6,4 +6,9 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-neo-app.workspace = true
+neo-app = { workspace = true, default-features = false }
+
+[features]
+default = ["cuda-13000"]
+cuda-12060 = ["neo-app/cuda-12060"]
+cuda-13000 = ["neo-app/cuda-13000"]
