@@ -23,7 +23,8 @@ use neo_runtime::{
     NeoD3d12InteropDevice, PrimitiveTopology, RasterCullOrder as RuntimeRasterCullOrder,
     RasterVisibilityMode as RuntimeRasterVisibilityMode, ReadablePinnedHostBuffer, SharedFrameRing,
     SharedGpuBuffer, SharedInstanceStream, Stream as CudaStream, Target, VertexAttribute,
-    VertexFormat, VertexLayout, VertexSemantic, VisibleInstanceStream,
+    VertexFormat, VertexLayout, VertexSemantic, VisibilityGrid, VisibilityGridDesc,
+    VisibleInstanceStream,
 };
 use notify::{Event as NotifyEvent, RecursiveMode, Watcher as _};
 use winit::{
@@ -39,10 +40,6 @@ const DEFAULT_HEIGHT: u32 = 540;
 const BLOCK: (u32, u32) = (16, 16);
 const INSTANCE_CULL_TILE: u32 = 8;
 const TILE_CULL_RECORD_BYTES: usize = 16;
-const INSTANCE_MACROCELL_SIZE: u32 = 8;
-const VISIBILITY_HEADER_U32S: usize = 8;
-const VISIBILITY_RECORD_U32S: usize = 6;
-const VISIBILITY_MAGIC: u32 = 0x4e45_4f4d;
 const EMPTY_IDLE_FPS: f32 = 15.0;
 const UNFOCUSED_IDLE_FPS: f32 = 15.0;
 const CAMERA_MOVE_UNITS_PER_SEC: f32 = 4.0;
@@ -1735,6 +1732,13 @@ impl LiveOptions {
         {
             bail!("--kernel-target-fps must be finite and non-negative");
         }
+        if self.instance_stress_variant == InstanceStressVariant::Macrocell
+            && self.instance_layout != StressInstanceLayout::AoSoA32
+        {
+            bail!(
+                "--instance-stress-variant macrocell currently requires --instance-layout aosoa32"
+            );
+        }
         Ok(())
     }
 
@@ -2360,6 +2364,7 @@ fn validate_mesh_kernel_abi(source: &str) -> Result<()> {
 struct InstanceKernel {
     raster: Kernel,
     cull: Option<Kernel>,
+    visibility_prepare: Option<Kernel>,
     tiled: bool,
     macrocell: bool,
 }
@@ -2380,17 +2385,24 @@ impl InstanceKernel {
         let entrypoints = match variant {
             InstanceStressVariant::Baseline
             | InstanceStressVariant::Fast
-            | InstanceStressVariant::Tiled
-            | InstanceStressVariant::Macrocell => {
+            | InstanceStressVariant::Tiled => {
                 vec!["instance_raster"]
             }
             InstanceStressVariant::Culled => vec!["instance_cull", "instance_raster"],
+            InstanceStressVariant::Macrocell => {
+                vec!["instance_visibility_prepare", "instance_raster"]
+            }
         };
         let module = neo_runtime::Module::from_neo_source(ctx, &source, &entrypoints)?;
         Ok(Self {
             raster: module.kernel("instance_raster")?,
             cull: if variant == InstanceStressVariant::Culled {
                 Some(module.kernel("instance_cull")?)
+            } else {
+                None
+            },
+            visibility_prepare: if variant == InstanceStressVariant::Macrocell {
+                Some(module.kernel("instance_visibility_prepare")?)
             } else {
                 None
             },
@@ -2855,6 +2867,21 @@ fn validate_macrocell_instance_kernel_abi(source: &str) -> Result<()> {
     let program = neo_lang::parse(source)?;
     validate_kernel_signature(
         &program,
+        "instance_visibility_prepare",
+        &[
+            (
+                "visibility",
+                Some(AddressSpace::Global),
+                TypeName::U8,
+                1usize,
+            ),
+            ("camera", Some(AddressSpace::Global), TypeName::U8, 1),
+        ],
+        "macrocell visibility prepare kernel",
+        "global u8* visibility, global u8* camera",
+    )?;
+    validate_kernel_signature(
+        &program,
         "instance_raster",
         &[
             ("pixels", Some(AddressSpace::Global), TypeName::U8, 1usize),
@@ -3163,7 +3190,7 @@ struct CameraParams {
 struct InstanceStressAssets {
     mesh: MeshBuffer,
     instances: InstanceBuffer,
-    visibility: DeviceBuffer<u8>,
+    visibility_grids: Vec<VisibilityGrid>,
     raster_instances: Option<SharedInstanceStream>,
     camera_buffers: Vec<DeviceBuffer<u8>>,
     tile_cull_width: u32,
@@ -3212,8 +3239,16 @@ fn create_instance_stress_assets(
         },
     };
     let data_layout = instance_layout.data_layout();
-    let visibility = DeviceBuffer::upload(neo, &create_visibility_grid_bytes(grid)?)
-        .context("failed to upload macrocell visibility grid")?;
+    let mut visibility_grids = Vec::with_capacity(present_ring);
+    for _ in 0..present_ring {
+        visibility_grids.push(
+            VisibilityGrid::upload(
+                neo,
+                VisibilityGridDesc::macrocell_lattice([grid.x, grid.y, grid.z]),
+            )
+            .context("failed to upload macrocell visibility grid")?,
+        );
+    }
     let instance_buffer = InstanceBuffer::upload_typed_with_layout(
         neo,
         instance_desc.clone(),
@@ -3243,7 +3278,7 @@ fn create_instance_stress_assets(
     Ok(InstanceStressAssets {
         mesh,
         instances: instance_buffer,
-        visibility,
+        visibility_grids,
         raster_instances,
         camera_buffers,
         tile_cull_width: 0,
@@ -3275,64 +3310,6 @@ fn tile_cull_byte_len(size: PhysicalSize<u32>) -> Result<usize> {
                 size.height
             )
         })
-}
-
-fn macrocell_grid_size(grid: InstanceGrid) -> Result<(u32, u32, u32)> {
-    grid.validate()?;
-    Ok((
-        grid.x.div_ceil(INSTANCE_MACROCELL_SIZE),
-        grid.y.div_ceil(INSTANCE_MACROCELL_SIZE),
-        grid.z.div_ceil(INSTANCE_MACROCELL_SIZE),
-    ))
-}
-
-fn visibility_grid_u32_len(grid: InstanceGrid) -> Result<usize> {
-    let (mx, my, mz) = macrocell_grid_size(grid)?;
-    mx.checked_mul(my)
-        .and_then(|xy| xy.checked_mul(mz))
-        .and_then(|count| count.checked_mul(VISIBILITY_RECORD_U32S as u32))
-        .and_then(|records| records.checked_add(VISIBILITY_HEADER_U32S as u32))
-        .map(|values| values as usize)
-        .ok_or_else(|| anyhow!("macrocell visibility grid size overflow"))
-}
-
-fn create_visibility_grid_bytes(grid: InstanceGrid) -> Result<Vec<u8>> {
-    let (mx, my, mz) = macrocell_grid_size(grid)?;
-    let mut values = vec![0u32; visibility_grid_u32_len(grid)?];
-    values[0] = VISIBILITY_MAGIC;
-    values[1] = INSTANCE_MACROCELL_SIZE;
-    values[2] = mx;
-    values[3] = my;
-    values[4] = mz;
-    values[5] = mx
-        .checked_mul(my)
-        .and_then(|xy| xy.checked_mul(mz))
-        .ok_or_else(|| anyhow!("macrocell count overflow"))?;
-    values[6] = 0;
-    values[7] = 0;
-
-    let mut record_index = VISIBILITY_HEADER_U32S;
-    for z in 0..mz {
-        for y in 0..my {
-            for x in 0..mx {
-                let min_x = x * INSTANCE_MACROCELL_SIZE;
-                let min_y = y * INSTANCE_MACROCELL_SIZE;
-                let min_z = z * INSTANCE_MACROCELL_SIZE;
-                let max_x = (min_x + INSTANCE_MACROCELL_SIZE - 1).min(grid.x - 1);
-                let max_y = (min_y + INSTANCE_MACROCELL_SIZE - 1).min(grid.y - 1);
-                let max_z = (min_z + INSTANCE_MACROCELL_SIZE - 1).min(grid.z - 1);
-                values[record_index..record_index + VISIBILITY_RECORD_U32S]
-                    .copy_from_slice(&[min_x, max_x, min_y, max_y, min_z, max_z]);
-                record_index += VISIBILITY_RECORD_U32S;
-            }
-        }
-    }
-
-    let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<u32>());
-    for value in values {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    Ok(bytes)
 }
 
 fn ensure_tile_cull_buffers(
@@ -4700,6 +4677,29 @@ fn run_instance_stress_batch(input: InstanceStressBatch<'_>) -> Result<Throughpu
         let pixel_arg = shared.device_ptr_arg();
         let time = input.start.elapsed().as_secs_f32();
         let frame = *input.next_frame;
+        if let Some(prepare_kernel) = &input.kernel.visibility_prepare {
+            let visibility = input
+                .assets
+                .visibility_grids
+                .get(index)
+                .context("missing macrocell visibility grid for interop slot")?;
+            let word_count = visibility.macrocell_count().div_ceil(32);
+            let prepare_dims = LaunchDims {
+                grid: (word_count.div_ceil(128), 1, 1),
+                block: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let stream_kernel = prepare_kernel.on_stream(stream);
+            let mut launch = stream_kernel.launcher();
+            launch
+                .arg_visibility_grid(visibility)
+                .arg_buffer(&input.assets.camera_buffers[index]);
+            unsafe {
+                launch
+                    .launch(prepare_dims)
+                    .context("failed to launch macrocell visibility prepare kernel")?;
+            }
+        }
         if let Some(cull_kernel) = &input.kernel.cull {
             let (tiles_x, tiles_y) =
                 tile_cull_grid_size(PhysicalSize::new(kernel_width, input.size.height))?;
@@ -4731,7 +4731,13 @@ fn run_instance_stress_batch(input: InstanceStressBatch<'_>) -> Result<Throughpu
                     .arg(&input.size.height)
                     .arg_mesh(&input.assets.mesh)
                     .arg_instances(&input.assets.instances)
-                    .arg_buffer(&input.assets.visibility)
+                    .arg_visibility_grid(
+                        input
+                            .assets
+                            .visibility_grids
+                            .get(index)
+                            .context("missing macrocell visibility grid for interop slot")?,
+                    )
                     .arg_buffer(&input.assets.camera_buffers[index]);
             } else {
                 launch
@@ -8254,13 +8260,18 @@ mod tests {
 
     #[test]
     fn macrocell_instance_kernel_abi_accepts_visibility_pointer() {
-        let source = "kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* mesh, global u8* instances, global u8* visibility, global u8* camera, f32 time, u32 frame) {}";
+        let source = "kernel fn instance_visibility_prepare(global u8* visibility, global u8* camera) {} kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* mesh, global u8* instances, global u8* visibility, global u8* camera, f32 time, u32 frame) {}";
         validate_macrocell_instance_kernel_abi(source).unwrap();
-        let missing_visibility = "kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* mesh, global u8* instances, global u8* camera, f32 time, u32 frame) {}";
+        let missing_visibility = "kernel fn instance_visibility_prepare(global u8* visibility, global u8* camera) {} kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* mesh, global u8* instances, global u8* camera, f32 time, u32 frame) {}";
         let err = validate_macrocell_instance_kernel_abi(missing_visibility)
             .unwrap_err()
             .to_string();
         assert!(err.contains("must have 9 params"));
+        let missing_prepare = "kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* mesh, global u8* instances, global u8* visibility, global u8* camera, f32 time, u32 frame) {}";
+        let err = validate_macrocell_instance_kernel_abi(missing_prepare)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("instance_visibility_prepare"));
     }
 
     #[test]
@@ -9292,6 +9303,25 @@ fragment fn quad_fs() {
     }
 
     #[test]
+    fn macrocell_variant_rejects_unsupported_instance_layout() {
+        let err = LiveOptions::parse(
+            [
+                "--mode",
+                "instance-stress",
+                "--instance-stress-variant",
+                "macrocell",
+                "--instance-layout",
+                "aosoa64",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("macrocell currently requires --instance-layout aosoa32"));
+    }
+
+    #[test]
     fn render_policy_accepts_expected_values() {
         assert_eq!("auto".parse::<RenderPolicy>().unwrap(), RenderPolicy::Auto);
         assert_eq!(
@@ -9526,72 +9556,6 @@ fragment fn quad_fs() {
             InstanceStressVariant::Macrocell.source_path(requested, StressInstanceLayout::AoSoA64),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_macrocell_aosoa32.neo")
         );
-    }
-
-    fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
-        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-    }
-
-    #[test]
-    fn macrocell_visibility_grid_packs_stable_records() {
-        let grid = InstanceGrid::new(256, 256, 128);
-        assert_eq!(macrocell_grid_size(grid).unwrap(), (32, 32, 16));
-        assert_eq!(
-            visibility_grid_u32_len(grid).unwrap(),
-            VISIBILITY_HEADER_U32S + 32 * 32 * 16 * VISIBILITY_RECORD_U32S
-        );
-        let bytes = create_visibility_grid_bytes(grid).unwrap();
-        assert_eq!(read_u32_le(&bytes, 0), VISIBILITY_MAGIC);
-        assert_eq!(read_u32_le(&bytes, 4), INSTANCE_MACROCELL_SIZE);
-        assert_eq!(read_u32_le(&bytes, 8), 32);
-        assert_eq!(read_u32_le(&bytes, 12), 32);
-        assert_eq!(read_u32_le(&bytes, 16), 16);
-        assert_eq!(read_u32_le(&bytes, 20), 32 * 32 * 16);
-        let first = VISIBILITY_HEADER_U32S * 4;
-        assert_eq!(
-            [
-                read_u32_le(&bytes, first),
-                read_u32_le(&bytes, first + 4),
-                read_u32_le(&bytes, first + 8),
-                read_u32_le(&bytes, first + 12),
-                read_u32_le(&bytes, first + 16),
-                read_u32_le(&bytes, first + 20),
-            ],
-            [0, 7, 0, 7, 0, 7]
-        );
-        let last = bytes.len() - VISIBILITY_RECORD_U32S * 4;
-        assert_eq!(
-            [
-                read_u32_le(&bytes, last),
-                read_u32_le(&bytes, last + 4),
-                read_u32_le(&bytes, last + 8),
-                read_u32_le(&bytes, last + 12),
-                read_u32_le(&bytes, last + 16),
-                read_u32_le(&bytes, last + 20),
-            ],
-            [248, 255, 248, 255, 120, 127]
-        );
-    }
-
-    #[test]
-    fn macrocell_visibility_grid_rounds_up_and_rejects_invalid_sizes() {
-        let grid = InstanceGrid::new(17, 9, 1);
-        assert_eq!(macrocell_grid_size(grid).unwrap(), (3, 2, 1));
-        let bytes = create_visibility_grid_bytes(grid).unwrap();
-        let last = bytes.len() - VISIBILITY_RECORD_U32S * 4;
-        assert_eq!(
-            [
-                read_u32_le(&bytes, last),
-                read_u32_le(&bytes, last + 4),
-                read_u32_le(&bytes, last + 8),
-                read_u32_le(&bytes, last + 12),
-                read_u32_le(&bytes, last + 16),
-                read_u32_le(&bytes, last + 20),
-            ],
-            [16, 16, 8, 8, 0, 0]
-        );
-        assert!(macrocell_grid_size(InstanceGrid::new(0, 1, 1)).is_err());
-        assert!(visibility_grid_u32_len(InstanceGrid::new(u32::MAX, u32::MAX, u32::MAX)).is_err());
     }
 
     #[test]

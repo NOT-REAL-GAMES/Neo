@@ -1,3 +1,85 @@
+kernel fn instance_visibility_prepare(global u8* visibility, global u8* camera) {
+    let word_id: u32 = block_id().x * block_dim().x + thread_id().x;
+
+    struct NeoStressCamera {
+        float4 origin;
+        float4 right;
+        float4 up;
+        float4 forward;
+        uint4 grid;
+        float4 view;
+        uint4 config;
+    };
+
+    let cam: NeoStressCamera* = (NeoStressCamera*)camera;
+    let vis: unsigned int* = (unsigned int*)visibility;
+    if (vis[0] != 0x4e454f4du) {
+        return;
+    }
+
+    let macro_size: u32 = vis[1];
+    let macro_x_count: u32 = vis[2];
+    let macro_y_count: u32 = vis[3];
+    let macro_z_count: u32 = vis[4];
+    let macro_count: u32 = vis[5];
+    let occupancy_offset: u32 = vis[6];
+    let relevance_offset: u32 = vis[7];
+    let word_count: u32 = (macro_count + 31u) / 32u;
+    if (word_id >= word_count || macro_size == 0u || macro_count == 0u || occupancy_offset == 0u || relevance_offset == 0u) {
+        return;
+    }
+
+    let spacing: f32 = cam->view.z;
+    let grid_x: u32 = cam->grid.x;
+    let grid_y: u32 = cam->grid.y;
+    let grid_z: u32 = cam->grid.z;
+    if (grid_x == 0u || grid_y == 0u || grid_z == 0u || spacing <= 0.0f) {
+        vis[relevance_offset + word_id] = 0u;
+        return;
+    }
+
+    let half_x: f32 = (as_f32(grid_x) - 1.0f) * 0.5f;
+    let half_y: f32 = (as_f32(grid_y) - 1.0f) * 0.5f;
+    let half_z: f32 = (as_f32(grid_z) - 1.0f) * 0.5f;
+    let occupancy_word: u32 = vis[occupancy_offset + word_id];
+    let tan_x: f32 = cam->view.x;
+    let tan_y: f32 = cam->view.y;
+    let relevance_word: u32 = 0u;
+
+    for (int lane_i = 0; lane_i < 32; ++lane_i) {
+        let lane: u32 = as_u32(lane_i);
+        let macro_id: u32 = word_id * 32u + lane;
+        let mask: u32 = 1u << lane;
+        if (macro_id < macro_count && (occupancy_word & mask) != 0u) {
+            let rec: unsigned int* = vis + 8u + macro_id * 6u;
+            let cx: f32 = ((as_f32(rec[0] + rec[1]) * 0.5f) - half_x) * spacing;
+            let cy: f32 = ((as_f32(rec[2] + rec[3]) * 0.5f) - half_y) * spacing;
+            let cz: f32 = ((as_f32(rec[4] + rec[5]) * 0.5f) - half_z) * spacing;
+            let extent_x: f32 = (as_f32(rec[1] - rec[0] + 1u) * 0.5f + 0.75f) * spacing;
+            let extent_y: f32 = (as_f32(rec[3] - rec[2] + 1u) * 0.5f + 0.75f) * spacing;
+            let extent_z: f32 = (as_f32(rec[5] - rec[4] + 1u) * 0.5f + 0.75f) * spacing;
+            let radius: f32 = sqrtf(extent_x * extent_x + extent_y * extent_y + extent_z * extent_z);
+            let vx: f32 = cx - cam->origin.x;
+            let vy: f32 = cy - cam->origin.y;
+            let vz: f32 = cz - cam->origin.z;
+            let fwd: f32 = vx * cam->forward.x + vy * cam->forward.y + vz * cam->forward.z;
+            let right: f32 = vx * cam->right.x + vy * cam->right.y + vz * cam->right.z;
+            let up: f32 = vx * cam->up.x + vy * cam->up.y + vz * cam->up.z;
+            let in_front: i32 = 0;
+            if (fwd + radius > 0.01f) {
+                in_front = 1;
+            }
+            let x_limit: f32 = fmaxf(radius, fwd * tan_x + radius);
+            let y_limit: f32 = fmaxf(radius, fwd * tan_y + radius);
+            if (in_front != 0 && fabsf(right) <= x_limit && fabsf(up) <= y_limit) {
+                relevance_word = relevance_word | mask;
+            }
+        }
+    }
+
+    vis[relevance_offset + word_id] = relevance_word;
+}
+
 kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* mesh, global u8* instances, global u8* visibility, global u8* camera, f32 time, u32 frame) {
     let x: u32 = block_id().x * block_dim().x + thread_id().x;
     let y: u32 = block_id().y * block_dim().y + thread_id().y;
@@ -36,7 +118,9 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
     let macro_y_count: u32 = vis[3];
     let macro_z_count: u32 = vis[4];
     let macro_count: u32 = vis[5];
-    if (macro_size == 0u || macro_x_count == 0u || macro_y_count == 0u || macro_z_count == 0u || macro_count == 0u) {
+    let occupancy_offset: u32 = vis[6];
+    let relevance_offset: u32 = vis[7];
+    if (macro_size == 0u || macro_x_count == 0u || macro_y_count == 0u || macro_z_count == 0u || macro_count == 0u || occupancy_offset == 0u || relevance_offset == 0u) {
         ((unsigned int*)pixels)[idx] = color;
         return;
     }
@@ -188,6 +272,7 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
     let grid_xy: u32 = grid_x * grid_y;
     let hit: i32 = 0;
     let macro_steps: u32 = 0u;
+    let rejected_macrocells: u32 = 0u;
     let visited_count: u32 = 0u;
 
     for (int macro_step = 0; macro_step < 4096; ++macro_step) {
@@ -199,100 +284,108 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
         if (macro_id >= macro_count) {
             break;
         }
-        let rec: unsigned int* = vis + 8u + macro_id * 6u;
-        let rec_min_x: u32 = rec[0];
-        let rec_max_x: u32 = rec[1];
-        let rec_min_y: u32 = rec[2];
-        let rec_max_y: u32 = rec[3];
-        let rec_min_z: u32 = rec[4];
-        let rec_max_z: u32 = rec[5];
-        let layer_i: i32 = as_i32(rec_min_z);
-        let layer_end: i32 = as_i32(rec_max_z);
-        let layer_step: i32 = 1;
-        if (dir_z < 0.0f) {
-            layer_i = as_i32(rec_max_z);
-            layer_end = as_i32(rec_min_z);
-            layer_step = -1;
-        }
-        let t_guess: f32 = (((as_f32(as_u32(layer_i)) - half_z) * spacing) - cam->origin.z) / dir_z;
-        let t_step: f32 = as_f32(layer_step) * spacing / dir_z;
-        for (int local_layer = 0; local_layer < 8; ++local_layer) {
-            if ((layer_step > 0 && layer_i > layer_end) || (layer_step < 0 && layer_i < layer_end)) {
-                break;
+        let macro_word: u32 = macro_id / 32u;
+        let macro_mask: u32 = 1u << (macro_id & 31u);
+        let macro_occupied: u32 = vis[occupancy_offset + macro_word] & macro_mask;
+        let macro_relevant: u32 = vis[relevance_offset + macro_word] & macro_mask;
+        if (macro_occupied == 0u || macro_relevant == 0u) {
+            rejected_macrocells = rejected_macrocells + 1u;
+        } else {
+            let rec: unsigned int* = vis + 8u + macro_id * 6u;
+            let rec_min_x: u32 = rec[0];
+            let rec_max_x: u32 = rec[1];
+            let rec_min_y: u32 = rec[2];
+            let rec_max_y: u32 = rec[3];
+            let rec_min_z: u32 = rec[4];
+            let rec_max_z: u32 = rec[5];
+            let layer_i: i32 = as_i32(rec_min_z);
+            let layer_end: i32 = as_i32(rec_max_z);
+            let layer_step: i32 = 1;
+            if (dir_z < 0.0f) {
+                layer_i = as_i32(rec_max_z);
+                layer_end = as_i32(rec_min_z);
+                layer_step = -1;
             }
-            visited_count = visited_count + 1u;
-            let layer: u32 = as_u32(layer_i);
-            let guess_x: f32 = cam->origin.x + dir_x * t_guess;
-            let guess_y: f32 = cam->origin.y + dir_y * t_guess;
-            let ix_i: i32 = as_i32(floorf(guess_x * inv_spacing + half_x + 0.5f));
-            let iy_i: i32 = as_i32(floorf(guess_y * inv_spacing + half_y + 0.5f));
-            if (ix_i >= as_i32(rec_min_x) && ix_i <= as_i32(rec_max_x) && iy_i >= as_i32(rec_min_y) && iy_i <= as_i32(rec_max_y)) {
-                let ix: u32 = as_u32(ix_i);
-                let iy: u32 = as_u32(iy_i);
-                let instance_id: u32 = layer * grid_xy + iy * grid_x + ix;
-                if (instance_id < instance_count) {
-                    let group: u32 = instance_id / group_size;
-                    let lane: u32 = instance_id - group * group_size;
-                    let group_lane_12: u32 = group * group_size * 12u + lane * 12u;
-                    let group_lane_16: u32 = group * group_size * 16u + lane * 16u;
-                    let group_lane_8: u32 = group * group_size * 8u + lane * 8u;
-                    let group_lane_4: u32 = group * group_size * 4u + lane * 4u;
-                    let pos_values: float* = (float*)(data_base + pos_stream + group_lane_12);
-                    let rot_values: float* = (float*)(data_base + rot_stream + group_lane_16);
-                    let scale_values: float* = (float*)(data_base + scale_stream + group_lane_8);
-                    let color_ptr: unsigned int* = (unsigned int*)(data_base + color_stream + group_lane_4);
-                    let pos_x: f32 = pos_values[0];
-                    let pos_y: f32 = pos_values[1];
-                    let pos_z: f32 = pos_values[2];
-                    let rx: f32 = rot_values[0];
-                    let ry: f32 = rot_values[1];
-                    let rz: f32 = rot_values[2];
-                    let rw: f32 = rot_values[3];
-                    let scale_x: f32 = scale_values[0];
-                    let scale_y: f32 = scale_values[1];
-                    let nx_uv_x: f32 = ry;
-                    let nx_uv_y: f32 = -rx;
-                    let nx_uuv_x: f32 = rz * rx;
-                    let nx_uuv_y: f32 = rz * ry;
-                    let nx_uuv_z: f32 = -rx * rx - ry * ry;
-                    let normal_x: f32 = 2.0f * (rw * nx_uv_x + nx_uuv_x);
-                    let normal_y: f32 = 2.0f * (rw * nx_uv_y + nx_uuv_y);
-                    let normal_z: f32 = 1.0f + 2.0f * nx_uuv_z;
-                    let denom: f32 = normal_x * dir_x + normal_y * dir_y + normal_z * dir_z;
-                    if (fabsf(denom) > 0.00001f) {
-                        let to_x: f32 = pos_x - cam->origin.x;
-                        let to_y: f32 = pos_y - cam->origin.y;
-                        let to_z: f32 = pos_z - cam->origin.z;
-                        let hit_t: f32 = (to_x * normal_x + to_y * normal_y + to_z * normal_z) / denom;
-                        if (hit_t > 0.0f) {
-                            let vx: f32 = cam->origin.x + dir_x * hit_t - pos_x;
-                            let vy: f32 = cam->origin.y + dir_y * hit_t - pos_y;
-                            let vz: f32 = cam->origin.z + dir_z * hit_t - pos_z;
-                            let uv_x: f32 = ry * vz - rz * vy;
-                            let uv_y: f32 = rz * vx - rx * vz;
-                            let uv_z: f32 = rx * vy - ry * vx;
-                            let uuv_x: f32 = ry * uv_z - rz * uv_y;
-                            let uuv_y: f32 = rz * uv_x - rx * uv_z;
-                            let uuv_z: f32 = rx * uv_y - ry * uv_x;
-                            let local_x_hit: f32 = vx - 2.0f * rw * uv_x + 2.0f * uuv_x;
-                            let local_y_hit: f32 = vy - 2.0f * rw * uv_y + 2.0f * uuv_y;
-                            let local_z_hit: f32 = vz - 2.0f * rw * uv_z + 2.0f * uuv_z;
-                            if (fabsf(local_x_hit) <= scale_x && fabsf(local_y_hit) <= scale_y && fabsf(local_z_hit) <= spacing * 0.08f) {
-                                let shade: f32 = fmaxf(0.18f, fabsf(normal_x * -dir_x + normal_y * -dir_y + normal_z * -dir_z));
-                                let c: u32 = color_ptr[0];
-                                let b: u32 = as_u32(as_f32(c & 255u) * shade) & 255u;
-                                let g: u32 = as_u32(as_f32((c >> 8u) & 255u) * shade) & 255u;
-                                let r: u32 = as_u32(as_f32((c >> 16u) & 255u) * shade) & 255u;
-                                color = b | (g << 8u) | (r << 16u) | 0xff000000u;
-                                hit = 1;
-                                break;
+            let t_guess: f32 = (((as_f32(as_u32(layer_i)) - half_z) * spacing) - cam->origin.z) / dir_z;
+            let t_step: f32 = as_f32(layer_step) * spacing / dir_z;
+            for (int local_layer = 0; local_layer < 8; ++local_layer) {
+                if ((layer_step > 0 && layer_i > layer_end) || (layer_step < 0 && layer_i < layer_end)) {
+                    break;
+                }
+                visited_count = visited_count + 1u;
+                let layer: u32 = as_u32(layer_i);
+                let guess_x: f32 = cam->origin.x + dir_x * t_guess;
+                let guess_y: f32 = cam->origin.y + dir_y * t_guess;
+                let ix_i: i32 = as_i32(floorf(guess_x * inv_spacing + half_x + 0.5f));
+                let iy_i: i32 = as_i32(floorf(guess_y * inv_spacing + half_y + 0.5f));
+                if (ix_i >= as_i32(rec_min_x) && ix_i <= as_i32(rec_max_x) && iy_i >= as_i32(rec_min_y) && iy_i <= as_i32(rec_max_y)) {
+                    let ix: u32 = as_u32(ix_i);
+                    let iy: u32 = as_u32(iy_i);
+                    let instance_id: u32 = layer * grid_xy + iy * grid_x + ix;
+                    if (instance_id < instance_count) {
+                        let group: u32 = instance_id / group_size;
+                        let lane: u32 = instance_id - group * group_size;
+                        let group_lane_12: u32 = group * group_size * 12u + lane * 12u;
+                        let group_lane_16: u32 = group * group_size * 16u + lane * 16u;
+                        let group_lane_8: u32 = group * group_size * 8u + lane * 8u;
+                        let group_lane_4: u32 = group * group_size * 4u + lane * 4u;
+                        let pos_values: float* = (float*)(data_base + pos_stream + group_lane_12);
+                        let rot_values: float* = (float*)(data_base + rot_stream + group_lane_16);
+                        let scale_values: float* = (float*)(data_base + scale_stream + group_lane_8);
+                        let color_ptr: unsigned int* = (unsigned int*)(data_base + color_stream + group_lane_4);
+                        let pos_x: f32 = pos_values[0];
+                        let pos_y: f32 = pos_values[1];
+                        let pos_z: f32 = pos_values[2];
+                        let rx: f32 = rot_values[0];
+                        let ry: f32 = rot_values[1];
+                        let rz: f32 = rot_values[2];
+                        let rw: f32 = rot_values[3];
+                        let scale_x: f32 = scale_values[0];
+                        let scale_y: f32 = scale_values[1];
+                        let nx_uv_x: f32 = ry;
+                        let nx_uv_y: f32 = -rx;
+                        let nx_uuv_x: f32 = rz * rx;
+                        let nx_uuv_y: f32 = rz * ry;
+                        let nx_uuv_z: f32 = -rx * rx - ry * ry;
+                        let normal_x: f32 = 2.0f * (rw * nx_uv_x + nx_uuv_x);
+                        let normal_y: f32 = 2.0f * (rw * nx_uv_y + nx_uuv_y);
+                        let normal_z: f32 = 1.0f + 2.0f * nx_uuv_z;
+                        let denom: f32 = normal_x * dir_x + normal_y * dir_y + normal_z * dir_z;
+                        if (fabsf(denom) > 0.00001f) {
+                            let to_x: f32 = pos_x - cam->origin.x;
+                            let to_y: f32 = pos_y - cam->origin.y;
+                            let to_z: f32 = pos_z - cam->origin.z;
+                            let hit_t: f32 = (to_x * normal_x + to_y * normal_y + to_z * normal_z) / denom;
+                            if (hit_t > 0.0f) {
+                                let vx: f32 = cam->origin.x + dir_x * hit_t - pos_x;
+                                let vy: f32 = cam->origin.y + dir_y * hit_t - pos_y;
+                                let vz: f32 = cam->origin.z + dir_z * hit_t - pos_z;
+                                let uv_x: f32 = ry * vz - rz * vy;
+                                let uv_y: f32 = rz * vx - rx * vz;
+                                let uv_z: f32 = rx * vy - ry * vx;
+                                let uuv_x: f32 = ry * uv_z - rz * uv_y;
+                                let uuv_y: f32 = rz * uv_x - rx * uv_z;
+                                let uuv_z: f32 = rx * uv_y - ry * uv_x;
+                                let local_x_hit: f32 = vx - 2.0f * rw * uv_x + 2.0f * uuv_x;
+                                let local_y_hit: f32 = vy - 2.0f * rw * uv_y + 2.0f * uuv_y;
+                                let local_z_hit: f32 = vz - 2.0f * rw * uv_z + 2.0f * uuv_z;
+                                if (fabsf(local_x_hit) <= scale_x && fabsf(local_y_hit) <= scale_y && fabsf(local_z_hit) <= spacing * 0.08f) {
+                                    let shade: f32 = fmaxf(0.18f, fabsf(normal_x * -dir_x + normal_y * -dir_y + normal_z * -dir_z));
+                                    let c: u32 = color_ptr[0];
+                                    let b: u32 = as_u32(as_f32(c & 255u) * shade) & 255u;
+                                    let g: u32 = as_u32(as_f32((c >> 8u) & 255u) * shade) & 255u;
+                                    let r: u32 = as_u32(as_f32((c >> 16u) & 255u) * shade) & 255u;
+                                    color = b | (g << 8u) | (r << 16u) | 0xff000000u;
+                                    hit = 1;
+                                    break;
+                                }
                             }
                         }
                     }
                 }
+                layer_i = layer_i + layer_step;
+                t_guess = t_guess + t_step;
             }
-            layer_i = layer_i + layer_step;
-            t_guess = t_guess + t_step;
         }
         if (hit != 0) {
             break;
@@ -314,8 +407,9 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
 
     if (debug_view == 1u) {
         let heat: u32 = as_u32(fminf(255.0f, as_f32(macro_steps) * 255.0f / fmaxf(1.0f, as_f32(macro_x_count + macro_y_count + macro_z_count))));
+        let reject: u32 = as_u32(fminf(255.0f, as_f32(rejected_macrocells) * 255.0f / fmaxf(1.0f, as_f32(macro_steps))));
         let cool: u32 = 255u - heat;
-        color = cool | (heat << 16u) | 0xff000000u;
+        color = cool | (reject << 8u) | (heat << 16u) | 0xff000000u;
     }
     if (debug_view == 2u) {
         let heat: u32 = as_u32(fminf(255.0f, as_f32(visited_count) * 255.0f / 128.0f));

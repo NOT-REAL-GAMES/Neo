@@ -43,6 +43,8 @@ pub enum RuntimeError {
     Mesh(String),
     #[error("instance buffer error: {0}")]
     Instance(String),
+    #[error("visibility grid error: {0}")]
+    VisibilityGrid(String),
     #[cfg(windows)]
     #[error("D3D12 interop error: {0}")]
     D3d12Interop(String),
@@ -288,6 +290,11 @@ const INSTANCE_FORMAT_F32X3: u32 = 2;
 const INSTANCE_FORMAT_F32X4: u32 = 3;
 const INSTANCE_FORMAT_U8X4_UNORM: u32 = 4;
 
+pub const VISIBILITY_GRID_MAGIC: u32 = 0x4e45_4f4d;
+pub const VISIBILITY_GRID_HEADER_U32S: usize = 8;
+pub const VISIBILITY_GRID_RECORD_U32S: usize = 6;
+pub const DEFAULT_MACROCELL_SIZE: u32 = 8;
+
 pub const DEFAULT_AOSOA_GROUP_SIZE: u32 = 32;
 const DATA_LAYOUT_AOS: u32 = 0;
 const DATA_LAYOUT_SOA: u32 = 1;
@@ -482,6 +489,31 @@ pub struct InstanceBuffer {
     data_layout: DataLayout,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisibilityGridDesc {
+    pub cells: [u32; 3],
+    pub macrocell_size: u32,
+}
+
+impl VisibilityGridDesc {
+    pub fn macrocell_lattice(cells: [u32; 3]) -> Self {
+        Self {
+            cells,
+            macrocell_size: DEFAULT_MACROCELL_SIZE,
+        }
+    }
+}
+
+pub struct VisibilityGrid {
+    buffer: DeviceBuffer<u8>,
+    desc: VisibilityGridDesc,
+    macrocell_dims: [u32; 3],
+    macrocell_count: u32,
+    byte_len: usize,
+}
+
+pub type AccelerationGrid = VisibilityGrid;
+
 impl StructuredBuffer {
     pub fn upload_aos(
         ctx: &Context,
@@ -617,6 +649,47 @@ impl InstanceBuffer {
 
     pub fn device_ptr_arg(&self) -> CudaDevicePtrArg {
         self.buffer.device_ptr_arg()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.byte_len == 0
+    }
+}
+
+impl VisibilityGrid {
+    pub fn upload(ctx: &Context, desc: VisibilityGridDesc) -> Result<Self, RuntimeError> {
+        let packed = pack_visibility_grid(&desc)?;
+        let byte_len = packed.len();
+        let macrocell_dims = visibility_macrocell_dims(&desc)?;
+        let macrocell_count = visibility_macrocell_count(macrocell_dims)?;
+        let buffer = DeviceBuffer::upload(ctx, &packed)?;
+        Ok(Self {
+            buffer,
+            desc,
+            macrocell_dims,
+            macrocell_count,
+            byte_len,
+        })
+    }
+
+    pub fn pack(desc: &VisibilityGridDesc) -> Result<Vec<u8>, RuntimeError> {
+        pack_visibility_grid(desc)
+    }
+
+    pub fn desc(&self) -> VisibilityGridDesc {
+        self.desc
+    }
+
+    pub fn macrocell_dims(&self) -> [u32; 3] {
+        self.macrocell_dims
+    }
+
+    pub fn macrocell_count(&self) -> u32 {
+        self.macrocell_count
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.byte_len
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1057,6 +1130,109 @@ fn validate_instance_buffer(
                 attr.semantic, desc.instance_layout.stride
             )));
         }
+    }
+    Ok(())
+}
+
+fn visibility_macrocell_dims(desc: &VisibilityGridDesc) -> Result<[u32; 3], RuntimeError> {
+    validate_visibility_grid_desc(desc)?;
+    Ok([
+        desc.cells[0].div_ceil(desc.macrocell_size),
+        desc.cells[1].div_ceil(desc.macrocell_size),
+        desc.cells[2].div_ceil(desc.macrocell_size),
+    ])
+}
+
+fn visibility_macrocell_count(dims: [u32; 3]) -> Result<u32, RuntimeError> {
+    dims[0]
+        .checked_mul(dims[1])
+        .and_then(|xy| xy.checked_mul(dims[2]))
+        .ok_or(RuntimeError::HostBufferTooLarge)
+}
+
+fn visibility_bitset_words(macrocell_count: u32) -> Result<u32, RuntimeError> {
+    Ok(macrocell_count.div_ceil(32))
+}
+
+fn visibility_grid_u32_len(desc: &VisibilityGridDesc) -> Result<usize, RuntimeError> {
+    let dims = visibility_macrocell_dims(desc)?;
+    let count = visibility_macrocell_count(dims)?;
+    let bitset_words = visibility_bitset_words(count)?;
+    count
+        .checked_mul(VISIBILITY_GRID_RECORD_U32S as u32)
+        .and_then(|records| records.checked_add(VISIBILITY_GRID_HEADER_U32S as u32))
+        .and_then(|records_and_header| records_and_header.checked_add(bitset_words))
+        .and_then(|with_occupancy| with_occupancy.checked_add(bitset_words))
+        .map(|values| values as usize)
+        .ok_or(RuntimeError::HostBufferTooLarge)
+}
+
+fn pack_visibility_grid(desc: &VisibilityGridDesc) -> Result<Vec<u8>, RuntimeError> {
+    let dims = visibility_macrocell_dims(desc)?;
+    let count = visibility_macrocell_count(dims)?;
+    let bitset_words = visibility_bitset_words(count)?;
+    let record_offset = VISIBILITY_GRID_HEADER_U32S as u32;
+    let occupancy_offset = record_offset
+        .checked_add(
+            count
+                .checked_mul(VISIBILITY_GRID_RECORD_U32S as u32)
+                .ok_or(RuntimeError::HostBufferTooLarge)?,
+        )
+        .ok_or(RuntimeError::HostBufferTooLarge)?;
+    let relevance_offset = occupancy_offset
+        .checked_add(bitset_words)
+        .ok_or(RuntimeError::HostBufferTooLarge)?;
+    let mut values = vec![0u32; visibility_grid_u32_len(desc)?];
+    values[0] = VISIBILITY_GRID_MAGIC;
+    values[1] = desc.macrocell_size;
+    values[2] = dims[0];
+    values[3] = dims[1];
+    values[4] = dims[2];
+    values[5] = count;
+    values[6] = occupancy_offset;
+    values[7] = relevance_offset;
+
+    let mut record_index = record_offset as usize;
+    for z in 0..dims[2] {
+        for y in 0..dims[1] {
+            for x in 0..dims[0] {
+                let min_x = x * desc.macrocell_size;
+                let min_y = y * desc.macrocell_size;
+                let min_z = z * desc.macrocell_size;
+                let max_x = (min_x + desc.macrocell_size - 1).min(desc.cells[0] - 1);
+                let max_y = (min_y + desc.macrocell_size - 1).min(desc.cells[1] - 1);
+                let max_z = (min_z + desc.macrocell_size - 1).min(desc.cells[2] - 1);
+                values[record_index..record_index + VISIBILITY_GRID_RECORD_U32S]
+                    .copy_from_slice(&[min_x, max_x, min_y, max_y, min_z, max_z]);
+                record_index += VISIBILITY_GRID_RECORD_U32S;
+            }
+        }
+    }
+
+    for id in 0..count {
+        let word = (id / 32) as usize;
+        let bit = 1u32 << (id % 32);
+        values[occupancy_offset as usize + word] |= bit;
+        values[relevance_offset as usize + word] |= bit;
+    }
+
+    let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<u32>());
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+fn validate_visibility_grid_desc(desc: &VisibilityGridDesc) -> Result<(), RuntimeError> {
+    if desc.macrocell_size == 0 {
+        return Err(RuntimeError::VisibilityGrid(
+            "macrocell size must be greater than zero".to_string(),
+        ));
+    }
+    if desc.cells.contains(&0) {
+        return Err(RuntimeError::VisibilityGrid(
+            "visibility grid cell dimensions must be nonzero".to_string(),
+        ));
     }
     Ok(())
 }
@@ -2205,6 +2381,10 @@ impl<'a> KernelLaunch<'a> {
     }
 
     pub fn arg_instances(&mut self, value: &'a InstanceBuffer) -> &mut Self {
+        self.arg_buffer(&value.buffer)
+    }
+
+    pub fn arg_visibility_grid(&mut self, value: &'a VisibilityGrid) -> &mut Self {
         self.arg_buffer(&value.buffer)
     }
 
@@ -4528,6 +4708,72 @@ mod tests {
         assert_eq!(read_u32_le(&aosoa64, 32), DATA_LAYOUT_AOSOA);
         assert_eq!(read_u32_le(&aosoa64, 36), 64);
         assert_eq!(read_u32_le(&aosoa64, 56 + 8), 768);
+    }
+
+    #[test]
+    fn visibility_grid_packs_macrocell_records_and_bitsets() {
+        let desc = VisibilityGridDesc::macrocell_lattice([256, 256, 128]);
+        let blob = VisibilityGrid::pack(&desc).unwrap();
+        assert_eq!(read_u32_le(&blob, 0), VISIBILITY_GRID_MAGIC);
+        assert_eq!(read_u32_le(&blob, 4), DEFAULT_MACROCELL_SIZE);
+        assert_eq!(read_u32_le(&blob, 8), 32);
+        assert_eq!(read_u32_le(&blob, 12), 32);
+        assert_eq!(read_u32_le(&blob, 16), 16);
+        assert_eq!(read_u32_le(&blob, 20), 32 * 32 * 16);
+        assert_eq!(
+            read_u32_le(&blob, 24),
+            VISIBILITY_GRID_HEADER_U32S as u32 + 32 * 32 * 16 * VISIBILITY_GRID_RECORD_U32S as u32
+        );
+        assert_eq!(
+            read_u32_le(&blob, 28),
+            read_u32_le(&blob, 24) + (32 * 32 * 16u32).div_ceil(32)
+        );
+
+        let first = VISIBILITY_GRID_HEADER_U32S * 4;
+        assert_eq!(
+            [
+                read_u32_le(&blob, first),
+                read_u32_le(&blob, first + 4),
+                read_u32_le(&blob, first + 8),
+                read_u32_le(&blob, first + 12),
+                read_u32_le(&blob, first + 16),
+                read_u32_le(&blob, first + 20),
+            ],
+            [0, 7, 0, 7, 0, 7]
+        );
+        let occupancy_offset = read_u32_le(&blob, 24) as usize * 4;
+        let relevance_offset = read_u32_le(&blob, 28) as usize * 4;
+        assert_eq!(read_u32_le(&blob, occupancy_offset), u32::MAX);
+        assert_eq!(read_u32_le(&blob, relevance_offset), u32::MAX);
+    }
+
+    #[test]
+    fn visibility_grid_rounds_up_and_rejects_invalid_descs() {
+        let desc = VisibilityGridDesc::macrocell_lattice([17, 9, 1]);
+        let blob = VisibilityGrid::pack(&desc).unwrap();
+        assert_eq!(read_u32_le(&blob, 8), 3);
+        assert_eq!(read_u32_le(&blob, 12), 2);
+        assert_eq!(read_u32_le(&blob, 16), 1);
+        let last = read_u32_le(&blob, 24) as usize * 4 - VISIBILITY_GRID_RECORD_U32S * 4;
+        assert_eq!(
+            [
+                read_u32_le(&blob, last),
+                read_u32_le(&blob, last + 4),
+                read_u32_le(&blob, last + 8),
+                read_u32_le(&blob, last + 12),
+                read_u32_le(&blob, last + 16),
+                read_u32_le(&blob, last + 20),
+            ],
+            [16, 16, 8, 8, 0, 0]
+        );
+        assert!(VisibilityGrid::pack(&VisibilityGridDesc::macrocell_lattice([0, 1, 1])).is_err());
+        assert!(
+            VisibilityGrid::pack(&VisibilityGridDesc {
+                cells: [1, 1, 1],
+                macrocell_size: 0,
+            })
+            .is_err()
+        );
     }
 
     #[test]
