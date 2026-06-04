@@ -3,7 +3,7 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
@@ -51,6 +51,35 @@ const DEFAULT_INSTANCE_GRID: InstanceGrid = InstanceGrid {
     y: 256,
     z: 128,
 };
+
+struct AsyncLogSink {
+    sender: Mutex<mpsc::SyncSender<String>>,
+}
+
+static ASYNC_LOG: OnceLock<AsyncLogSink> = OnceLock::new();
+
+fn queue_log_line(line: String) {
+    let sink = ASYNC_LOG.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<String>(256);
+        let _ = thread::Builder::new()
+            .name("neo-live-log".to_string())
+            .spawn(move || {
+                use std::io::Write as _;
+
+                let stdout = std::io::stdout();
+                let mut stdout = stdout.lock();
+                while let Ok(line) = receiver.recv() {
+                    let _ = writeln!(stdout, "{line}");
+                }
+            });
+        AsyncLogSink {
+            sender: Mutex::new(sender),
+        }
+    });
+    if let Ok(sender) = sink.sender.lock() {
+        let _ = sender.try_send(line);
+    }
+}
 
 pub fn main_entry() -> Result<()> {
     run_from_args(std::env::args().skip(1))
@@ -6036,10 +6065,10 @@ impl ThroughputCounter {
         let render_policy = context.render_policy;
         let visibility = context.visibility;
         let frame = context.frame;
-        println!(
+        queue_log_line(format!(
             "kernel_fps {kernel_fps:>9.1} | sample_fps {sample_fps:>6.1} | present_fps {present_fps:>6.1} | completed {:>10} | frame {frame:>8} | {}x{} | {mb_frame:>5.1} MB/frame | dtoh {dtoh_gbps:>5.1} GB/s {sample_us:>6.1} us | upload {upload_gbps:>5.1} GB/s map_copy {map_copy_us:>6.1} us | gpu_copy {draw_us:>6.1} us | swap {swap_us:>6.1} us | present {present_us:>6.1} us | launch {launch_us:>5.1} us/k | wait {wait_us:>5.1} us/k | presenter {presenter} | kernel_cap {kernel_cap} | render_policy {render_policy} | visibility {visibility} | kernel {reload_state}{interop_marker}{variant_marker}{layout_marker}{debug_marker}{materials_marker}{sparse_feedback_marker}{sparse_feedback_stats_marker}{gpu_preset_marker}{gpu_sm_marker}{stress_block_marker}{sparse_quality_marker}{specialization_marker}{material_format_marker}{renderer_marker}{draw_markers}",
             self.total_completed, context.size.width, context.size.height
-        );
+        ));
         self.completed_since_log = 0;
         self.sampled_since_log = 0;
         self.presented_since_log = 0;
@@ -6113,10 +6142,10 @@ impl FpsCounter {
         } else {
             "current"
         };
-        println!(
+        queue_log_line(format!(
             "fps {fps:>7.1} | frame {frame:>8} | {}x{} | launch {launch_us:>5.1} us | dtoh {download_us:>5.1} us | sync {sync_us:>5.1} us | render {render_us:>6.1} us | present {present_us:>6.1} us | total {total_us:>6.1} us | presenter {presenter} | kernel {reload_state}",
             size.width, size.height
-        );
+        ));
         self.frames_since_log = 0;
         self.launch_accum = Duration::ZERO;
         self.download_accum = Duration::ZERO;
