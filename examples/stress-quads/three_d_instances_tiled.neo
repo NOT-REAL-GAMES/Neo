@@ -22,7 +22,7 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
         tile_window[0] = 0;
         tile_window[1] = as_i32(grid_z) - 1;
         tile_window[2] = 1;
-        tile_window[3] = 1;
+        tile_window[3] = 0;
 
         if (width != 0u && height != 0u && grid_z != 0u && neo_mesh_vertex_count(mesh) != 0u && neo_instance_count(instances) != 0u) {
             let spacing: f32 = cam->view.z;
@@ -184,93 +184,202 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
     let half_x: f32 = (as_f32(grid_x) - 1.0f) * 0.5f;
     let half_y: f32 = (as_f32(grid_y) - 1.0f) * 0.5f;
     let half_z: f32 = (as_f32(grid_z_pixel) - 1.0f) * 0.5f;
+    let hit: i32 = 0;
+    let best_t: f32 = 1000000.0f;
 
-    if (instance_count == 0u || fabsf(dir_z) <= 0.00001f) {
+    if (instance_count == 0u) {
         ((unsigned int*)pixels)[idx] = color;
         return;
     }
 
-    let layer_i: i32 = tile_window[0];
-    let end_i: i32 = tile_window[1];
-    let step_i: i32 = tile_window[2];
     let grid_xy: u32 = grid_x * grid_y;
-    let t_guess: f32 = (((as_f32(as_u32(layer_i)) - half_z) * spacing) - cam->origin.z) / dir_z;
-    let t_step: f32 = as_f32(step_i) * spacing / dir_z;
+    let min_x: f32 = -half_x * spacing - spacing * 0.5f;
+    let max_x: f32 = half_x * spacing + spacing * 0.5f;
+    let min_y: f32 = -half_y * spacing - spacing * 0.5f;
+    let max_y: f32 = half_y * spacing + spacing * 0.5f;
+    let min_z: f32 = -half_z * spacing - spacing * 0.5f;
+    let max_z: f32 = half_z * spacing + spacing * 0.5f;
+    let t_enter: f32 = 0.0f;
+    let t_exit: f32 = 1000000000.0f;
 
-    for (int visited = 0; visited < as_i32(grid_z_pixel); ++visited) {
-        if ((step_i > 0 && layer_i > end_i) || (step_i < 0 && layer_i < end_i)) {
+    if (fabsf(dir_x) > 0.00001f) {
+        let t0: f32 = (min_x - cam->origin.x) / dir_x;
+        let t1: f32 = (max_x - cam->origin.x) / dir_x;
+        t_enter = fmaxf(t_enter, fminf(t0, t1));
+        t_exit = fminf(t_exit, fmaxf(t0, t1));
+    } else {
+        if (cam->origin.x < min_x || cam->origin.x > max_x) {
+            ((unsigned int*)pixels)[idx] = color;
+            return;
+        }
+    }
+    if (fabsf(dir_y) > 0.00001f) {
+        let t0: f32 = (min_y - cam->origin.y) / dir_y;
+        let t1: f32 = (max_y - cam->origin.y) / dir_y;
+        t_enter = fmaxf(t_enter, fminf(t0, t1));
+        t_exit = fminf(t_exit, fmaxf(t0, t1));
+    } else {
+        if (cam->origin.y < min_y || cam->origin.y > max_y) {
+            ((unsigned int*)pixels)[idx] = color;
+            return;
+        }
+    }
+    if (fabsf(dir_z) > 0.00001f) {
+        let t0: f32 = (min_z - cam->origin.z) / dir_z;
+        let t1: f32 = (max_z - cam->origin.z) / dir_z;
+        t_enter = fmaxf(t_enter, fminf(t0, t1));
+        t_exit = fminf(t_exit, fmaxf(t0, t1));
+    } else {
+        if (cam->origin.z < min_z || cam->origin.z > max_z) {
+            ((unsigned int*)pixels)[idx] = color;
+            return;
+        }
+    }
+    if (t_exit < t_enter || t_exit < 0.0f) {
+        ((unsigned int*)pixels)[idx] = color;
+        return;
+    }
+
+    let current_t: f32 = fmaxf(t_enter, 0.0f) + 0.0001f;
+    let start_x: f32 = cam->origin.x + dir_x * current_t;
+    let start_y: f32 = cam->origin.y + dir_y * current_t;
+    let start_z: f32 = cam->origin.z + dir_z * current_t;
+    let ix_i: i32 = as_i32(floorf((start_x - min_x) * inv_spacing));
+    let iy_i: i32 = as_i32(floorf((start_y - min_y) * inv_spacing));
+    let iz_i: i32 = as_i32(floorf((start_z - min_z) * inv_spacing));
+    if (ix_i < 0) { ix_i = 0; }
+    if (iy_i < 0) { iy_i = 0; }
+    if (iz_i < 0) { iz_i = 0; }
+    if (ix_i >= as_i32(grid_x)) { ix_i = as_i32(grid_x) - 1; }
+    if (iy_i >= as_i32(grid_y)) { iy_i = as_i32(grid_y) - 1; }
+    if (iz_i >= as_i32(grid_z_pixel)) { iz_i = as_i32(grid_z_pixel) - 1; }
+
+    let step_x: i32 = 0;
+    let step_y: i32 = 0;
+    let step_z: i32 = 0;
+    let t_max_x: f32 = 1000000000.0f;
+    let t_max_y: f32 = 1000000000.0f;
+    let t_max_z: f32 = 1000000000.0f;
+    let t_delta_x: f32 = 1000000000.0f;
+    let t_delta_y: f32 = 1000000000.0f;
+    let t_delta_z: f32 = 1000000000.0f;
+
+    if (dir_x > 0.00001f) {
+        step_x = 1;
+        t_max_x = (min_x + as_f32(as_u32(ix_i + 1)) * spacing - cam->origin.x) / dir_x;
+        t_delta_x = spacing / dir_x;
+    }
+    if (dir_x < -0.00001f) {
+        step_x = -1;
+        t_max_x = (min_x + as_f32(as_u32(ix_i)) * spacing - cam->origin.x) / dir_x;
+        t_delta_x = -spacing / dir_x;
+    }
+    if (dir_y > 0.00001f) {
+        step_y = 1;
+        t_max_y = (min_y + as_f32(as_u32(iy_i + 1)) * spacing - cam->origin.y) / dir_y;
+        t_delta_y = spacing / dir_y;
+    }
+    if (dir_y < -0.00001f) {
+        step_y = -1;
+        t_max_y = (min_y + as_f32(as_u32(iy_i)) * spacing - cam->origin.y) / dir_y;
+        t_delta_y = -spacing / dir_y;
+    }
+    if (dir_z > 0.00001f) {
+        step_z = 1;
+        t_max_z = (min_z + as_f32(as_u32(iz_i + 1)) * spacing - cam->origin.z) / dir_z;
+        t_delta_z = spacing / dir_z;
+    }
+    if (dir_z < -0.00001f) {
+        step_z = -1;
+        t_max_z = (min_z + as_f32(as_u32(iz_i)) * spacing - cam->origin.z) / dir_z;
+        t_delta_z = -spacing / dir_z;
+    }
+
+    for (int dda_step = 0; dda_step < 1024; ++dda_step) {
+        if (ix_i < 0 || iy_i < 0 || iz_i < 0 || ix_i >= as_i32(grid_x) || iy_i >= as_i32(grid_y) || iz_i >= as_i32(grid_z_pixel)) {
+            break;
+        }
+        if (current_t > t_exit || (hit != 0 && current_t > best_t)) {
             break;
         }
 
-        let layer: u32 = as_u32(layer_i);
-        let guess_x: f32 = cam->origin.x + dir_x * t_guess;
-        let guess_y: f32 = cam->origin.y + dir_y * t_guess;
-        let ix_i: i32 = as_i32(floorf(guess_x * inv_spacing + half_x + 0.5f));
-        let iy_i: i32 = as_i32(floorf(guess_y * inv_spacing + half_y + 0.5f));
+        let ix: u32 = as_u32(ix_i);
+        let iy: u32 = as_u32(iy_i);
+        let layer: u32 = as_u32(iz_i);
+        let instance_id: u32 = layer * grid_xy + iy * grid_x + ix;
+                if (instance_id < instance_count) {
+                    let pos: vec3f = neo_instance_position3f(instances, instance_id);
+                    let rot: vec4f = neo_instance_rotation4f(instances, instance_id);
+                    let scale: vec2f = neo_instance_scale2f(instances, instance_id);
+                    let pos_x: f32 = pos.x;
+                    let pos_y: f32 = pos.y;
+                    let pos_z: f32 = pos.z;
+                    let rx: f32 = rot.x;
+                    let ry: f32 = rot.y;
+                    let rz: f32 = rot.z;
+                    let rw: f32 = rot.w;
+                    let scale_x: f32 = scale.x;
+                    let scale_y: f32 = scale.y;
 
-        if (ix_i >= 0 && iy_i >= 0 && ix_i < as_i32(grid_x) && iy_i < as_i32(grid_y)) {
-            let ix: u32 = as_u32(ix_i);
-            let iy: u32 = as_u32(iy_i);
-            let instance_id: u32 = layer * grid_xy + iy * grid_x + ix;
-            if (instance_id < instance_count) {
-                let pos: vec3f = neo_instance_position3f(instances, instance_id);
-                let rot: vec4f = neo_instance_rotation4f(instances, instance_id);
-                let scale: vec2f = neo_instance_scale2f(instances, instance_id);
-                let pos_x: f32 = pos.x;
-                let pos_y: f32 = pos.y;
-                let pos_z: f32 = pos.z;
-                let rx: f32 = rot.x;
-                let ry: f32 = rot.y;
-                let rz: f32 = rot.z;
-                let rw: f32 = rot.w;
-                let scale_x: f32 = scale.x;
-                let scale_y: f32 = scale.y;
+                    let nx_uv_x: f32 = ry;
+                    let nx_uv_y: f32 = -rx;
+                    let nx_uuv_x: f32 = rz * rx;
+                    let nx_uuv_y: f32 = rz * ry;
+                    let nx_uuv_z: f32 = -rx * rx - ry * ry;
+                    let normal_x: f32 = 2.0f * (rw * nx_uv_x + nx_uuv_x);
+                    let normal_y: f32 = 2.0f * (rw * nx_uv_y + nx_uuv_y);
+                    let normal_z: f32 = 1.0f + 2.0f * nx_uuv_z;
+                    let denom: f32 = normal_x * dir_x + normal_y * dir_y + normal_z * dir_z;
 
-                let nx_uv_x: f32 = ry;
-                let nx_uv_y: f32 = -rx;
-                let nx_uuv_x: f32 = rz * rx;
-                let nx_uuv_y: f32 = rz * ry;
-                let nx_uuv_z: f32 = -rx * rx - ry * ry;
-                let normal_x: f32 = 2.0f * (rw * nx_uv_x + nx_uuv_x);
-                let normal_y: f32 = 2.0f * (rw * nx_uv_y + nx_uuv_y);
-                let normal_z: f32 = 1.0f + 2.0f * nx_uuv_z;
-                let denom: f32 = normal_x * dir_x + normal_y * dir_y + normal_z * dir_z;
+                    if (fabsf(denom) > 0.00001f) {
+                        let to_x: f32 = pos_x - cam->origin.x;
+                        let to_y: f32 = pos_y - cam->origin.y;
+                        let to_z: f32 = pos_z - cam->origin.z;
+                        let hit_t: f32 = (to_x * normal_x + to_y * normal_y + to_z * normal_z) / denom;
+                        if (hit_t > 0.0f && hit_t < best_t) {
+                            let vx: f32 = cam->origin.x + dir_x * hit_t - pos_x;
+                            let vy: f32 = cam->origin.y + dir_y * hit_t - pos_y;
+                            let vz: f32 = cam->origin.z + dir_z * hit_t - pos_z;
+                            let uv_x: f32 = ry * vz - rz * vy;
+                            let uv_y: f32 = rz * vx - rx * vz;
+                            let uv_z: f32 = rx * vy - ry * vx;
+                            let uuv_x: f32 = ry * uv_z - rz * uv_y;
+                            let uuv_y: f32 = rz * uv_x - rx * uv_z;
+                            let uuv_z: f32 = rx * uv_y - ry * uv_x;
+                            let local_x_hit: f32 = vx - 2.0f * rw * uv_x + 2.0f * uuv_x;
+                            let local_y_hit: f32 = vy - 2.0f * rw * uv_y + 2.0f * uuv_y;
 
-                if (fabsf(denom) > 0.00001f) {
-                    let to_x: f32 = pos_x - cam->origin.x;
-                    let to_y: f32 = pos_y - cam->origin.y;
-                    let to_z: f32 = pos_z - cam->origin.z;
-                    let hit_t: f32 = (to_x * normal_x + to_y * normal_y + to_z * normal_z) / denom;
-                    if (hit_t > 0.0f) {
-                        let vx: f32 = cam->origin.x + dir_x * hit_t - pos_x;
-                        let vy: f32 = cam->origin.y + dir_y * hit_t - pos_y;
-                        let vz: f32 = cam->origin.z + dir_z * hit_t - pos_z;
-                        let uv_x: f32 = ry * vz - rz * vy;
-                        let uv_y: f32 = rz * vx - rx * vz;
-                        let uv_z: f32 = rx * vy - ry * vx;
-                        let uuv_x: f32 = ry * uv_z - rz * uv_y;
-                        let uuv_y: f32 = rz * uv_x - rx * uv_z;
-                        let uuv_z: f32 = rx * uv_y - ry * uv_x;
-                        let local_x_hit: f32 = vx - 2.0f * rw * uv_x + 2.0f * uuv_x;
-                        let local_y_hit: f32 = vy - 2.0f * rw * uv_y + 2.0f * uuv_y;
-                        let local_z_hit: f32 = vz - 2.0f * rw * uv_z + 2.0f * uuv_z;
-
-                        if (fabsf(local_x_hit) <= scale_x && fabsf(local_y_hit) <= scale_y && fabsf(local_z_hit) <= spacing * 0.08f) {
-                            let shade: f32 = fmaxf(0.18f, fabsf(normal_x * -dir_x + normal_y * -dir_y + normal_z * -dir_z));
-                            let c: u32 = neo_instance_color4u8(instances, instance_id);
-                            let b: u32 = as_u32(as_f32(c & 255u) * shade) & 255u;
-                            let g: u32 = as_u32(as_f32((c >> 8u) & 255u) * shade) & 255u;
-                            let r: u32 = as_u32(as_f32((c >> 16u) & 255u) * shade) & 255u;
-                            color = b | (g << 8u) | (r << 16u) | 0xff000000u;
-                            break;
+                            if (fabsf(local_x_hit) <= scale_x && fabsf(local_y_hit) <= scale_y) {
+                                let shade: f32 = fmaxf(0.18f, fabsf(normal_x * -dir_x + normal_y * -dir_y + normal_z * -dir_z));
+                                let c: u32 = neo_instance_color4u8(instances, instance_id);
+                                let b: u32 = as_u32(as_f32(c & 255u) * shade) & 255u;
+                                let g: u32 = as_u32(as_f32((c >> 8u) & 255u) * shade) & 255u;
+                                let r: u32 = as_u32(as_f32((c >> 16u) & 255u) * shade) & 255u;
+                                color = b | (g << 8u) | (r << 16u) | 0xff000000u;
+                                hit = 1;
+                                best_t = hit_t;
+                            }
                         }
                     }
                 }
-            }
+        let next_t: f32 = fminf(t_max_x, fminf(t_max_y, t_max_z));
+        if (next_t > t_exit || (hit != 0 && next_t > best_t)) {
+            break;
         }
-
-        layer_i = layer_i + step_i;
-        t_guess = t_guess + t_step;
+        let tie_epsilon: f32 = 0.00001f;
+        if (t_max_x <= next_t + tie_epsilon) {
+            ix_i = ix_i + step_x;
+            t_max_x = t_max_x + t_delta_x;
+        }
+        if (t_max_y <= next_t + tie_epsilon) {
+            iy_i = iy_i + step_y;
+            t_max_y = t_max_y + t_delta_y;
+        }
+        if (t_max_z <= next_t + tie_epsilon) {
+            iz_i = iz_i + step_z;
+            t_max_z = t_max_z + t_delta_z;
+        }
+        current_t = next_t;
     }
 
     ((unsigned int*)pixels)[idx] = color;

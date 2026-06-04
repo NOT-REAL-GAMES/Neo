@@ -1,18 +1,51 @@
 #[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum D3d12QueuePriority {
+    Normal,
+    High,
+}
+
+#[cfg(windows)]
+impl D3d12QueuePriority {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::High => "high",
+        }
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Display for D3d12QueuePriority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[cfg(windows)]
 pub struct NeoD3d12InteropDevice {
     device: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     queue: windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue,
+    queue_priority: D3d12QueuePriority,
 }
 
 #[cfg(windows)]
 impl NeoD3d12InteropDevice {
     pub fn new(ctx: &Context) -> Result<Self, RuntimeError> {
+        Self::new_with_queue_priority(ctx, D3d12QueuePriority::Normal)
+    }
+
+    pub fn new_with_queue_priority(
+        ctx: &Context,
+        queue_priority: D3d12QueuePriority,
+    ) -> Result<Self, RuntimeError> {
         use windows::Win32::Graphics::{
             Direct3D::D3D_FEATURE_LEVEL_11_0,
             Direct3D12::{
                 D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC,
-                D3D12_COMMAND_QUEUE_FLAG_NONE, D3D12_COMMAND_QUEUE_PRIORITY_NORMAL,
-                D3D12CreateDevice, ID3D12CommandQueue, ID3D12Device,
+                D3D12_COMMAND_QUEUE_FLAG_NONE, D3D12_COMMAND_QUEUE_PRIORITY_HIGH,
+                D3D12_COMMAND_QUEUE_PRIORITY_NORMAL, D3D12CreateDevice, ID3D12CommandQueue,
+                ID3D12Device,
             },
             Dxgi::{
                 CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS,
@@ -50,14 +83,39 @@ impl NeoD3d12InteropDevice {
         let device = device.ok_or_else(|| {
             RuntimeError::D3d12Interop("D3D12CreateDevice returned no device".to_string())
         })?;
+        let requested_priority = match queue_priority {
+            D3d12QueuePriority::Normal => D3D12_COMMAND_QUEUE_PRIORITY_NORMAL,
+            D3d12QueuePriority::High => D3D12_COMMAND_QUEUE_PRIORITY_HIGH,
+        };
         let queue_desc = D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-            Priority: D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
+            Priority: requested_priority.0,
             Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
             NodeMask: 0,
         };
-        let queue: ID3D12CommandQueue = unsafe { device.CreateCommandQueue(&queue_desc)? };
-        Ok(Self { device, queue })
+        let (queue, queue_priority) = match unsafe { device.CreateCommandQueue(&queue_desc) } {
+            Ok(queue) => (queue, queue_priority),
+            Err(err) if queue_priority == D3d12QueuePriority::High => {
+                eprintln!(
+                    "D3D12 high-priority interop queue unavailable; falling back to normal: {err}"
+                );
+                let normal_desc = D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    Priority: D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
+                    Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
+                    NodeMask: 0,
+                };
+                let queue: ID3D12CommandQueue =
+                    unsafe { device.CreateCommandQueue(&normal_desc)? };
+                (queue, D3d12QueuePriority::Normal)
+            }
+            Err(err) => return Err(err.into()),
+        };
+        Ok(Self {
+            device,
+            queue,
+            queue_priority,
+        })
     }
 
     pub fn device(&self) -> &windows::Win32::Graphics::Direct3D12::ID3D12Device {
@@ -66,6 +124,10 @@ impl NeoD3d12InteropDevice {
 
     pub fn queue(&self) -> &windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue {
         &self.queue
+    }
+
+    pub fn queue_priority(&self) -> D3d12QueuePriority {
+        self.queue_priority
     }
 
     pub fn create_shared_frame_ring(
@@ -94,8 +156,18 @@ pub type RasterDevice = DrawDevice;
 #[cfg(windows)]
 impl DrawDevice {
     pub fn new(ctx: &Context) -> Result<Self, RuntimeError> {
+        Self::new_with_queue_priority(ctx, D3d12QueuePriority::Normal)
+    }
+
+    pub fn new_with_queue_priority(
+        ctx: &Context,
+        queue_priority: D3d12QueuePriority,
+    ) -> Result<Self, RuntimeError> {
         Ok(Self {
-            interop: Arc::new(NeoD3d12InteropDevice::new(ctx)?),
+            interop: Arc::new(NeoD3d12InteropDevice::new_with_queue_priority(
+                ctx,
+                queue_priority,
+            )?),
         })
     }
 

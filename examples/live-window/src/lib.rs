@@ -14,14 +14,14 @@ use std::{
 use anyhow::{Context as _, Result, anyhow, bail};
 use neo_lang::{AddressSpace, TypeName};
 use neo_runtime::{
-    Context as NeoContext, CudaFence, CudaGraph, DataLayout, DeviceBuffer, DeviceInfo, DrawBackend,
-    DrawDepthMode as RuntimeDrawDepthMode, DrawExecution, DrawIndexedIndirectCommand, DrawPolicy,
-    DrawPolicyConfig, GeometryStream, IndexFormat, IndirectDrawBuffer, InstanceAttribute,
-    InstanceBuffer, InstanceBufferDesc, InstanceFormat, InstanceLayout, InstanceSemantic,
-    InstanceStream, Kernel, LaunchDims, MaterialBindingKind, MaterialFragmentRequirement,
-    MaterialKernel, MaterialKernelAbi, MaterialStream, MaterialStreamFormat,
-    MaterialVertexRequirement, MeshBuffer, MeshBufferDesc, NeoD3d12InteropDevice,
-    PrimitiveTopology, RasterCullOrder as RuntimeRasterCullOrder,
+    Context as NeoContext, CudaFence, CudaGraph, D3d12QueuePriority as RuntimeD3d12QueuePriority,
+    DataLayout, DeviceBuffer, DeviceInfo, DrawBackend, DrawDepthMode as RuntimeDrawDepthMode,
+    DrawExecution, DrawIndexedIndirectCommand, DrawPolicy, DrawPolicyConfig, GeometryStream,
+    IndexFormat, IndirectDrawBuffer, InstanceAttribute, InstanceBuffer, InstanceBufferDesc,
+    InstanceFormat, InstanceLayout, InstanceSemantic, InstanceStream, Kernel, LaunchDims,
+    MaterialBindingKind, MaterialFragmentRequirement, MaterialKernel, MaterialKernelAbi,
+    MaterialStream, MaterialStreamFormat, MaterialVertexRequirement, MeshBuffer, MeshBufferDesc,
+    NeoD3d12InteropDevice, PrimitiveTopology, RasterCullOrder as RuntimeRasterCullOrder,
     RasterVisibilityMode as RuntimeRasterVisibilityMode, ReadablePinnedHostBuffer, SharedFrameRing,
     SharedGpuBuffer, SharedInstanceStream, SparseTextureAtlas, SparseTextureDesc,
     SparseTextureFeedbackSummary, Stream as CudaStream, Target, VertexAttribute, VertexFormat,
@@ -777,8 +777,16 @@ fn run(mut options: LiveOptions) -> Result<()> {
     };
     let mut interop_device = None;
     let presenter_kind = if options.presenter == PresenterKind::D3d12Interop {
-        match NeoD3d12InteropDevice::new(&neo) {
+        let requested_queue_priority =
+            RuntimeD3d12QueuePriority::from(options.d3d12_queue_priority);
+        match NeoD3d12InteropDevice::new_with_queue_priority(&neo, requested_queue_priority) {
             Ok(device) => {
+                if device.queue_priority() != requested_queue_priority {
+                    eprintln!(
+                        "D3D12 interop queue priority resolved to {}",
+                        device.queue_priority()
+                    );
+                }
                 interop_device = Some(device);
                 PresenterKind::D3d12Interop
             }
@@ -1038,6 +1046,7 @@ fn run(mut options: LiveOptions) -> Result<()> {
                                     max_inflight,
                                     present_ring: options.present_ring,
                                     stress_block,
+                                    present_schedule: options.present_schedule,
                                 })
                             }
                             _ => Err(anyhow!(
@@ -1094,6 +1103,14 @@ fn run(mut options: LiveOptions) -> Result<()> {
                                 indirect_draws: None,
                                 render_policy: options.render_policy,
                                 visibility,
+                                present_schedule: options.present_schedule,
+                                d3d12_queue_priority: interop_device
+                                    .as_ref()
+                                    .map(|device| device.queue_priority().into())
+                                    .unwrap_or(options.d3d12_queue_priority),
+                                interop_slots: interop_throughput_resources
+                                    .as_ref()
+                                    .map(InteropThroughputResources::slot_counts),
                             });
                             if options.should_stop_completed(completed_kernels, start.elapsed()) {
                                 wait_for_interop_idle(
@@ -1219,6 +1236,12 @@ fn run(mut options: LiveOptions) -> Result<()> {
                                 indirect_draws: Some(1),
                                 render_policy: options.render_policy,
                                 visibility: RenderVisibility::Visible,
+                                present_schedule: options.present_schedule,
+                                d3d12_queue_priority: interop_device
+                                    .as_ref()
+                                    .map(|device| device.queue_priority().into())
+                                    .unwrap_or(options.d3d12_queue_priority),
+                                interop_slots: None,
                             });
                             if options.should_stop_completed(completed_kernels, start.elapsed()) {
                                 raster_resources = None;
@@ -1273,6 +1296,7 @@ fn run(mut options: LiveOptions) -> Result<()> {
                             present_limiter: &mut interop_present_limiter,
                             max_inflight,
                             present_ring: options.present_ring,
+                            present_schedule: options.present_schedule,
                         }),
                         _ => Err(anyhow!("missing D3D12 interop device or mesh buffer")),
                     };
@@ -1308,6 +1332,14 @@ fn run(mut options: LiveOptions) -> Result<()> {
                                 indirect_draws: None,
                                 render_policy: options.render_policy,
                                 visibility: window_visibility.render_visibility(),
+                                present_schedule: options.present_schedule,
+                                d3d12_queue_priority: interop_device
+                                    .as_ref()
+                                    .map(|device| device.queue_priority().into())
+                                    .unwrap_or(options.d3d12_queue_priority),
+                                interop_slots: interop_throughput_resources
+                                    .as_ref()
+                                    .map(InteropThroughputResources::slot_counts),
                             });
                             if options.should_stop_completed(completed_kernels, start.elapsed()) {
                                 wait_for_interop_idle(
@@ -1359,6 +1391,7 @@ fn run(mut options: LiveOptions) -> Result<()> {
                                 present_limiter: &mut interop_present_limiter,
                                 max_inflight,
                                 present_ring: options.present_ring,
+                                present_schedule: options.present_schedule,
                             }),
                             None => Err(anyhow!("missing D3D12 interop device")),
                         }
@@ -1412,6 +1445,14 @@ fn run(mut options: LiveOptions) -> Result<()> {
                                 indirect_draws: None,
                                 render_policy: options.render_policy,
                                 visibility: window_visibility.render_visibility(),
+                                present_schedule: options.present_schedule,
+                                d3d12_queue_priority: interop_device
+                                    .as_ref()
+                                    .map(|device| device.queue_priority().into())
+                                    .unwrap_or(options.d3d12_queue_priority),
+                                interop_slots: interop_throughput_resources
+                                    .as_ref()
+                                    .map(InteropThroughputResources::slot_counts),
                             });
                             if options.should_stop_completed(completed_kernels, start.elapsed()) {
                                 wait_for_interop_idle(
@@ -1696,6 +1737,8 @@ struct LiveOptions {
     sparse_texture_quality: SparseTextureQuality,
     render_policy: RenderPolicy,
     d3d_upload: D3dUploadMode,
+    present_schedule: InteropPresentSchedule,
+    d3d12_queue_priority: D3d12QueuePriority,
     interop_fallback: InteropFallback,
     hot_reload: bool,
     raster_plan: HardwareRasterPlan,
@@ -1728,6 +1771,8 @@ impl LiveOptions {
             sparse_texture_quality: SparseTextureQuality::Auto,
             render_policy: RenderPolicy::Auto,
             d3d_upload: D3dUploadMode::MappedCopy,
+            present_schedule: InteropPresentSchedule::LatePresent,
+            d3d12_queue_priority: D3d12QueuePriority::Normal,
             interop_fallback: InteropFallback::NoInterop,
             hot_reload: true,
             raster_plan: HardwareRasterPlan::stock(),
@@ -1802,13 +1847,19 @@ impl LiveOptions {
                     options.render_policy = parse_next(&mut args, "--render-policy")?
                 }
                 "--d3d-upload" => options.d3d_upload = parse_next(&mut args, "--d3d-upload")?,
+                "--interop-present-schedule" => {
+                    options.present_schedule = parse_next(&mut args, "--interop-present-schedule")?
+                }
+                "--d3d12-queue-priority" => {
+                    options.d3d12_queue_priority = parse_next(&mut args, "--d3d12-queue-priority")?
+                }
                 "--interop-fallback" => {
                     options.interop_fallback = parse_next(&mut args, "--interop-fallback")?
                 }
                 "--hot-reload" => options.hot_reload = true,
                 "--no-hot-reload" => options.hot_reload = false,
                 "--help" | "-h" => bail!(
-                    "usage: neo-live-window [path.neo] [--title TEXT] [--width N] [--height N] [--frames N] [--seconds N] [--presenter d3d12-interop|d3d12|d3d11|gdi] [--mode live|kernel-throughput|mesh-demo|instance-stress|draw-stress|raster-stress] [--sample-every N] [--present-target-fps N] [--kernel-target-fps N] [--max-inflight N] [--present-ring N] [--instance-grid XxYxZ] [--instance-stress-variant baseline|fast|culled|tiled|macrocell] [--instance-debug-view off|tile-range|iterations|hit-miss] [--instance-layout aosoa32|aosoa64] [--instance-materials none|sparse-texture] [--sparse-feedback off|sampled|block|missing|atomic] [--gpu-preset auto|pascal|modern] [--stress-block WxH] [--sparse-texture-quality auto|full|pascal-fast] [--draw-policy draw-all|compute-culled] [--draw-depth auto|on|off] [--cull-order atomic-compact|stable-dense] [--visibility frustum|projected-size] [--min-projected-pixels N] [--render-policy auto|force-render|pause-when-empty] [--d3d-upload mapped-copy|update-subresource] [--interop-fallback no-interop|fail] [--hot-reload|--no-hot-reload]"
+                    "usage: neo-live-window [path.neo] [--title TEXT] [--width N] [--height N] [--frames N] [--seconds N] [--presenter d3d12-interop|d3d12|d3d11|gdi] [--mode live|kernel-throughput|mesh-demo|instance-stress|draw-stress|raster-stress] [--sample-every N] [--present-target-fps N] [--kernel-target-fps N] [--max-inflight N] [--present-ring N] [--instance-grid XxYxZ] [--instance-stress-variant baseline|fast|culled|tiled|cuda-raster|macrocell] [--instance-debug-view off|tile-range|iterations|hit-miss] [--instance-layout aosoa32|aosoa64] [--instance-materials none|sparse-texture] [--sparse-feedback off|sampled|block|missing|atomic] [--gpu-preset auto|pascal|modern] [--stress-block WxH] [--sparse-texture-quality auto|full|pascal-fast] [--draw-policy draw-all|compute-culled] [--draw-depth auto|on|off] [--cull-order atomic-compact|stable-dense] [--visibility frustum|projected-size] [--min-projected-pixels N] [--render-policy auto|force-render|pause-when-empty] [--d3d-upload mapped-copy|update-subresource] [--interop-present-schedule early-present|late-present] [--d3d12-queue-priority normal|high] [--interop-fallback no-interop|fail] [--hot-reload|--no-hot-reload]"
                 ),
                 value if value.starts_with('-') => bail!("unknown option `{value}`"),
                 value => options.source_path = PathBuf::from(value),
@@ -2089,6 +2140,7 @@ enum InstanceStressVariant {
     Fast,
     Culled,
     Tiled,
+    CudaRaster,
     Macrocell,
 }
 
@@ -2116,6 +2168,16 @@ impl InstanceStressVariant {
                     return requested.with_file_name(match layout {
                         StressInstanceLayout::AoSoA32 => "three_d_instances_tiled_aosoa32.neo",
                         StressInstanceLayout::AoSoA64 => "three_d_instances_tiled_aosoa64.neo",
+                    });
+                }
+                Self::CudaRaster => {
+                    return requested.with_file_name(match layout {
+                        StressInstanceLayout::AoSoA32 => {
+                            "three_d_instances_cuda_raster_aosoa32.neo"
+                        }
+                        StressInstanceLayout::AoSoA64 => {
+                            "three_d_instances_cuda_raster_aosoa64.neo"
+                        }
                     });
                 }
                 Self::Macrocell => {
@@ -2152,9 +2214,10 @@ impl std::str::FromStr for InstanceStressVariant {
             "fast" => Ok(Self::Fast),
             "culled" => Ok(Self::Culled),
             "tiled" => Ok(Self::Tiled),
+            "cuda-raster" => Ok(Self::CudaRaster),
             "macrocell" => Ok(Self::Macrocell),
             _ => bail!(
-                "unknown instance stress variant `{value}`; expected baseline, fast, culled, tiled, or macrocell"
+                "unknown instance stress variant `{value}`; expected baseline, fast, culled, tiled, cuda-raster, or macrocell"
             ),
         }
     }
@@ -2167,6 +2230,7 @@ impl std::fmt::Display for InstanceStressVariant {
             Self::Fast => f.write_str("fast"),
             Self::Culled => f.write_str("culled"),
             Self::Tiled => f.write_str("tiled"),
+            Self::CudaRaster => f.write_str("cuda-raster"),
             Self::Macrocell => f.write_str("macrocell"),
         }
     }
@@ -2610,6 +2674,80 @@ impl std::fmt::Display for D3dUploadMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteropPresentSchedule {
+    EarlyPresent,
+    LatePresent,
+}
+
+impl std::str::FromStr for InteropPresentSchedule {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "early-present" => Ok(Self::EarlyPresent),
+            "late-present" => Ok(Self::LatePresent),
+            _ => bail!(
+                "unknown interop present schedule `{value}`; expected early-present or late-present"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for InteropPresentSchedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EarlyPresent => f.write_str("early-present"),
+            Self::LatePresent => f.write_str("late-present"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum D3d12QueuePriority {
+    Normal,
+    High,
+}
+
+impl std::str::FromStr for D3d12QueuePriority {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "normal" => Ok(Self::Normal),
+            "high" => Ok(Self::High),
+            _ => bail!("unknown D3D12 queue priority `{value}`; expected normal or high"),
+        }
+    }
+}
+
+impl std::fmt::Display for D3d12QueuePriority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Normal => f.write_str("normal"),
+            Self::High => f.write_str("high"),
+        }
+    }
+}
+
+impl From<D3d12QueuePriority> for RuntimeD3d12QueuePriority {
+    fn from(value: D3d12QueuePriority) -> Self {
+        match value {
+            D3d12QueuePriority::Normal => Self::Normal,
+            D3d12QueuePriority::High => Self::High,
+        }
+    }
+}
+
+impl From<RuntimeD3d12QueuePriority> for D3d12QueuePriority {
+    fn from(value: RuntimeD3d12QueuePriority) -> Self {
+        match value {
+            RuntimeD3d12QueuePriority::Normal => Self::Normal,
+            RuntimeD3d12QueuePriority::High => Self::High,
+        }
+    }
+}
+
 fn parse_next<T: std::str::FromStr>(
     args: &mut impl Iterator<Item = String>,
     name: &str,
@@ -2788,10 +2926,13 @@ fn validate_mesh_kernel_abi(source: &str) -> Result<()> {
 }
 
 struct InstanceKernel {
+    clear: Option<Kernel>,
     raster: Kernel,
+    resolve: Option<Kernel>,
     cull: Option<Kernel>,
     visibility_prepare: Option<Kernel>,
     tiled: bool,
+    cuda_raster: bool,
     macrocell: bool,
     textured: bool,
     specialization: &'static str,
@@ -2813,6 +2954,7 @@ impl InstanceKernel {
             | InstanceStressVariant::Tiled => {
                 validate_instance_kernel_abi(&source)?;
             }
+            InstanceStressVariant::CudaRaster => validate_cuda_raster_instance_kernel_abi(&source)?,
             InstanceStressVariant::Culled => validate_culled_instance_kernel_abi(&source)?,
             InstanceStressVariant::Macrocell => {
                 if materials == InstanceMaterials::SparseTexture {
@@ -2828,6 +2970,9 @@ impl InstanceKernel {
             | InstanceStressVariant::Tiled => {
                 vec!["instance_raster"]
             }
+            InstanceStressVariant::CudaRaster => {
+                vec!["instance_clear", "instance_raster", "instance_resolve"]
+            }
             InstanceStressVariant::Culled => vec!["instance_cull", "instance_raster"],
             InstanceStressVariant::Macrocell => {
                 vec!["instance_visibility_prepare", "instance_raster"]
@@ -2835,7 +2980,17 @@ impl InstanceKernel {
         };
         let module = neo_runtime::Module::from_neo_source(ctx, &source, &entrypoints)?;
         Ok(Self {
+            clear: if variant == InstanceStressVariant::CudaRaster {
+                Some(module.kernel("instance_clear")?)
+            } else {
+                None
+            },
             raster: module.kernel("instance_raster")?,
+            resolve: if variant == InstanceStressVariant::CudaRaster {
+                Some(module.kernel("instance_resolve")?)
+            } else {
+                None
+            },
             cull: if variant == InstanceStressVariant::Culled {
                 Some(module.kernel("instance_cull")?)
             } else {
@@ -2850,6 +3005,7 @@ impl InstanceKernel {
                 variant,
                 InstanceStressVariant::Tiled | InstanceStressVariant::Macrocell
             ),
+            cuda_raster: variant == InstanceStressVariant::CudaRaster,
             macrocell: variant == InstanceStressVariant::Macrocell,
             textured: materials == InstanceMaterials::SparseTexture,
             specialization,
@@ -2866,6 +3022,8 @@ fn instance_kernel_specialization(path: &Path) -> &'static str {
         Some("three_d_instances_macrocell_aosoa32.neo") => "macrocell-aosoa32",
         Some("three_d_instances_tiled_aosoa32.neo") => "tiled-aosoa32",
         Some("three_d_instances_tiled_aosoa64.neo") => "tiled-aosoa64",
+        Some("three_d_instances_cuda_raster_aosoa32.neo") => "cuda-raster-aosoa32",
+        Some("three_d_instances_cuda_raster_aosoa64.neo") => "cuda-raster-aosoa64",
         _ => "custom",
     }
 }
@@ -3278,6 +3436,49 @@ fn validate_instance_kernel_abi(source: &str) -> Result<()> {
         ],
         "instance stress kernel",
         "global u8* pixels, u32 width, u32 height, global u8* mesh, global u8* instances, global u8* camera, f32 time, u32 frame",
+    )
+}
+
+fn validate_cuda_raster_instance_kernel_abi(source: &str) -> Result<()> {
+    let program = neo_lang::parse(source)?;
+    validate_kernel_signature(
+        &program,
+        "instance_clear",
+        &[
+            ("packed", Some(AddressSpace::Global), TypeName::U8, 1usize),
+            ("width", None, TypeName::U32, 0),
+            ("height", None, TypeName::U32, 0),
+        ],
+        "CUDA raster clear kernel",
+        "global u8* packed, u32 width, u32 height",
+    )?;
+    validate_kernel_signature(
+        &program,
+        "instance_raster",
+        &[
+            ("packed", Some(AddressSpace::Global), TypeName::U8, 1usize),
+            ("width", None, TypeName::U32, 0),
+            ("height", None, TypeName::U32, 0),
+            ("mesh", Some(AddressSpace::Global), TypeName::U8, 1),
+            ("instances", Some(AddressSpace::Global), TypeName::U8, 1),
+            ("camera", Some(AddressSpace::Global), TypeName::U8, 1),
+            ("time", None, TypeName::F32, 0),
+            ("frame", None, TypeName::U32, 0),
+        ],
+        "CUDA raster instance kernel",
+        "global u8* packed, u32 width, u32 height, global u8* mesh, global u8* instances, global u8* camera, f32 time, u32 frame",
+    )?;
+    validate_kernel_signature(
+        &program,
+        "instance_resolve",
+        &[
+            ("pixels", Some(AddressSpace::Global), TypeName::U8, 1usize),
+            ("packed", Some(AddressSpace::Global), TypeName::U8, 1),
+            ("width", None, TypeName::U32, 0),
+            ("height", None, TypeName::U32, 0),
+        ],
+        "CUDA raster resolve kernel",
+        "global u8* pixels, global u8* packed, u32 width, u32 height",
     )
 }
 
@@ -3703,6 +3904,9 @@ struct InstanceStressAssets {
     tile_cull_width: u32,
     tile_cull_height: u32,
     tile_cull_buffers: Vec<DeviceBuffer<u8>>,
+    cuda_raster_width: u32,
+    cuda_raster_height: u32,
+    cuda_raster_buffers: Vec<DeviceBuffer<u8>>,
 }
 
 #[derive(Clone, Copy)]
@@ -3836,6 +4040,9 @@ fn create_instance_stress_assets(
         tile_cull_width: 0,
         tile_cull_height: 0,
         tile_cull_buffers: Vec::new(),
+        cuda_raster_width: 0,
+        cuda_raster_height: 0,
+        cuda_raster_buffers: Vec::new(),
     })
 }
 
@@ -3885,6 +4092,46 @@ fn ensure_tile_cull_buffers(
     assets.tile_cull_width = tiles_x;
     assets.tile_cull_height = tiles_y;
     assets.tile_cull_buffers = buffers;
+    Ok(())
+}
+
+fn cuda_raster_byte_len(size: PhysicalSize<u32>) -> Result<usize> {
+    if size.width == 0 || size.height == 0 {
+        bail!("CUDA raster buffer size must be nonzero");
+    }
+    size.width
+        .checked_mul(size.height)
+        .and_then(|pixels| pixels.checked_mul(8))
+        .map(|bytes| bytes as usize)
+        .ok_or_else(|| {
+            anyhow!(
+                "CUDA raster buffer size overflow for {}x{}",
+                size.width,
+                size.height
+            )
+        })
+}
+
+fn ensure_cuda_raster_buffers(
+    neo: &NeoContext,
+    assets: &mut InstanceStressAssets,
+    size: PhysicalSize<u32>,
+    present_ring: usize,
+) -> Result<()> {
+    if assets.cuda_raster_width == size.width
+        && assets.cuda_raster_height == size.height
+        && assets.cuda_raster_buffers.len() == present_ring
+    {
+        return Ok(());
+    }
+    let byte_len = cuda_raster_byte_len(size)?;
+    let mut buffers = Vec::with_capacity(present_ring);
+    for _ in 0..present_ring {
+        buffers.push(neo.alloc_zeros(byte_len)?);
+    }
+    assets.cuda_raster_width = size.width;
+    assets.cuda_raster_height = size.height;
+    assets.cuda_raster_buffers = buffers;
     Ok(())
 }
 
@@ -4490,6 +4737,13 @@ enum InteropSlotState {
     Completed,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct InteropSlotCounts {
+    free: usize,
+    pending: usize,
+    completed: usize,
+}
+
 impl InteropThroughputResources {
     fn new(
         neo: &NeoContext,
@@ -4526,6 +4780,18 @@ impl InteropThroughputResources {
             .any(|slot| slot.state != InteropSlotState::Free)
     }
 
+    fn slot_counts(&self) -> InteropSlotCounts {
+        let mut counts = InteropSlotCounts::default();
+        for slot in &self.slots {
+            match slot.state {
+                InteropSlotState::Free => counts.free += 1,
+                InteropSlotState::Pending => counts.pending += 1,
+                InteropSlotState::Completed => counts.completed += 1,
+            }
+        }
+        counts
+    }
+
     fn drain_completed(
         &mut self,
         presenter: &mut WindowPresenter,
@@ -4533,6 +4799,17 @@ impl InteropThroughputResources {
         present_limiter: &mut PresentRateLimiter,
     ) -> Result<ThroughputBatchStats> {
         let mut stats = ThroughputBatchStats::default();
+        self.mark_completed(&mut stats);
+        let newest = self.retain_newest_completed();
+        if let Some(index) = newest
+            && present_limiter.try_consume(Instant::now())
+        {
+            self.present_completed_slot(index, presenter, size, &mut stats)?;
+        }
+        Ok(stats)
+    }
+
+    fn mark_completed(&mut self, stats: &mut ThroughputBatchStats) {
         for index in 0..self.slots.len() {
             if self.slots[index].state != InteropSlotState::Pending {
                 continue;
@@ -4547,34 +4824,41 @@ impl InteropThroughputResources {
             stats.completed_kernels += 1;
             self.slots[index].state = InteropSlotState::Completed;
         }
+    }
 
-        let newest = self
-            .slots
-            .iter()
-            .enumerate()
-            .filter(|(_, slot)| slot.state == InteropSlotState::Completed)
-            .max_by_key(|(_, slot)| slot.frame)
-            .map(|(index, _)| index);
-
-        if newest.is_some() && present_limiter.try_consume(Instant::now()) {
-            if let Some(index) = newest {
-                self.present_completed_slot(index, presenter, size, &mut stats)?;
-            }
-        }
-
-        let newest_to_retain = if stats.presented_frames > 0 {
-            None
-        } else {
-            newest
-        };
+    fn retain_newest_completed(&mut self) -> Option<usize> {
+        let newest = newest_completed_interop_slot(
+            self.slots
+                .iter()
+                .enumerate()
+                .map(|(index, slot)| (index, slot.state, slot.frame)),
+        );
         for index in 0..self.slots.len() {
-            if self.slots[index].state == InteropSlotState::Completed
-                && Some(index) != newest_to_retain
-            {
+            if self.slots[index].state == InteropSlotState::Completed && Some(index) != newest {
                 self.slots[index].state = InteropSlotState::Free;
             }
         }
-        Ok(stats)
+        newest
+    }
+
+    fn present_completed_if_ready(
+        &mut self,
+        index: Option<usize>,
+        presenter: &mut WindowPresenter,
+        size: PhysicalSize<u32>,
+        present_limiter: &mut PresentRateLimiter,
+        stats: &mut ThroughputBatchStats,
+    ) -> Result<()> {
+        if let Some(index) = index
+            && self
+                .slots
+                .get(index)
+                .is_some_and(|slot| slot.state == InteropSlotState::Completed)
+            && present_limiter.try_consume(Instant::now())
+        {
+            self.present_completed_slot(index, presenter, size, stats)?;
+        }
+        Ok(())
     }
 
     fn present_completed_slot(
@@ -4602,6 +4886,16 @@ impl InteropThroughputResources {
         interop_trace("presented shared frame");
         Ok(())
     }
+}
+
+fn newest_completed_interop_slot(
+    slots: impl IntoIterator<Item = (usize, InteropSlotState, u32)>,
+) -> Option<usize> {
+    slots
+        .into_iter()
+        .filter(|(_, state, _)| *state == InteropSlotState::Completed)
+        .max_by_key(|(_, _, frame)| *frame)
+        .map(|(index, _, _)| index)
 }
 
 struct RasterStressResources {
@@ -5027,6 +5321,7 @@ struct InteropThroughputBatch<'a> {
     present_limiter: &'a mut PresentRateLimiter,
     max_inflight: u32,
     present_ring: usize,
+    present_schedule: InteropPresentSchedule,
 }
 
 fn run_interop_throughput_batch(input: InteropThroughputBatch<'_>) -> Result<ThroughputBatchStats> {
@@ -5049,11 +5344,30 @@ fn run_interop_throughput_batch(input: InteropThroughputBatch<'_>) -> Result<Thr
         PresentSink::Threaded(_) => bail!("d3d12-interop does not use the present thread"),
     };
 
-    stats += resources.drain_completed(direct_presenter, input.size, input.present_limiter)?;
+    let late_completed = match input.present_schedule {
+        InteropPresentSchedule::EarlyPresent => {
+            stats +=
+                resources.drain_completed(direct_presenter, input.size, input.present_limiter)?;
+            None
+        }
+        InteropPresentSchedule::LatePresent => {
+            resources.mark_completed(&mut stats);
+            resources.retain_newest_completed()
+        }
+    };
     if stats.completed_kernels > 0 {
         *input.completed_kernels += u64::from(stats.completed_kernels);
     }
     if input.max_inflight == 0 {
+        if input.present_schedule == InteropPresentSchedule::LatePresent {
+            resources.present_completed_if_ready(
+                late_completed,
+                direct_presenter,
+                input.size,
+                input.present_limiter,
+                &mut stats,
+            )?;
+        }
         return Ok(stats);
     }
 
@@ -5098,6 +5412,15 @@ fn run_interop_throughput_batch(input: InteropThroughputBatch<'_>) -> Result<Thr
         launched += 1;
         *input.next_frame = input.next_frame.wrapping_add(1);
     }
+    if input.present_schedule == InteropPresentSchedule::LatePresent {
+        resources.present_completed_if_ready(
+            late_completed,
+            direct_presenter,
+            input.size,
+            input.present_limiter,
+            &mut stats,
+        )?;
+    }
     Ok(stats)
 }
 
@@ -5115,6 +5438,7 @@ struct MeshDemoBatch<'a> {
     present_limiter: &'a mut PresentRateLimiter,
     max_inflight: u32,
     present_ring: usize,
+    present_schedule: InteropPresentSchedule,
 }
 
 fn run_mesh_demo_batch(input: MeshDemoBatch<'_>) -> Result<ThroughputBatchStats> {
@@ -5137,11 +5461,30 @@ fn run_mesh_demo_batch(input: MeshDemoBatch<'_>) -> Result<ThroughputBatchStats>
         PresentSink::Threaded(_) => bail!("mesh-demo does not use the present thread"),
     };
 
-    stats += resources.drain_completed(direct_presenter, input.size, input.present_limiter)?;
+    let late_completed = match input.present_schedule {
+        InteropPresentSchedule::EarlyPresent => {
+            stats +=
+                resources.drain_completed(direct_presenter, input.size, input.present_limiter)?;
+            None
+        }
+        InteropPresentSchedule::LatePresent => {
+            resources.mark_completed(&mut stats);
+            resources.retain_newest_completed()
+        }
+    };
     if stats.completed_kernels > 0 {
         *input.completed_kernels += u64::from(stats.completed_kernels);
     }
     if input.max_inflight == 0 {
+        if input.present_schedule == InteropPresentSchedule::LatePresent {
+            resources.present_completed_if_ready(
+                late_completed,
+                direct_presenter,
+                input.size,
+                input.present_limiter,
+                &mut stats,
+            )?;
+        }
         return Ok(stats);
     }
 
@@ -5191,6 +5534,15 @@ fn run_mesh_demo_batch(input: MeshDemoBatch<'_>) -> Result<ThroughputBatchStats>
         launched += 1;
         *input.next_frame = input.next_frame.wrapping_add(1);
     }
+    if input.present_schedule == InteropPresentSchedule::LatePresent {
+        resources.present_completed_if_ready(
+            late_completed,
+            direct_presenter,
+            input.size,
+            input.present_limiter,
+            &mut stats,
+        )?;
+    }
     Ok(stats)
 }
 
@@ -5210,6 +5562,7 @@ struct InstanceStressBatch<'a> {
     max_inflight: u32,
     present_ring: usize,
     stress_block: StressBlock,
+    present_schedule: InteropPresentSchedule,
 }
 
 fn run_instance_stress_batch(input: InstanceStressBatch<'_>) -> Result<ThroughputBatchStats> {
@@ -5233,23 +5586,59 @@ fn run_instance_stress_batch(input: InstanceStressBatch<'_>) -> Result<Throughpu
             resources.slots.len(),
         )?;
     }
+    if input.kernel.cuda_raster {
+        ensure_cuda_raster_buffers(
+            input.neo,
+            input.assets,
+            PhysicalSize::new(kernel_width, input.size.height),
+            resources.slots.len(),
+        )?;
+    }
     let raster_block = if input.kernel.tiled {
         input.stress_block.tuple()
     } else {
         BLOCK
     };
     let dims = LaunchDims::for_2d(kernel_width, input.size.height, raster_block);
+    let cuda_raster_instance_count = input.camera.grid[0]
+        .checked_mul(input.camera.grid[1])
+        .and_then(|xy| xy.checked_mul(input.camera.grid[2]))
+        .ok_or_else(|| anyhow!("instance grid count overflow"))?;
+    let cuda_raster_instance_dims = LaunchDims {
+        grid: (cuda_raster_instance_count.div_ceil(128), 1, 1),
+        block: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
     let mut stats = ThroughputBatchStats::default();
     let direct_presenter = match input.presenter {
         PresentSink::Direct(presenter) => presenter,
         PresentSink::Threaded(_) => bail!("instance-stress does not use the present thread"),
     };
 
-    stats += resources.drain_completed(direct_presenter, input.size, input.present_limiter)?;
+    let late_completed = match input.present_schedule {
+        InteropPresentSchedule::EarlyPresent => {
+            stats +=
+                resources.drain_completed(direct_presenter, input.size, input.present_limiter)?;
+            None
+        }
+        InteropPresentSchedule::LatePresent => {
+            resources.mark_completed(&mut stats);
+            resources.retain_newest_completed()
+        }
+    };
     if stats.completed_kernels > 0 {
         *input.completed_kernels += u64::from(stats.completed_kernels);
     }
     if input.max_inflight == 0 {
+        if input.present_schedule == InteropPresentSchedule::LatePresent {
+            resources.present_completed_if_ready(
+                late_completed,
+                direct_presenter,
+                input.size,
+                input.present_limiter,
+                &mut stats,
+            )?;
+        }
         return Ok(stats);
     }
 
@@ -5321,8 +5710,66 @@ fn run_instance_stress_batch(input: InstanceStressBatch<'_>) -> Result<Throughpu
                     .context("failed to launch instance stress cull kernel")?;
             }
         }
-        let stream_kernel = input.kernel.raster.on_stream(stream);
-        {
+        if input.kernel.cuda_raster {
+            let packed = input
+                .assets
+                .cuda_raster_buffers
+                .get(index)
+                .context("missing CUDA raster packed framebuffer for interop slot")?;
+
+            let clear_kernel = input
+                .kernel
+                .clear
+                .as_ref()
+                .context("missing CUDA raster clear kernel")?
+                .on_stream(stream);
+            let mut clear = clear_kernel.launcher();
+            clear
+                .arg_buffer(packed)
+                .arg(&kernel_width)
+                .arg(&input.size.height);
+            unsafe {
+                clear
+                    .launch(dims)
+                    .context("failed to launch CUDA raster clear kernel")?;
+            }
+
+            let stream_kernel = input.kernel.raster.on_stream(stream);
+            let mut raster = stream_kernel.launcher();
+            raster
+                .arg_buffer(packed)
+                .arg(&kernel_width)
+                .arg(&input.size.height)
+                .arg_mesh(&input.assets.mesh)
+                .arg_instances(&input.assets.instances)
+                .arg_buffer(&input.assets.camera_buffers[index])
+                .arg(&time)
+                .arg(&frame);
+            unsafe {
+                raster
+                    .launch(cuda_raster_instance_dims)
+                    .context("failed to launch CUDA raster instance kernel")?;
+            }
+
+            let resolve_kernel = input
+                .kernel
+                .resolve
+                .as_ref()
+                .context("missing CUDA raster resolve kernel")?
+                .on_stream(stream);
+            let mut resolve = resolve_kernel.launcher();
+            resolve
+                .arg_device_ptr(&pixel_arg)
+                .arg_buffer(packed)
+                .arg(&kernel_width)
+                .arg(&input.size.height);
+            unsafe {
+                resolve
+                    .launch(dims)
+                    .context("failed to launch CUDA raster resolve kernel")?;
+            }
+        } else {
+            let stream_kernel = input.kernel.raster.on_stream(stream);
             let mut launch = stream_kernel.launcher();
             if input.kernel.macrocell {
                 launch
@@ -5384,6 +5831,15 @@ fn run_instance_stress_batch(input: InstanceStressBatch<'_>) -> Result<Throughpu
         stats.launch += launch_start.elapsed();
         launched += 1;
         *input.next_frame = input.next_frame.wrapping_add(1);
+    }
+    if input.present_schedule == InteropPresentSchedule::LatePresent {
+        resources.present_completed_if_ready(
+            late_completed,
+            direct_presenter,
+            input.size,
+            input.present_limiter,
+            &mut stats,
+        )?;
     }
     Ok(stats)
 }
@@ -5824,6 +6280,9 @@ struct ThroughputLogContext<'a> {
     indirect_draws: Option<u32>,
     render_policy: RenderPolicy,
     visibility: RenderVisibility,
+    present_schedule: InteropPresentSchedule,
+    d3d12_queue_priority: D3d12QueuePriority,
+    interop_slots: Option<InteropSlotCounts>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -5979,6 +6438,15 @@ impl ThroughputCounter {
         } else {
             ""
         };
+        let slot_marker = context
+            .interop_slots
+            .map(|slots| {
+                format!(
+                    " | interop_slots_free {} | interop_slots_pending {} | interop_slots_completed {}",
+                    slots.free, slots.pending, slots.completed
+                )
+            })
+            .unwrap_or_default();
         let variant_marker = context
             .instance_variant
             .map(|variant| format!(" | instance_variant {variant}"))
@@ -6070,9 +6538,11 @@ impl ThroughputCounter {
         let presenter = context.presenter;
         let render_policy = context.render_policy;
         let visibility = context.visibility;
+        let present_schedule = context.present_schedule;
+        let d3d12_queue_priority = context.d3d12_queue_priority;
         let frame = context.frame;
         queue_log_line(format!(
-            "kernel_fps {kernel_fps:>9.1} | sample_fps {sample_fps:>6.1} | present_fps {present_fps:>6.1} | completed {:>10} | frame {frame:>8} | {}x{} | {mb_frame:>5.1} MB/frame | dtoh {dtoh_gbps:>5.1} GB/s {sample_us:>6.1} us | upload {upload_gbps:>5.1} GB/s map_copy {map_copy_us:>6.1} us | gpu_copy {draw_us:>6.1} us | swap {swap_us:>6.1} us | present {present_us:>6.1} us | launch {launch_us:>5.1} us/k | wait {wait_us:>5.1} us/k | presenter {presenter} | kernel_cap {kernel_cap} | render_policy {render_policy} | visibility {visibility} | kernel {reload_state}{interop_marker}{variant_marker}{layout_marker}{debug_marker}{materials_marker}{sparse_feedback_marker}{sparse_feedback_stats_marker}{gpu_preset_marker}{gpu_sm_marker}{stress_block_marker}{sparse_quality_marker}{specialization_marker}{material_format_marker}{renderer_marker}{draw_markers}",
+            "kernel_fps {kernel_fps:>9.1} | sample_fps {sample_fps:>6.1} | present_fps {present_fps:>6.1} | completed {:>10} | frame {frame:>8} | {}x{} | {mb_frame:>5.1} MB/frame | dtoh {dtoh_gbps:>5.1} GB/s {sample_us:>6.1} us | upload {upload_gbps:>5.1} GB/s map_copy {map_copy_us:>6.1} us | gpu_copy {draw_us:>6.1} us | swap {swap_us:>6.1} us | present {present_us:>6.1} us | launch {launch_us:>5.1} us/k | wait {wait_us:>5.1} us/k | presenter {presenter} | kernel_cap {kernel_cap} | render_policy {render_policy} | visibility {visibility} | present_schedule {present_schedule} | d3d12_queue_priority {d3d12_queue_priority} | kernel {reload_state}{interop_marker}{slot_marker}{variant_marker}{layout_marker}{debug_marker}{materials_marker}{sparse_feedback_marker}{sparse_feedback_stats_marker}{gpu_preset_marker}{gpu_sm_marker}{stress_block_marker}{sparse_quality_marker}{specialization_marker}{material_format_marker}{renderer_marker}{draw_markers}",
             self.total_completed, context.size.width, context.size.height
         ));
         self.completed_since_log = 0;
@@ -9216,6 +9686,14 @@ mod tests {
             "../../stress-quads/three_d_instances_tiled_aosoa64.neo"
         ))
         .unwrap();
+        validate_cuda_raster_instance_kernel_abi(include_str!(
+            "../../stress-quads/three_d_instances_cuda_raster_aosoa32.neo"
+        ))
+        .unwrap();
+        validate_cuda_raster_instance_kernel_abi(include_str!(
+            "../../stress-quads/three_d_instances_cuda_raster_aosoa64.neo"
+        ))
+        .unwrap();
         validate_macrocell_instance_kernel_abi(include_str!(
             "../../stress-quads/three_d_instances_macrocell_aosoa32.neo"
         ))
@@ -9998,6 +10476,10 @@ fragment fn quad_fs() {
                 "5",
                 "--d3d-upload",
                 "update-subresource",
+                "--interop-present-schedule",
+                "early-present",
+                "--d3d12-queue-priority",
+                "high",
                 "--interop-fallback",
                 "fail",
                 "--no-hot-reload",
@@ -10015,6 +10497,11 @@ fragment fn quad_fs() {
         assert_eq!(options.kernel_cap(), Some(240.0));
         assert_eq!(options.present_ring, 5);
         assert_eq!(options.d3d_upload, D3dUploadMode::UpdateSubresource);
+        assert_eq!(
+            options.present_schedule,
+            InteropPresentSchedule::EarlyPresent
+        );
+        assert_eq!(options.d3d12_queue_priority, D3d12QueuePriority::High);
         assert_eq!(options.interop_fallback, InteropFallback::Fail);
         assert!(!options.hot_reload);
         assert_eq!(
@@ -10610,7 +11097,7 @@ fragment fn quad_fs() {
     }
 
     #[test]
-    fn instance_stress_variant_accepts_baseline_fast_culled_tiled_and_macrocell() {
+    fn instance_stress_variant_accepts_baseline_fast_culled_tiled_cuda_raster_and_macrocell() {
         assert_eq!(
             "baseline".parse::<InstanceStressVariant>().unwrap(),
             InstanceStressVariant::Baseline
@@ -10628,15 +11115,20 @@ fragment fn quad_fs() {
             InstanceStressVariant::Tiled
         );
         assert_eq!(
+            "cuda-raster".parse::<InstanceStressVariant>().unwrap(),
+            InstanceStressVariant::CudaRaster
+        );
+        assert_eq!(
             "macrocell".parse::<InstanceStressVariant>().unwrap(),
             InstanceStressVariant::Macrocell
         );
+        assert_eq!(InstanceStressVariant::CudaRaster.to_string(), "cuda-raster");
         assert_eq!(InstanceStressVariant::Macrocell.to_string(), "macrocell");
         let err = "turbo"
             .parse::<InstanceStressVariant>()
             .unwrap_err()
             .to_string();
-        assert!(err.contains("expected baseline, fast, culled, tiled, or macrocell"));
+        assert!(err.contains("expected baseline, fast, culled, tiled, cuda-raster, or macrocell"));
     }
 
     #[test]
@@ -10696,6 +11188,28 @@ fragment fn quad_fs() {
                 ResolvedGpuPreset::Modern,
             ),
             PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_tiled_aosoa64.neo")
+        );
+        assert_eq!(
+            InstanceStressVariant::CudaRaster.source_path(
+                requested,
+                StressInstanceLayout::AoSoA32,
+                InstanceMaterials::None,
+                InstanceDebugView::Off,
+                SparseFeedbackMode::Off,
+                ResolvedGpuPreset::Modern,
+            ),
+            PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_cuda_raster_aosoa32.neo")
+        );
+        assert_eq!(
+            InstanceStressVariant::CudaRaster.source_path(
+                requested,
+                StressInstanceLayout::AoSoA64,
+                InstanceMaterials::None,
+                InstanceDebugView::Off,
+                SparseFeedbackMode::Off,
+                ResolvedGpuPreset::Modern,
+            ),
+            PathBuf::from("D:/Neo/examples/stress-quads/three_d_instances_cuda_raster_aosoa64.neo")
         );
         assert_eq!(
             InstanceStressVariant::Macrocell.source_path(
@@ -11220,6 +11734,60 @@ fragment fn quad_fs() {
         );
         let err = "wat".parse::<D3dUploadMode>().unwrap_err().to_string();
         assert!(err.contains("expected mapped-copy or update-subresource"));
+    }
+
+    #[test]
+    fn interop_present_schedule_accepts_late_and_early_present() {
+        assert_eq!(
+            "late-present".parse::<InteropPresentSchedule>().unwrap(),
+            InteropPresentSchedule::LatePresent
+        );
+        assert_eq!(
+            "early-present".parse::<InteropPresentSchedule>().unwrap(),
+            InteropPresentSchedule::EarlyPresent
+        );
+        assert_eq!(
+            InteropPresentSchedule::LatePresent.to_string(),
+            "late-present"
+        );
+        let err = "now"
+            .parse::<InteropPresentSchedule>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected early-present or late-present"));
+    }
+
+    #[test]
+    fn d3d12_queue_priority_accepts_normal_and_high() {
+        assert_eq!(
+            "normal".parse::<D3d12QueuePriority>().unwrap(),
+            D3d12QueuePriority::Normal
+        );
+        assert_eq!(
+            "high".parse::<D3d12QueuePriority>().unwrap(),
+            D3d12QueuePriority::High
+        );
+        assert_eq!(D3d12QueuePriority::High.to_string(), "high");
+        let err = "urgent"
+            .parse::<D3d12QueuePriority>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected normal or high"));
+    }
+
+    #[test]
+    fn newest_completed_interop_slot_picks_latest_frame() {
+        let slots = [
+            (0, InteropSlotState::Completed, 9),
+            (1, InteropSlotState::Pending, 11),
+            (2, InteropSlotState::Completed, 12),
+            (3, InteropSlotState::Free, 13),
+        ];
+        assert_eq!(newest_completed_interop_slot(slots), Some(2));
+        assert_eq!(
+            newest_completed_interop_slot([(0, InteropSlotState::Pending, 1)]),
+            None
+        );
     }
 
     #[test]

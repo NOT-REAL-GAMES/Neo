@@ -1,0 +1,183 @@
+kernel fn instance_clear(global u8* packed, u32 width, u32 height) {
+    let x: u32 = block_id().x * block_dim().x + thread_id().x;
+    let y: u32 = block_id().y * block_dim().y + thread_id().y;
+    if (x >= width || y >= height) {
+        return;
+    }
+    let idx: u32 = y * width + x;
+    ((unsigned long long*)packed)[idx] = 0xffffffff00090605ull;
+}
+
+kernel fn instance_resolve(global u8* pixels, global u8* packed, u32 width, u32 height) {
+    let x: u32 = block_id().x * block_dim().x + thread_id().x;
+    let y: u32 = block_id().y * block_dim().y + thread_id().y;
+    if (x >= width || y >= height) {
+        return;
+    }
+    let idx: u32 = y * width + x;
+    let value: unsigned long long = ((unsigned long long*)packed)[idx];
+    ((unsigned int*)pixels)[idx] = (unsigned int)(value & 0xffffffffull);
+}
+
+kernel fn instance_raster(global u8* packed, u32 width, u32 height, global u8* mesh, global u8* instances, global u8* camera, f32 time, u32 frame) {
+    let instance_id: u32 = block_id().x * block_dim().x + thread_id().x;
+    let instance_count: u32 = neo_instance_count(instances);
+    if (instance_id >= instance_count || width == 0u || height == 0u) {
+        return;
+    }
+
+    struct NeoStressCamera {
+        float4 origin;
+        float4 right;
+        float4 up;
+        float4 forward;
+        uint4 grid;
+        float4 view;
+        uint4 config;
+    };
+    let cam: NeoStressCamera* = (NeoStressCamera*)camera;
+    let pos: vec3f = neo_instance_position3f(instances, instance_id);
+    let rot: vec4f = neo_instance_rotation4f(instances, instance_id);
+    let scale: vec2f = neo_instance_scale2f(instances, instance_id);
+    let c: u32 = neo_instance_color4u8(instances, instance_id);
+    let rx: f32 = rot.x;
+    let ry: f32 = rot.y;
+    let rz: f32 = rot.z;
+    let rw: f32 = rot.w;
+    let axis_x_x: f32 = 1.0f + 2.0f * (-ry * ry - rz * rz);
+    let axis_x_y: f32 = 2.0f * (rw * rz + rx * ry);
+    let axis_x_z: f32 = 2.0f * (-rw * ry + rx * rz);
+    let axis_y_x: f32 = 2.0f * (-rw * rz + rx * ry);
+    let axis_y_y: f32 = 1.0f + 2.0f * (-rx * rx - rz * rz);
+    let axis_y_z: f32 = 2.0f * (rw * rx + ry * rz);
+    let normal_x: f32 = 2.0f * (rw * ry + rz * rx);
+    let normal_y: f32 = 2.0f * (-rw * rx + rz * ry);
+    let normal_z: f32 = 1.0f + 2.0f * (-rx * rx - ry * ry);
+
+    let rel_x: f32 = pos.x - cam->origin.x;
+    let rel_y: f32 = pos.y - cam->origin.y;
+    let rel_z: f32 = pos.z - cam->origin.z;
+    let inv_rel_len: f32 = rsqrtf(fmaxf(0.000001f, rel_x * rel_x + rel_y * rel_y + rel_z * rel_z));
+    let shade: f32 = fmaxf(0.18f, fabsf(normal_x * (-rel_x * inv_rel_len) + normal_y * (-rel_y * inv_rel_len) + normal_z * (-rel_z * inv_rel_len)));
+
+    float cx[8];
+    float cy[8];
+    float cz[8];
+    float lx[8];
+    float ly[8];
+    float out_cx[8];
+    float out_cy[8];
+    float out_cz[8];
+    float out_lx[8];
+    float out_ly[8];
+    float sx[8];
+    float sy[8];
+    float inv_z[8];
+    float lx_over_z[8];
+    float ly_over_z[8];
+
+    for (int corner_id = 0; corner_id < 4; ++corner_id) {
+        let local_x: f32 = (corner_id == 0 || corner_id == 3) ? -scale.x : scale.x;
+        let local_y: f32 = (corner_id == 0 || corner_id == 1) ? -scale.y : scale.y;
+        let world_x: f32 = pos.x + axis_x_x * local_x + axis_y_x * local_y;
+        let world_y: f32 = pos.y + axis_x_y * local_x + axis_y_y * local_y;
+        let world_z: f32 = pos.z + axis_x_z * local_x + axis_y_z * local_y;
+        let vx: f32 = world_x - cam->origin.x;
+        let vy: f32 = world_y - cam->origin.y;
+        let vz: f32 = world_z - cam->origin.z;
+        cx[corner_id] = vx * cam->right.x + vy * cam->right.y + vz * cam->right.z;
+        cy[corner_id] = vx * cam->up.x + vy * cam->up.y + vz * cam->up.z;
+        cz[corner_id] = vx * cam->forward.x + vy * cam->forward.y + vz * cam->forward.z;
+        lx[corner_id] = local_x;
+        ly[corner_id] = local_y;
+    }
+
+    let near_z: f32 = 0.05f;
+    let in_count: int = 4;
+    let out_count: int = 0;
+    for (int edge_id = 0; edge_id < in_count; ++edge_id) {
+        let prev: int = (edge_id + in_count - 1) % in_count;
+        let curr: int = edge_id;
+        let prev_in: bool = cz[prev] >= near_z;
+        let curr_in: bool = cz[curr] >= near_z;
+        if (prev_in != curr_in) {
+            let denom: f32 = cz[curr] - cz[prev];
+            let t: f32 = (near_z - cz[prev]) / denom;
+            out_cx[out_count] = cx[prev] + (cx[curr] - cx[prev]) * t;
+            out_cy[out_count] = cy[prev] + (cy[curr] - cy[prev]) * t;
+            out_cz[out_count] = near_z;
+            out_lx[out_count] = lx[prev] + (lx[curr] - lx[prev]) * t;
+            out_ly[out_count] = ly[prev] + (ly[curr] - ly[prev]) * t;
+            out_count = out_count + 1;
+        }
+        if (curr_in) {
+            out_cx[out_count] = cx[curr];
+            out_cy[out_count] = cy[curr];
+            out_cz[out_count] = cz[curr];
+            out_lx[out_count] = lx[curr];
+            out_ly[out_count] = ly[curr];
+            out_count = out_count + 1;
+        }
+    }
+    if (out_count < 3) {
+        return;
+    }
+
+    for (int i = 0; i < out_count; ++i) {
+        let invz: f32 = 1.0f / out_cz[i];
+        let clip_x: f32 = out_cx[i] * invz / cam->view.x;
+        let clip_y: f32 = out_cy[i] * invz / cam->view.y;
+        sx[i] = (clip_x * 0.5f + 0.5f) * as_f32(width);
+        sy[i] = (0.5f - clip_y * 0.5f) * as_f32(height);
+        inv_z[i] = invz;
+        lx_over_z[i] = out_lx[i] * invz;
+        ly_over_z[i] = out_ly[i] * invz;
+    }
+
+    for (int tri = 1; tri < out_count - 1; ++tri) {
+        let i0: int = 0;
+        let i1: int = tri;
+        let i2: int = tri + 1;
+        let area: f32 = (sx[i1] - sx[i0]) * (sy[i2] - sy[i0]) - (sy[i1] - sy[i0]) * (sx[i2] - sx[i0]);
+        if (fabsf(area) < 0.00001f) {
+            continue;
+        }
+        let min_x_f: f32 = fmaxf(0.0f, floorf(fminf(sx[i0], fminf(sx[i1], sx[i2]))));
+        let max_x_f: f32 = fminf(as_f32(width - 1u), ceilf(fmaxf(sx[i0], fmaxf(sx[i1], sx[i2]))));
+        let min_y_f: f32 = fmaxf(0.0f, floorf(fminf(sy[i0], fminf(sy[i1], sy[i2]))));
+        let max_y_f: f32 = fminf(as_f32(height - 1u), ceilf(fmaxf(sy[i0], fmaxf(sy[i1], sy[i2]))));
+        let min_x_i: int = (int)min_x_f;
+        let max_x_i: int = (int)max_x_f;
+        let min_y_i: int = (int)min_y_f;
+        let max_y_i: int = (int)max_y_f;
+        for (int py_i = min_y_i; py_i <= max_y_i; ++py_i) {
+            let py: f32 = as_f32(py_i) + 0.5f;
+            for (int px_i = min_x_i; px_i <= max_x_i; ++px_i) {
+                let px: f32 = as_f32(px_i) + 0.5f;
+                let w0: f32 = ((px - sx[i1]) * (sy[i2] - sy[i1]) - (py - sy[i1]) * (sx[i2] - sx[i1])) / area;
+                let w1: f32 = ((px - sx[i2]) * (sy[i0] - sy[i2]) - (py - sy[i2]) * (sx[i0] - sx[i2])) / area;
+                let w2: f32 = 1.0f - w0 - w1;
+                if (w0 >= -0.0001f && w1 >= -0.0001f && w2 >= -0.0001f) {
+                    let pixel_inv_z: f32 = w0 * inv_z[i0] + w1 * inv_z[i1] + w2 * inv_z[i2];
+                    if (pixel_inv_z > 0.0f) {
+                        let pixel_z: f32 = 1.0f / pixel_inv_z;
+                        let depth_norm: f32 = fminf(0.999999f, fmaxf(0.0f, pixel_z / (pixel_z + 512.0f)));
+                        let depth_key: unsigned int = (unsigned int)(depth_norm * 16777214.0f);
+                        let tie_key: unsigned int = (instance_id * 1664525u + 1013904223u) & 255u;
+                        let local_x_hit: f32 = (w0 * lx_over_z[i0] + w1 * lx_over_z[i1] + w2 * lx_over_z[i2]) / pixel_inv_z;
+                        let local_y_hit: f32 = (w0 * ly_over_z[i0] + w1 * ly_over_z[i1] + w2 * ly_over_z[i2]) / pixel_inv_z;
+                        let checker_x: int = (int)floorf((local_x_hit / (scale.x * 2.0f) + 0.5f) * 8.0f);
+                        let checker_y: int = (int)floorf((local_y_hit / (scale.y * 2.0f) + 0.5f) * 8.0f);
+                        let checker_scale: f32 = (((checker_x + checker_y) & 1) == 0) ? 1.0f : 0.55f;
+                        let b: u32 = as_u32(as_f32(c & 255u) * shade * checker_scale) & 255u;
+                        let g: u32 = as_u32(as_f32((c >> 8u) & 255u) * shade * checker_scale) & 255u;
+                        let r: u32 = as_u32(as_f32((c >> 16u) & 255u) * shade * checker_scale) & 255u;
+                        let out_color: u32 = b | (g << 8u) | (r << 16u) | 0xff000000u;
+                        let packed_value: unsigned long long = (((unsigned long long)depth_key) << 40) | (((unsigned long long)tie_key) << 32) | ((unsigned long long)out_color);
+                        atomicMin(&((unsigned long long*)packed)[as_u32(py_i) * width + as_u32(px_i)], packed_value);
+                    }
+                }
+            }
+        }
+    }
+}
