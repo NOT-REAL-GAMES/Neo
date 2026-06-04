@@ -10,8 +10,8 @@ cargo run --no-default-features --features cuda-12060 -p neo-quad-stress-3d --re
   --instance-materials sparse-texture ^
   --sparse-feedback off ^
   --gpu-preset auto ^
-  --kernel-target-fps 1000 ^
-  --present-target-fps 1000 ^
+  --kernel-target-fps 0 ^
+  --present-target-fps 0 ^
   --no-hot-reload
 
 pause

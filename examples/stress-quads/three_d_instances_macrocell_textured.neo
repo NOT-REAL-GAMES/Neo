@@ -318,14 +318,9 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
                 let guess_y: f32 = cam->origin.y + dir_y * t_guess;
                 let ix_i: i32 = as_i32(floorf(guess_x * inv_spacing + half_x + 0.5f));
                 let iy_i: i32 = as_i32(floorf(guess_y * inv_spacing + half_y + 0.5f));
-                let best_t: f32 = 1000000000.0f;
-                for (int neighbor_y = -1; neighbor_y <= 1; ++neighbor_y) {
-                    for (int neighbor_x = -1; neighbor_x <= 1; ++neighbor_x) {
-                        let cand_ix_i: i32 = ix_i + neighbor_x;
-                        let cand_iy_i: i32 = iy_i + neighbor_y;
-                        if (cand_ix_i >= as_i32(rec_min_x) && cand_ix_i <= as_i32(rec_max_x) && cand_iy_i >= as_i32(rec_min_y) && cand_iy_i <= as_i32(rec_max_y)) {
-                    let ix: u32 = as_u32(cand_ix_i);
-                    let iy: u32 = as_u32(cand_iy_i);
+                if (ix_i >= as_i32(rec_min_x) && ix_i <= as_i32(rec_max_x) && iy_i >= as_i32(rec_min_y) && iy_i <= as_i32(rec_max_y)) {
+                    let ix: u32 = as_u32(ix_i);
+                    let iy: u32 = as_u32(iy_i);
                     let instance_id: u32 = layer * grid_xy + iy * grid_x + ix;
                     if (instance_id < instance_count) {
                         let group: u32 = instance_id / group_size;
@@ -374,8 +369,7 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
                                 let local_x_hit: f32 = vx - 2.0f * rw * uv_x + 2.0f * uuv_x;
                                 let local_y_hit: f32 = vy - 2.0f * rw * uv_y + 2.0f * uuv_y;
                                 let local_z_hit: f32 = vz - 2.0f * rw * uv_z + 2.0f * uuv_z;
-                                if (hit_t < best_t && fabsf(local_x_hit) <= scale_x && fabsf(local_y_hit) <= scale_y && fabsf(local_z_hit) <= spacing * 0.08f) {
-                                    best_t = hit_t;
+                                if (fabsf(local_x_hit) <= scale_x && fabsf(local_y_hit) <= scale_y && fabsf(local_z_hit) <= spacing * 0.08f) {
                                     let shade: f32 = fmaxf(0.18f, fabsf(normal_x * -dir_x + normal_y * -dir_y + normal_z * -dir_z));
                                     let c: u32 = color_ptr[0];
                                     let material_id: u32 = neo_sparse_material_tile(materials, instance_id);
@@ -394,15 +388,11 @@ kernel fn instance_raster(global u8* pixels, u32 width, u32 height, global u8* m
                                     let r: u32 = as_u32(as_f32((c >> 16u) & 255u) * tex_r * shade) & 255u;
                                     color = b | (g << 8u) | (r << 16u) | 0xff000000u;
                                     hit = 1;
+                                    break;
                                 }
                             }
                         }
                     }
-                }
-                    }
-                }
-                if (hit != 0) {
-                    break;
                 }
                 layer_i = layer_i + layer_step;
                 t_guess = t_guess + t_step;
