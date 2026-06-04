@@ -1,0 +1,15 @@
+[package]
+name = "neo-simple-2d-game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+image.workspace = true
+neo-app = { workspace = true, default-features = false }
+
+[features]
+default = ["cuda-13000"]
+cuda-12060 = ["neo-app/cuda-12060"]
+cuda-13000 = ["neo-app/cuda-13000"]

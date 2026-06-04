@@ -859,6 +859,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cudarc",
+ "image",
  "neo-lang",
  "neo-runtime",
  "notify",
@@ -893,6 +894,15 @@ dependencies = [
  "neo-lang",
  "thiserror 2.0.18",
  "windows",
+]
+
+[[package]]
+name = "neo-simple-2d-game"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "neo-app",
 ]
 
 [[package]]

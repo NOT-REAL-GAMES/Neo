@@ -5,6 +5,9 @@ use std::{
 };
 
 use anyhow::{Result, bail};
+pub use neo_live_window::{
+    Color, GameFrame, GameRenderer, GameTextureSpec, GameWindowConfig, NeoGame, Rect, Sprite, Vec2,
+};
 use neo_runtime::{
     Context, IndexFormat, MeshBuffer, MeshBufferDesc, PrimitiveTopology, VertexAttribute,
     VertexFormat, VertexLayout, VertexSemantic,
@@ -3362,6 +3365,39 @@ mod tests {
         assert_eq!(app.config().max_inflight, 8);
         assert_eq!(app.config().present_ring, 8);
         assert_eq!(app.config().render_policy, RenderPolicy::Auto);
+    }
+
+    #[test]
+    fn beginner_game_api_is_available_from_neo_app() {
+        assert_eq!(NeoGame::new().config().target_fps, Some(60.0));
+        assert_eq!(NeoGame::new().uncapped().config().target_fps, None);
+
+        let game = NeoGame::new()
+            .window("Sprites", 800, 600)
+            .texture("player", "assets/player.png")
+            .renderer(GameRenderer::Cpu)
+            .target_fps(60.0);
+
+        assert_eq!(game.config().window.title, "Sprites");
+        assert_eq!(game.config().window.width, 800);
+        assert_eq!(game.config().window.height, 600);
+        assert_eq!(game.config().renderer, GameRenderer::Cpu);
+        assert_eq!(game.config().target_fps, Some(60.0));
+        assert_eq!(game.texture_specs()[0].name, "player");
+
+        let mut frame_count = 0;
+        let pixels = NeoGame::new()
+            .window("test", 1, 1)
+            .renderer(GameRenderer::Cpu)
+            .run_for_frames(3, |frame| {
+                frame_count += 1;
+                frame.clear(Color::rgb(frame_count, 0, 0));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(frame_count, 3);
+        assert_eq!(&pixels, &[0, 0, 3, 255]);
     }
 
     #[test]

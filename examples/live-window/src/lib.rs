@@ -36,6 +36,12 @@ use winit::{
     window::{CursorGrabMode, Window, WindowAttributes},
 };
 
+mod game2d;
+
+pub use game2d::{
+    Color, GameFrame, GameRenderer, GameTextureSpec, GameWindowConfig, NeoGame, Rect, Sprite, Vec2,
+};
+
 const DEFAULT_WIDTH: u32 = 960;
 const DEFAULT_HEIGHT: u32 = 540;
 const BLOCK: (u32, u32) = (16, 16);
@@ -6175,6 +6181,60 @@ struct PresentTimings {
     total: Duration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirtyRowRange {
+    start: u32,
+    end: u32,
+}
+
+impl DirtyRowRange {
+    fn new(start: u32, end: u32, height: u32) -> Result<Self> {
+        if start >= end {
+            bail!("dirty row range must be non-empty");
+        }
+        if end > height {
+            bail!("dirty row range end {end} exceeds frame height {height}");
+        }
+        Ok(Self { start, end })
+    }
+
+    #[cfg(test)]
+    fn full(height: u32) -> Self {
+        Self {
+            start: 0,
+            end: height,
+        }
+    }
+
+    fn is_full(self, height: u32) -> bool {
+        self.start == 0 && self.end == height
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirtyRowBox {
+    left: u32,
+    top: u32,
+    front: u32,
+    right: u32,
+    bottom: u32,
+    back: u32,
+}
+
+fn d3d11_dirty_row_box(width: u32, rows: DirtyRowRange) -> Result<DirtyRowBox> {
+    if width == 0 {
+        bail!("dirty row D3D box width must be greater than zero");
+    }
+    Ok(DirtyRowBox {
+        left: 0,
+        top: rows.start,
+        front: 0,
+        right: width,
+        bottom: rows.end,
+        back: 1,
+    })
+}
+
 enum PresentSink {
     Direct(WindowPresenter),
     Threaded(ThreadedPresenter),
@@ -6415,6 +6475,22 @@ impl WindowPresenter {
             }
             PresenterImpl::D3d12(presenter) => presenter.present(size, bgra),
             PresenterImpl::D3d11(presenter) => presenter.present(size, bgra),
+            PresenterImpl::Gdi(presenter) => presenter.present(size, bgra),
+        }
+    }
+
+    fn present_dirty_rows(
+        &mut self,
+        size: PhysicalSize<u32>,
+        bgra: &[u8],
+        rows: DirtyRowRange,
+    ) -> Result<PresentTimings> {
+        match &mut self.inner {
+            PresenterImpl::D3d12Interop(_) => {
+                bail!("d3d12-interop presenter requires a shared Neo frame slot")
+            }
+            PresenterImpl::D3d12(presenter) => presenter.present(size, bgra),
+            PresenterImpl::D3d11(presenter) => presenter.present_dirty_rows(size, bgra, rows),
             PresenterImpl::Gdi(presenter) => presenter.present(size, bgra),
         }
     }
@@ -8500,6 +8576,8 @@ struct D3d11Presenter {
     context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
     swap_chain: windows::Win32::Graphics::Dxgi::IDXGISwapChain1,
     back_buffer: Option<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>,
+    update_texture: Option<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>,
+    update_texture_valid: bool,
     upload_slots: Vec<D3d11UploadSlot>,
     upload_index: usize,
     upload_mode: D3dUploadMode,
@@ -8605,6 +8683,8 @@ impl D3d11Presenter {
             context,
             swap_chain,
             back_buffer: None,
+            update_texture: None,
+            update_texture_valid: false,
             upload_slots: Vec::new(),
             upload_index: 0,
             upload_mode,
@@ -8615,6 +8695,8 @@ impl D3d11Presenter {
         presenter.recreate_backbuffer()?;
         if upload_mode == D3dUploadMode::MappedCopy {
             presenter.recreate_upload_textures(width, height, upload_ring)?;
+        } else {
+            presenter.recreate_update_texture(width, height)?;
         }
         Ok(presenter)
     }
@@ -8643,10 +8725,65 @@ impl D3d11Presenter {
             }
             D3dUploadMode::UpdateSubresource => {
                 let map_copy_start = Instant::now();
-                self.update_backbuffer(size.width, bgra)?;
-                (map_copy_start.elapsed(), Duration::ZERO)
+                self.update_present_texture(size.width, bgra, None)?;
+                self.update_texture_valid = true;
+                let map_copy = map_copy_start.elapsed();
+                let copy_start = Instant::now();
+                self.copy_update_texture_to_backbuffer()?;
+                (map_copy, copy_start.elapsed())
             }
         };
+        let flags = if self.tearing_supported {
+            windows::Win32::Graphics::Dxgi::DXGI_PRESENT_ALLOW_TEARING
+        } else {
+            windows::Win32::Graphics::Dxgi::DXGI_PRESENT(0)
+        };
+        let swap_start = Instant::now();
+        unsafe {
+            self.swap_chain.Present(0, flags).ok()?;
+        }
+        let swap_present = swap_start.elapsed();
+        Ok(PresentTimings {
+            map_copy,
+            draw,
+            swap_present,
+            total: total_start.elapsed(),
+        })
+    }
+
+    fn present_dirty_rows(
+        &mut self,
+        size: PhysicalSize<u32>,
+        bgra: &[u8],
+        rows: DirtyRowRange,
+    ) -> Result<PresentTimings> {
+        let expected = frame_byte_len(size.width, size.height)?;
+        if bgra.len() != expected {
+            bail!(
+                "present buffer size mismatch: got {} bytes, expected {}",
+                bgra.len(),
+                expected
+            );
+        }
+        let width = size.width.max(1);
+        let height = size.height.max(1);
+        let resized = self.width != width || self.height != height;
+        if resized
+            || rows.is_full(size.height)
+            || self.upload_mode != D3dUploadMode::UpdateSubresource
+            || !self.update_texture_valid
+        {
+            return self.present(size, bgra);
+        }
+
+        let total_start = Instant::now();
+        self.ensure_size(size)?;
+        let map_copy_start = Instant::now();
+        self.update_present_texture(size.width, bgra, Some(rows))?;
+        let map_copy = map_copy_start.elapsed();
+        let copy_start = Instant::now();
+        self.copy_update_texture_to_backbuffer()?;
+        let draw = copy_start.elapsed();
         let flags = if self.tearing_supported {
             windows::Win32::Graphics::Dxgi::DXGI_PRESENT_ALLOW_TEARING
         } else {
@@ -8672,6 +8809,8 @@ impl D3d11Presenter {
             return Ok(());
         }
         self.back_buffer = None;
+        self.update_texture = None;
+        self.update_texture_valid = false;
         let upload_ring = self.upload_slots.len();
         self.upload_slots.clear();
         self.upload_index = 0;
@@ -8694,6 +8833,8 @@ impl D3d11Presenter {
         self.recreate_backbuffer()?;
         if self.upload_mode == D3dUploadMode::MappedCopy {
             self.recreate_upload_textures(width, height, upload_ring)?;
+        } else {
+            self.recreate_update_texture(width, height)?;
         }
         Ok(())
     }
@@ -8747,6 +8888,37 @@ impl D3d11Presenter {
         Ok(())
     }
 
+    fn recreate_update_texture(&mut self, width: u32, height: u32) -> Result<()> {
+        use windows::Win32::Graphics::{
+            Direct3D11::{D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Texture2D},
+            Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
+        };
+
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: 0,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture: Option<ID3D11Texture2D> = None;
+        unsafe {
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut texture))?;
+        }
+        self.update_texture = Some(texture.context("D3D11 did not return an update texture")?);
+        self.update_texture_valid = false;
+        Ok(())
+    }
+
     fn upload_bgra(&self, slot_index: usize, width: u32, height: u32, bgra: &[u8]) -> Result<()> {
         use windows::Win32::Graphics::Direct3D11::{
             D3D11_MAP_WRITE_DISCARD, D3D11_MAPPED_SUBRESOURCE,
@@ -8786,18 +8958,57 @@ impl D3d11Presenter {
         Ok(())
     }
 
-    fn update_backbuffer(&self, width: u32, bgra: &[u8]) -> Result<()> {
+    fn copy_update_texture_to_backbuffer(&self) -> Result<()> {
+        let update_texture = self
+            .update_texture
+            .as_ref()
+            .context("D3D11 update texture is not available")?;
         let back_buffer = self
             .back_buffer
             .as_ref()
             .context("D3D11 backbuffer is not available")?;
         unsafe {
+            self.context.CopyResource(back_buffer, update_texture);
+        }
+        Ok(())
+    }
+
+    fn update_present_texture(
+        &self,
+        width: u32,
+        bgra: &[u8],
+        rows: Option<DirtyRowRange>,
+    ) -> Result<()> {
+        use windows::Win32::Graphics::Direct3D11::D3D11_BOX;
+
+        let texture = self
+            .update_texture
+            .as_ref()
+            .context("D3D11 update texture is not available")?;
+        let row_pitch = width.checked_mul(4).context("D3D11 row pitch overflow")?;
+        let offset = rows
+            .map(|rows| rows.start as usize * row_pitch as usize)
+            .unwrap_or(0);
+        let d3d_box = if let Some(rows) = rows {
+            let row_box = d3d11_dirty_row_box(width, rows)?;
+            Some(D3D11_BOX {
+                left: row_box.left,
+                top: row_box.top,
+                front: row_box.front,
+                right: row_box.right,
+                bottom: row_box.bottom,
+                back: row_box.back,
+            })
+        } else {
+            None
+        };
+        unsafe {
             self.context.UpdateSubresource(
-                back_buffer,
+                texture,
                 0,
-                None,
-                bgra.as_ptr().cast(),
-                width * 4,
+                d3d_box.as_ref().map(|row_box| row_box as *const D3D11_BOX),
+                bgra[offset..].as_ptr().cast(),
+                row_pitch,
                 0,
             );
         }
@@ -8872,6 +9083,15 @@ impl WindowPresenter {
     }
 
     fn present(&mut self, _size: PhysicalSize<u32>, _bgra: &[u8]) -> Result<PresentTimings> {
+        bail!("the no-interop live presenter currently targets Windows/Win32")
+    }
+
+    fn present_dirty_rows(
+        &mut self,
+        _size: PhysicalSize<u32>,
+        _bgra: &[u8],
+        _rows: DirtyRowRange,
+    ) -> Result<PresentTimings> {
         bail!("the no-interop live presenter currently targets Windows/Win32")
     }
 
@@ -11000,6 +11220,34 @@ fragment fn quad_fs() {
         );
         let err = "wat".parse::<D3dUploadMode>().unwrap_err().to_string();
         assert!(err.contains("expected mapped-copy or update-subresource"));
+    }
+
+    #[test]
+    fn dirty_row_range_validates_bounds() {
+        assert_eq!(
+            DirtyRowRange::new(2, 5, 8).unwrap(),
+            DirtyRowRange { start: 2, end: 5 }
+        );
+        assert_eq!(DirtyRowRange::full(8), DirtyRowRange { start: 0, end: 8 });
+        assert!(DirtyRowRange::new(2, 2, 8).is_err());
+        assert!(DirtyRowRange::new(6, 9, 8).is_err());
+    }
+
+    #[test]
+    fn d3d_dirty_row_box_covers_full_width_row_span() {
+        let rows = DirtyRowRange::new(3, 7, 10).unwrap();
+        assert_eq!(
+            d3d11_dirty_row_box(800, rows).unwrap(),
+            DirtyRowBox {
+                left: 0,
+                top: 3,
+                front: 0,
+                right: 800,
+                bottom: 7,
+                back: 1,
+            }
+        );
+        assert!(d3d11_dirty_row_box(0, rows).is_err());
     }
 
     #[test]

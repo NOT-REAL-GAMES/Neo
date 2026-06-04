@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 cudarc.workspace = true
+image.workspace = true
 neo-lang.workspace = true
 neo-runtime = { workspace = true, default-features = false }
 notify.workspace = true

@@ -6,6 +6,7 @@ members = [
     "crates/neo-runtime",
     "examples/friendly-demo",
     "examples/live-window",
+    "examples/simple-2d-game",
     "examples/stress-quads",
     "examples/stress-quads-3d",
 ]

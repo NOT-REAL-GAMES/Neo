@@ -56,6 +56,27 @@ Flagship 8M 3D quad stress launcher:
 cargo run -p neo-quad-stress-3d --release
 ```
 
+Performance gate for the flagship stress launcher:
+
+```powershell
+.\tools\quad_stress_perf.ps1 -Runs 3 -Seconds 20
+```
+
+The perf gate builds `neo-quad-stress-3d`, runs bounded samples, parses
+`kernel_fps`, `present_fps`, `gpu_copy`, `swap`, and `present`, and fails if the
+candidate median `kernel_fps` is more than 5% below the `68c4c62` baseline. It
+adds `--render-policy force-render` to benchmark renderer throughput without
+window focus/visibility throttling.
+For regression forensics across the known sampling/refactor commits:
+
+```powershell
+.\tools\quad_stress_perf.ps1 -Refs 68c4c62,d927fd0,2efd619,HEAD -Runs 3 -Seconds 20 -ReportOnly
+```
+
+The secondary macrocell-sparse scenario leaves `--present-target-fps` unset for
+uncapped presentation because the CLI reserves `0` as an uncapped value only for
+`--kernel-target-fps`.
+
 Hardware-raster stress comparisons:
 
 ```powershell
